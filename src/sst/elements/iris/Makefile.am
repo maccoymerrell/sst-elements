@@ -27,6 +27,8 @@ libsumi_la_SOURCES = \
   sumi/collective.cc \
   sumi/collective_actor.cc \
   sumi/collective_message.cc \
+  sumi/collective_registry.cc \
+  sumi/collective_registry_builtins.cc \
   sumi/communicator.cc \
   sumi/dense_rank_map.cc \
   sumi/gather.cc \
@@ -36,6 +38,7 @@ libsumi_la_SOURCES = \
   sumi/rank_mapper.cc \
   sumi/reduce.cc \
   sumi/reduce_scatter.cc \
+  sumi/ring_allreduce.cc \
   sumi/scan.cc \
   sumi/scatter.cc \
   sumi/scatterv.cc  \
@@ -57,6 +60,7 @@ nobase_library_include_HEADERS = \
   sumi/collective_actor_fwd.h \
   sumi/collective_message.h \
   sumi/collective_message_fwd.h \
+  sumi/collective_registry.h \
   sumi/comm_functions.h \
   sumi/communicator.h \
   sumi/communicator_fwd.h \
@@ -72,6 +76,7 @@ nobase_library_include_HEADERS = \
   sumi/rank_mapper.h \
   sumi/reduce.h \
   sumi/reduce_scatter.h \
+  sumi/ring_allreduce.h \
   sumi/scan.h \
   sumi/scatter.h \
   sumi/scatterv.h \

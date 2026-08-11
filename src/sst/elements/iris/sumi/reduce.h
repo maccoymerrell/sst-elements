@@ -100,7 +100,7 @@ class WilkeHalvingReduce :
   }
 
   std::string toString() const override {
-    return "sumi allreduce";
+    return "sumi reduce";
   }
 
   DagCollectiveActor* newActor() const override {

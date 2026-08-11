@@ -88,6 +88,19 @@ class HgNIC(TemplateBase):
 
 class HgOS(TemplateBase):
 
+    def addParam(self, key, value):
+        # Forward the namespace intact; allreduce is both a key and a prefix.
+        if key.startswith("app1."):
+            app_key = key[len("app1."):]
+            if (app_key.startswith("collective.") or
+                    app_key in ("allgather", "alltoall")):
+                if value is None:
+                    self._groups["params"].pop(key, None)
+                else:
+                    self._groups["params"][key] = value
+                return
+        return TemplateBase.addParam(self, key, value)
+
     def __init__(self):
         TemplateBase.__init__(self)
         self._declareParams("params",["name",
@@ -113,6 +126,7 @@ class HgOS(TemplateBase):
                                            "use_put_window",
                                            "compute_library_access_width",
                                            "compute_library_loop_overhead",
+                                           "smp_optimize",
                                           ],
                                           "app1.")
         self._subscribeToPlatformParamSet("operating_system")

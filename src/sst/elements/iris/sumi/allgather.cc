@@ -178,6 +178,14 @@ BruckActor::finalize()
 void
 RingAllgatherActor::initBuffers()
 {
+  // Seed the local chunk before it enters the ring.
+  void* dst = result_buffer_;
+  void* src = send_buffer_;
+  if (src != dst){
+    int block_size = nelems_ * type_size_;
+    void* my_chunk = ((char*)dst) + dom_me_ * block_size;
+    my_api_->memcopy(my_chunk, src, block_size);
+  }
   recv_buffer_ = result_buffer_;
 }
 

@@ -31,6 +31,7 @@ void
 Communicator::createSmpCommunicator(const std::set<int>& neighbors, CollectiveEngine *engine,
                                     int cq_id)
 {
+  smp_initialized_ = true;
   if (!supportsSmp()) return;
 
   if (neighbors.size() == 1) return; //no smp parallelism
