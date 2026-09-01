@@ -20,9 +20,9 @@
 #include "sst/elements/memHierarchy/membackend/memBackend.h"
 
 
-#include "base/base.h"
-#include "base/request.h"
-#include "frontend/frontend.h"
+#include "ramulator/base/base.h"
+#include "ramulator/base/request.h"
+#include "ramulator/frontend/i_frontend.h"
 //#include "memory_system/memory_system.h"
 
 
@@ -42,7 +42,8 @@ public:
 
     SST_ELI_DOCUMENT_PARAMS( MEMBACKEND_ELI_PARAMS,
             /* Own parameters */
-            {"configFile",  "Name of the Ramulator2 Device config file", NULL} )
+            {"configFile",  "Name of the Ramulator2 Device config file", NULL},
+            {"statsFile",   "Where to write Ramulator2 own statistics; empty writes them to stdout", ""} )
 
 /* Begin class definition */
     ramulator2Memory(ComponentId_t id, Params &params);
@@ -52,6 +53,9 @@ public:
 
 protected:
     std::string config_path;
+    // Where ramulator's own statistics go at finish(); empty means stdout.
+    std::string stats_path;
+
     Ramulator::IFrontEnd* ramulator2_frontend;
     Ramulator::IMemorySystem* ramulator2_memorysystem;
 

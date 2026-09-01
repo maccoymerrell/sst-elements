@@ -15,9 +15,12 @@
 
 
 #include <sst_config.h>
+
+#include <fstream>
+#include <iostream>
 #include "sst/elements/memHierarchy/util.h"
 #include "membackend/ramulator2Backend.h"
-#include "base/config.h"
+#include "ramulator/base/config.h"
 
 using namespace SST;
 using namespace SST::MemHierarchy;
@@ -32,7 +35,13 @@ ramulator2Memory::ramulator2Memory(ComponentId_t id, Params &params) :
         output->fatal(CALL_INFO, -1, "Ramulator2 Backend must define a 'configFile' file parameter\n");
     }
 
-    YAML::Node config = Ramulator::Config::parse_config_file(config_path, {});
+    stats_path = params.find<std::string>("statsFile", "");
+
+    // Our ramulator2 fork returns its own ConfigNode rather than a YAML::Node,
+    // and parse_config_file takes only the path. See NMFC-Rev/README.md: we keep
+    // one ramulator across both simulators so the memory device is identical by
+    // construction, not by assertion, and adapt this backend to it.
+    Ramulator::ConfigNode config = Ramulator::Config::parse_config_file(config_path);
     ramulator2_frontend = Ramulator::Factory::create_frontend(config);
     ramulator2_memorysystem = Ramulator::Factory::create_memory_system(config);
 
@@ -46,8 +55,11 @@ bool ramulator2Memory::issueRequest(ReqId reqId, Addr addr, bool isWrite, unsign
     bool enqueue_success = false;
 
     if (isWrite) {
+        // Our fork takes the request size: a cache block wider than one DRAM
+        // transaction must be split, and upstream's 4-argument form silently
+        // ignored size and modelled every request as a single transaction.
         enqueue_success = ramulator2_frontend->receive_external_requests(1, addr, 0,
-            [this](Ramulator::Request& req) {});
+            [this](Ramulator::Request& req) {}, numBytes);
         if (enqueue_success) {
             writes.insert(reqId);
         }
@@ -66,7 +78,7 @@ bool ramulator2Memory::issueRequest(ReqId reqId, Addr addr, bool isWrite, unsign
                     dramReqs.erase(req.addr);
 
                 handleMemResponse(memreq);
-        });
+        }, numBytes);
         if (enqueue_success) {
             if (dramReqs.find(addr) != dramReqs.end()) dramReqs[addr].push_back(reqId);
             else {
@@ -97,4 +109,25 @@ bool ramulator2Memory::clock(Cycle_t cycle){
 void ramulator2Memory::finish(){
     ramulator2_frontend->finalize();
     ramulator2_memorysystem->finalize();
+
+    // Derived statistics -- spreads, peaks, means -- are computed in each
+    // component's update_stats(), not in finalize(), and nothing calls it on
+    // its own. Skipping this does not fail: the raw counters print correctly
+    // and everything computed from them prints as zero, which reads exactly
+    // like a plugin that saw no traffic. Ramulator's own python bindings run
+    // finalize on both, then update_stats_recursive on both, then read.
+    ramulator2_frontend->update_stats_recursive();
+    ramulator2_memorysystem->update_stats_recursive();
+
+    // Ramulator keeps its own statistics -- bank balance, command gaps, queue
+    // occupancy -- and they are not SST statistics, so nothing else prints
+    // them. ChampSim calls print_stats itself; without this the numbers exist
+    // and are simply never emitted, which is worse than not collecting them.
+    if ( stats_path.empty() ) {
+        ramulator2_memorysystem->print_stats(std::cout);
+    } else {
+        std::ofstream out(stats_path);
+        if ( out ) ramulator2_memorysystem->print_stats(out);
+        else output->fatal(CALL_INFO, -1, "ramulator2: cannot write statsFile \"%s\"\n", stats_path.c_str());
+    }
 }
