@@ -596,8 +596,20 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                 if ( 0 == resource_check ) // Resources available, can issue
                 {
                     int allocate_fu = 1;
-                    if (ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE ||
-                        ins_type == INST_ROCC0 || ins_type == INST_ROCC1 || ins_type == INST_ROCC2 || ins_type == INST_ROCC3)
+                    const bool is_rocc = (ins_type == INST_ROCC0 || ins_type == INST_ROCC1 ||
+                                          ins_type == INST_ROCC2 || ins_type == INST_ROCC3);
+
+                    // A coprocessor instruction is architecturally visible the
+                    // moment it issues: an accelerator may have sent something
+                    // no one can take back -- an NMFC FORK puts an invocation
+                    // on the fabric. So it issues only when it is the oldest
+                    // instruction in the reorder buffer and therefore cannot be
+                    // squashed. Without this a branch mispredict flushes an
+                    // instruction that has already executed, and the response
+                    // later writes a physical register that has since been
+                    // recovered and handed to somebody else.
+                    if (is_rocc && j != 0) { allocate_fu = 1; }
+                    else if (ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE || is_rocc)
                     {
                         if(unallocated_memory_op_seen) {
                             // the instruction should not be allocated because memory operations
@@ -793,9 +805,18 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
         RoCCResponse* resp;
         if (!(roccs_[i]->isBusy()) && (resp = roccs_[i]->respond())) {
             VanadisInstruction* ins = rocc_queues_[i].front();
-            register_files[ins->getHWThread()]->setIntReg<uint64_t>(resp->rd, resp->rd_val);
+            // The accelerator can only know the ISA register number -- that is
+            // all RoCCInstruction carries, and RoCCResponse::rd is a uint8_t,
+            // which a physical register index would not even fit in. But
+            // setIntReg() indexes the *physical* file (it asserts against
+            // count_int_regs), so writing resp->rd put the result in whatever
+            // physical register happened to share the ISA number. Correct only
+            // before rename has moved anything. The instruction knows its own
+            // renamed destination, so ask it.
+            register_files[ins->getHWThread()]->setIntReg<uint64_t>(ins->getPhysIntRegOut(0), resp->rd_val);
             ins->markExecuted();
             rocc_queues_[i].pop_front();
+            delete resp;
         }
         roccs_[i]->tick((uint64_t)cycle);
 
@@ -1266,8 +1287,11 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
 
         output->verbose(CALL_INFO, 16, 0, "allocating rocc%d instruction\n", rocc_index);
         if (!roccs_[rocc_index]->RoCCFull()) {
-            output->verbose(CALL_INFO, 16, 0, "pushing to RoCC%d queue\n", rocc_index);
-            rocc_queues_[rocc_index].push_back(ins);
+            // Reserve the unit here; the instruction is recorded where the
+            // command is pushed (assignRegistersToInstruction), so the core's
+            // queue and the accelerator's are filled at the same instant and
+            // cannot drift. A response is matched to rocc_queues_.front() by
+            // position, so any drift hands an instruction another one's result.
             allocated_fu = true;
         }
         break;
@@ -1855,8 +1879,12 @@ VANADIS_COMPONENT::assignRegistersToInstruction(
         }
 
         if (!roccs_[rocc_index]->RoCCFull()) {
+            rocc_queues_[rocc_index].push_back(ins);
             VanadisRegisterFile* regFile = register_files[ins->getHWThread()];
-            regFile->print(output);
+            // Dumping the whole register file on every coprocessor issue is a
+            // debugging leftover, and an unconditional one: it dominated the
+            // run time of any program that actually used RoCC.
+            if ( UNLIKELY(output->getVerboseLevel() >= 16) ) { regFile->print(output); }
 
             uint64_t rs1_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(0));
             uint64_t rs2_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(1));

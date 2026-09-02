@@ -362,6 +362,15 @@ class ProcessInfo {
             m_dbg.fatal(CALL_INFO, -1, "Error: can't find memory region for addr %#" PRIx64 "\n", virtAddr);
         }
 
+        // No OS paging configured (useMMU=false): as far as this OS is
+        // concerned the virtual address is the physical one. A machine may
+        // perfectly well translate somewhere else -- NMFC does it in the memory
+        // interface, because placement is a decision the address space's owner
+        // makes and the host and the near-memory cores have to agree on the
+        // answer. Without this, m_mmu is null and every syscall that touches a
+        // user buffer segfaults rather than reporting anything.
+        if ( nullptr == m_mmu ) { return virtAddr; }
+
         uint32_t ppn = m_mmu->virtToPhys( getpid(), vpn );
 
         if ( -1 == ppn ) {

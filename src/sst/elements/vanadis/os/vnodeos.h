@@ -327,7 +327,10 @@ public:
         assert( iter != m_threadMap.end() );
         m_threadMap.erase( iter );
 
-        getMMU()->flushTlb( core, hwThread );
+        // There is no TLB to flush when no MMU is configured (useMMU=false),
+        // and no page table either. Same reason as ProcessInfo::virtToPhys:
+        // a machine may translate somewhere other than the OS.
+        if ( getMMU() ) { getMMU()->flushTlb( core, hwThread ); }
 
         // clear the process/thread to hwThread map
         m_coreInfoMap.at( core ).setProcess( hwThread, nullptr );
