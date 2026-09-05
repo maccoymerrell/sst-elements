@@ -906,6 +906,12 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
 
     // Tick the RoCC Interfaces
     for (int i = 0; i < roccs_.size(); i++) {
+        // Publish the core's retire count to the accelerator before ticking it.
+        // performExecute() runs after retirement in the same cycle, so
+        // ins_retired_this_cycle is this cycle's, and the running total an
+        // accelerator reads inside tick() includes the cycle it is in. See
+        // VanadisRoCCInterface::host_insns_retired.
+        roccs_[i]->host_insns_retired += ins_retired_this_cycle;
         RoCCResponse* resp;
         if (!(roccs_[i]->isBusy()) && (resp = roccs_[i]->respond())) {
             VanadisInstruction* ins = rocc_queues_[i].front();

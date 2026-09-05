@@ -100,6 +100,17 @@ public:
     SST::Output* output;
 
     Statistic<uint64_t>* stat_rocc_issued;
+
+    // HOST INSTRUCTIONS RETIRED, published to the accelerator.
+    //
+    // An accelerator that wants to say how much work the core did BETWEEN two
+    // of its own instructions cannot get that from anywhere else: it is handed
+    // commands and cycles, and the retire count belongs to the core. The core
+    // adds this cycle's retirements here before it ticks each interface, so a
+    // RoCC reading it at the moment it executes a command sees a running total
+    // that includes the cycle it is in. An accelerator that does not care simply
+    // never reads it, and nothing in the core's behaviour depends on it.
+    uint64_t host_insns_retired = 0;
 };
 
 } // namespace Vanadis
