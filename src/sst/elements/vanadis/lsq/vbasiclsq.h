@@ -449,7 +449,31 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                 // copy entire register here
                                 lsq->registerFiles->at(target_thread)->copyFromIntRegister(target_reg, 0, &register_value[0], reg_width);
 
-                                assert((reg_offset + addr_offset + ev->size) <= reg_width);
+                                // A LOAD RESPONSE THAT DOES NOT FIT THE REGISTER IT IS FOR.
+                                //
+                                // It was `assert(...)`, which says nothing: the
+                                // abort names this line and no address, and the
+                                // three quantities that decide it are all in
+                                // registers the core has. Every one of them is a
+                                // clue -- an `addr_offset` of 2^64-something is a
+                                // response whose address is not the one the entry
+                                // was opened for, a large `ev->size` is a response
+                                // for another request, and the instruction address
+                                // says which load. Printing them turns a run that
+                                // dies with a line number into one that says what
+                                // it was doing, which is the difference between a
+                                // day and ten minutes.
+                                if(UNLIKELY((reg_offset + addr_offset + ev->size) > reg_width)) {
+                                    out->fatal(CALL_INFO, -1,
+                                        "load response does not fit the register: ins 0x%" PRI_ADDR " (%s), "
+                                        "load-addr 0x%" PRI_ADDR " width %" PRIu16 ", reg-offset %" PRIu64 ", "
+                                        "response vAddr 0x%" PRI_ADDR " pAddr 0x%" PRI_ADDR " size %" PRIu64 ", "
+                                        "addr-offset %" PRIu64 ", reg-width %" PRIu32 ", requests-left %d\n",
+                                        load_ins->getInstructionAddress(), load_ins->getInstCode(),
+                                        load_address, load_width, reg_offset,
+                                        ev->vAddr, ev->pAddr, (uint64_t) ev->size, addr_offset, reg_width,
+                                        (int) load_entry->countRequests());
+                                }
 
                                 for(auto i = 0; i < ev->size; ++i) {
                                     register_value.at(reg_offset + addr_offset + i) = ev->data[i];
