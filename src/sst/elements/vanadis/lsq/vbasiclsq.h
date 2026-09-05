@@ -31,6 +31,24 @@
 #include <vector>
 #include <queue>
 
+// A TRACE CALL THAT DOES NOT PAY FOR ITSELF WHEN NOBODY IS LISTENING.
+//
+// SST::Output::verbose is variadic, so the compiler cannot inline it however
+// short its body is: every call reaches the out-of-line copy, and its va_start
+// spills six integer and eight SSE registers to the stack BEFORE the level test
+// that throws the message away. At verbosity 0 -- which is every run that is
+// not being debugged -- that was 1.8 % of the whole simulator. One non-variadic
+// call answers first. The do/while makes this a statement, so it substitutes
+// for the call it replaces even as the unbraced body of an if or an else.
+#ifndef VANADIS_VERB
+#define VANADIS_VERB(obj, lvl, flg, ...)                                  \
+    do {                                                                  \
+        if ( (obj)->getVerboseLevel() >= (uint32_t)(lvl) ) {              \
+            (obj)->verbose(CALL_INFO, lvl, flg, __VA_ARGS__);             \
+        }                                                                 \
+    } while ( 0 )
+#endif
+
 using namespace SST::Interfaces;
 
 namespace SST {
@@ -190,7 +208,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // update the cache line size each cycle to make sure we get updates
             cache_line_width = memInterface->getLineSize();
 
-            output->verbose(CALL_INFO, 2, 0, "updating cache line size to: %" PRIu64 "\n", cache_line_width);
+            VANADIS_VERB(output, 2, 0, "updating cache line size to: %" PRIu64 "\n", cache_line_width);
         }
 
         void printStatus(SST::Output& out) override
@@ -217,12 +235,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         void tick(uint64_t cycle) override
         {
             if(output->getVerboseLevel() >= 16) {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> tick LSQ at cycle %" PRIu64 "\n", cycle);
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> tick LSQ at cycle %" PRIu64 "\n", cycle);
 
                 if(loads_pending.size() > 0) {
                     for(int i = loads_pending.size() - 1; i >= 0; i--) {
                         VanadisBasicLoadPendingEntry* load_entry = loads_pending.at(i);
-                        output->verbose(CALL_INFO, 8, 0, "-->   load[%5d] ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " / addr: 0x%" PRI_ADDR " / width: %" PRIu64 "\n",
+                        VANADIS_VERB(output, 8, 0, "-->   load[%5d] ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " / addr: 0x%" PRI_ADDR " / width: %" PRIu64 "\n",
                             i, load_entry->getLoadInstruction()->getInstructionAddress(),
                             load_entry->getLoadInstruction()->getHWThread(),
                             load_entry->getLoadAddress(), load_entry->getLoadWidth());
@@ -234,7 +252,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         for(int i = stores_pending[t].size() - 1; i >= 0; i--) {
                             VanadisBasicStorePendingEntry* store_entry = stores_pending[t].at(i);
 
-                            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> stores[%5d] ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " / addr: 0x%" PRI_ADDR " / width: %" PRIu64 "\n",
+                            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> stores[%5d] ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " / addr: 0x%" PRI_ADDR " / width: %" PRIu64 "\n",
                                 i, store_entry->getStoreInstruction()->getInstructionAddress(),
                                 store_entry->getStoreInstruction()->getHWThread(),
                                 store_entry->getStoreAddress(), store_entry->getStoreWidth());
@@ -284,7 +302,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 {
 
                     *target_thread = load_ins->getHWThread();
-                    out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> copyLoadResp thr=%d\n", *target_thread);
+                    VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> copyLoadResp thr=%d\n", *target_thread);
                     if(fp==true)
                     {
                         *target_isa_reg =  load_ins->getISAFPRegOut(0);
@@ -299,7 +317,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                 virtual void processLLSC(StandardMem::WriteResp* ev, VanadisStoreInstruction* store_ins,VanadisBasicStorePendingEntry* store_entry)
                 {
-                    out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, " (ScalarLSQ) -> processLLSC\n");
+                    VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_STORE_FLG, " (ScalarLSQ) -> processLLSC\n");
                     const uint16_t value_reg = store_ins->getPhysIntRegOut(0);
 
                     VanadisStoreConditionalInstruction* store_cond_ins = store_ins->asStoreConditional();
@@ -311,7 +329,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     if (ev->getSuccess()) {
                         const int64_t success_result = store_cond_ins->getResultSuccess();
 
-                        out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG,
+                        VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_STORE_FLG,
                                         "---> LSQ LLSC-STORE rt: %" PRIu64 " <- %" PRIu16 " (success)\n",
                                         success_result, value_reg);
                         lsq->registerFiles->at(store_ins->getHWThread())->setIntReg<int64_t>(value_reg,
@@ -319,7 +337,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     } else {
                         const int64_t failure_result = store_cond_ins->getResultFailure();
 
-                        out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> LSQ LLSC-STORE rt: %" PRIu64 " <- %" PRIu16 " (failed)\n",
+                        VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> LSQ LLSC-STORE rt: %" PRIu64 " <- %" PRIu16 " (failed)\n",
                                         failure_result, value_reg);
                         lsq->registerFiles->at(store_ins->getHWThread())->setIntReg<uint64_t>(value_reg,
                             failure_result);
@@ -328,7 +346,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                 virtual void handle(StandardMem::ReadResp* ev)
                 {
-                    out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> handle read-response (virt-addr: 0x%" PRI_ADDR ")\n", ev->vAddr);
+                    VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> handle read-response (virt-addr: 0x%" PRI_ADDR ")\n", ev->vAddr);
                     lsq->stat_loaded_bytes->addData(ev->size);
 
                     auto load_itr = lsq->loads_pending.begin();
@@ -357,7 +375,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     }
 
                     if(out->getVerboseLevel() >= 16) {
-                        out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
+                        VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                                         "--> LSQ match load entry, unpacking payload "
                                         "(load-addr: 0x%0" PRI_ADDR ", load-thr: %" PRIu32 ").\n",
                                         ev->pAddr, load_entry->getHWThread());
@@ -369,7 +387,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                     if ( ev->getFail())
                     {
-                        out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
+                        VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                                         "--> ev failed "
                                         "(load-addr: 0x%0" PRI_ADDR ", load-thr: %" PRIu32 ").\n",
                                         ev->pAddr, load_entry->getHWThread());
@@ -377,7 +395,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     }
                     if(ev->vAddr < 64)
                     {
-                        out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
+                        VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                                         "ev virtual addr<64 "
                                         "(load-addr: 0x%0" PRI_ADDR ",virtual-addr: 0x%0" PRI_ADDR ", load-thr: %" PRIu32 ").\n",
                                         ev->pAddr, ev->vAddr, load_entry->getHWThread());
@@ -405,7 +423,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         for ( std::vector<uint8_t>::iterator it = ev->data.begin(); it != ev->data.end(); it++ ) {
                             str << std::setw(2) << static_cast<unsigned>(*it);
                         }
-                        out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> LSQ recv load event ins: 0x%" PRI_ADDR " / hw-thr: %" PRIu32 " / entry-addr: 0x%" PRI_ADDR " / entry-width: %" PRIu16 " / reg-offset: %" PRIu64 " / ev-addr: 0x%" PRI_ADDR " / ev-width: %" PRIu64 " / addr-offset %" PRIu64 " / sign-extend: %s / target-isa-reg: %" PRIu16 " / target-phys-reg: %" PRIu16 " / reg-type: %s / %s\n",
+                        VANADIS_VERB(out, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> LSQ recv load event ins: 0x%" PRI_ADDR " / hw-thr: %" PRIu32 " / entry-addr: 0x%" PRI_ADDR " / entry-width: %" PRIu16 " / reg-offset: %" PRIu64 " / ev-addr: 0x%" PRI_ADDR " / ev-width: %" PRIu64 " / addr-offset %" PRIu64 " / sign-extend: %s / target-isa-reg: %" PRIu16 " / target-phys-reg: %" PRIu16 " / reg-type: %s / %s\n",
                             load_ins->getInstructionAddress(), load_entry->getHWThread(), load_address, load_width, reg_offset, ev->vAddr, ev->size,
                             addr_offset, (load_ins->performSignExtension() ? "yes" : "no"),
                             target_isa_reg, target_reg,
@@ -499,7 +517,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                     if(0 == load_entry->countRequests()) {
                         if(out->getVerboseLevel() >= 9) {
-                            out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG,
+                            VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_LOAD_FLG,
                                 "---> LSQ Execute: %s (0x%" PRI_ADDR " / thr: %" PRIu32 ") load data instruction "
                                 "marked executed.\n",
                                 load_ins->getInstCode(), load_ins->getInstructionAddress(), load_ins->getHWThread());
@@ -511,7 +529,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         delete load_entry;
                     } else {
                         if(out->getVerboseLevel() >= 9) {
-                            out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG,
+                            VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_LOAD_FLG,
                                 "---> LSQ Execute: %s (0x%" PRI_ADDR " / thr:%" PRIu32 ") does not have all requests completed yet %zu left, will not execute until all done.\n",
                                     load_ins->getInstCode(), load_ins->getInstructionAddress(), load_ins->getHWThread(), load_entry->countRequests());
                         }
@@ -521,7 +539,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                 virtual void handle(StandardMem::WriteResp* ev)
                 {
-                    out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "-> handle write-response (virt-addr: 0x%" PRI_ADDR ")\n", ev->vAddr);
+                    VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_STORE_FLG, "-> handle write-response (virt-addr: 0x%" PRI_ADDR ")\n", ev->vAddr);
                     lsq->stat_stored_bytes->addData(ev->size);
 
                     bool std_store_found = false;
@@ -534,7 +552,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     }
 
                     if(std_store_found) {
-                        out->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "--> write-response is a standard store is matched and cleared from in-flight operations successfully.\n");
+                        VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_STORE_FLG, "--> write-response is a standard store is matched and cleared from in-flight operations successfully.\n");
                         delete ev;
                         return;
                     }
@@ -591,13 +609,13 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         void processIncomingDataCacheEvent(StandardMem::Request* ev)
         {
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "received incoming data cache request -> processIncomingDataCacheEvent()\n");
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "received incoming data cache request -> processIncomingDataCacheEvent()\n");
 
             assert(ev != nullptr);
             assert(std_mem_handlers != nullptr);
 
             ev->handle(std_mem_handlers);
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "completed pass off to incoming handlers\n");
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "completed pass off to incoming handlers\n");
         }
 
         bool issueStoreFront(uint32_t thr)
@@ -607,33 +625,33 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             }
 
             if(output->getVerboseLevel() >= 16) {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "issue store-front (thr: %" PRIu32 ")-> check store is front of ROB and attempt to issue\n", thr);
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "issue store-front (thr: %" PRIu32 ")-> check store is front of ROB and attempt to issue\n", thr);
             }
 
             // check the front store of the pending queue, if this isn't currently dispatched
             // and is front of ROB, then we can execute it into the memory system
             VanadisBasicStorePendingEntry* current_store = stores_pending[thr].front();
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current pending store\n");
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current pending store\n");
             VanadisStoreInstruction* store_ins = current_store->getStoreInstruction();
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store\n");
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store\n");
             if(output->getVerboseLevel() >= 16)
             {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store queue front is ins addr: 0x%" PRI_ADDR "\n", store_ins->getInstructionAddress());
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store queue front is ins addr: 0x%" PRI_ADDR "\n", store_ins->getInstructionAddress());
             }
 
             // check we have not already dispatched this entry
             if( UNLIKELY(!current_store->isDispatched()) )
             {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "--> store-front is not already dispatched so attempt to put into memory system.\n");
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "--> store-front is not already dispatched so attempt to put into memory system.\n");
 
                 if( UNLIKELY(store_ins->checkFrontOfROB()) && LIKELY(store_ins->completedIssue()) )
                 {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> store is at front of ROB so OK to push into memory system.\n");
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> store is at front of ROB so OK to push into memory system.\n");
 
                     // store instruction is current front of ROB so ready to be send to memory system
                     bool issue_result = issueStore(current_store, store_ins);
 
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> attempt to issue store result is: %s\n",
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> attempt to issue store result is: %s\n",
                         issue_result ? "success" : "failed");
 
                     // this was a standard store (not LLSC/LOCK) and we issued into system successfully
@@ -644,30 +662,30 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
 
                         if(output->getVerboseLevel() >= 16) {
-                            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued store: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 " / sw_thr: %" PRIu32 " into memory system using standard store operation\n",
+                            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued store: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 " / sw_thr: %" PRIu32 " into memory system using standard store operation\n",
                                 store_ins->getInstructionAddress(), store_ins->getHWThread(),current_store->getSWThr());
                         }
                         delete current_store;
 
                         // mark executed
                         store_ins->markExecuted();
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued store: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 " / sw_thr: %" PRIu32 " / numStores: %" PRIu32 "\n",
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued store: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 " / sw_thr: %" PRIu32 " / numStores: %" PRIu32 "\n",
                                 store_ins->getInstructionAddress(), store_ins->getHWThread(),current_store->getSWThr(), store_ins->getNumStores());
                         stat_stores_executed->addData(1);
                     }
                     else
                     {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued non-standard store: 0x%" PRI_ADDR " / thr: %" PRIu32 " (marked dispatch, will stall until response)\n",
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "---> issued non-standard store: 0x%" PRI_ADDR " / thr: %" PRIu32 " (marked dispatch, will stall until response)\n",
                             store_ins->getInstructionAddress(), store_ins->getHWThread());
                         current_store->markDispatched();
                     }
                     return issue_result;
                 } else {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "----> store is not at ROB front so need to wait until this is marked\n");
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "----> store is not at ROB front so need to wait until this is marked\n");
                 }
             } else {
 
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store queue front is already dispatched. Returning\n");
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store queue front is already dispatched. Returning\n");
             }
             return false;
         }
@@ -712,7 +730,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 for ( std::vector<uint8_t>::iterator it = tmp.begin(); it != tmp.end(); it++ ) {
                     str << std::setw(2) << static_cast<unsigned>(*it);
                 }
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "--> thr %d, issue-store at ins: 0x%" PRI_ADDR " / store-addr: 0x%" PRI_ADDR " / width: %" PRIu64 " / partial: %s / split: %s / offset: %" PRIu32 " / %s\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "--> thr %d, issue-store at ins: 0x%" PRI_ADDR " / store-addr: 0x%" PRI_ADDR " / width: %" PRIu64 " / partial: %s / split: %s / offset: %" PRIu32 " / %s\n",
                     store_ins->getHWThread(), store_ins->getInstructionAddress(), store_address, store_width, store_ins->isPartialStore() ? "yes" : "no", needs_split ? "yes" : "no",
                     store_ins->getRegisterOffset(), str.str().c_str());
             }
@@ -730,7 +748,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             {
                 if(UNLIKELY(needs_split)) {
                     if(output->getVerboseLevel() >= 9) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: standard split-store\n");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: standard split-store\n");
                     }
 
                     const uint64_t store_width_right = (store_address + store_width) % cache_line_width;
@@ -742,7 +760,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     const uint64_t store_address_right = store_address + store_width_left;
 
                     if(output->getVerboseLevel() >= 9) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> store-left-at: 0x%" PRI_ADDR " left-width: %" PRIu64 ", store-right-at: 0x%" PRI_ADDR " right-width: %" PRIu64 "\n",
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> store-left-at: 0x%" PRI_ADDR " left-width: %" PRIu64 ", store-right-at: 0x%" PRI_ADDR " right-width: %" PRIu64 "\n",
                             store_address, store_width_left, store_address_right, store_width_right);
                     }
 
@@ -774,16 +792,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     return true;
                 } else {
                     if(output->getVerboseLevel() >= 9) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: standard store ins: 0x%" PRI_ADDR " store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: standard store ins: 0x%" PRI_ADDR " store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                             store_ins->getInstructionAddress(), store_address, store_width);
 
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "-----> payload = {");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "-----> payload = {");
 
                         for(auto i = 0; i < payload.size(); ++i) {
-                            output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, " %x", payload[i]);
+                            VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, " %x", payload[i]);
                         }
 
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "}\n");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "}\n");
                     }
 
                     store_req = new StandardMem::Write(store_address & address_mask, payload.size(), payload,
@@ -803,7 +821,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 if(UNLIKELY(needs_split)) {
                     output->fatal(CALL_INFO, -1, "Error - attempted to perform an LLSC-store over a split-cache line. This is not permitted.\n");
                 } else {
-                    output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: LLSC-store store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                    VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: LLSC-store store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                         store_address, store_width);
 
                     store_req = new StandardMem::StoreConditional(store_address & address_mask, payload.size(), payload,
@@ -815,7 +833,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 if(UNLIKELY(needs_split)) {
                     output->fatal(CALL_INFO, -1, "Error - attempted to perform an LOCK-store over a split-cache line. This is not permitted.\n");
                 } else {
-                    output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: LOCK-store store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                    VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_STORE_FLG, "---> [memory-transaction]: LOCK-store store-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                         store_address, store_width);
 
                     store_req = new StandardMem::WriteUnlock(store_address & address_mask, payload.size(), payload,
@@ -830,12 +848,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     store_ins->flagError();
                 }
 
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-----> store-request sent to memory interface / entry marked dispatched\n");
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-----> store-request sent to memory interface / entry marked dispatched\n");
                 memInterface->send(store_req);
                 store_entry->addRequest(store_req->getID());
                 store_entry->markDispatched();
             } else {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, "-----> store-request was not sent to memory interface, record is nullptr\n");
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-----> store-request was not sent to memory interface, record is nullptr\n");
             }
 
             return false;
@@ -874,7 +892,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 case MEM_TRANSACTION_NONE:
                 {
                     if(UNLIKELY(needs_split)) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: standard load (line auto-split)\n");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: standard load (line auto-split)\n");
                         // How many bytes are in the left most line?
                         const uint64_t load_width_right = (load_address + load_width) % cache_line_width;
                         assert(load_width_right > 0);
@@ -886,7 +904,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         assert((load_right_start % cache_line_width) == 0);
 
                         if(output->getVerboseLevel() >= 9) {
-                            output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> split load at-left: 0x%" PRI_ADDR " left-width: %" PRIu64 " / at-right: 0x%" PRI_ADDR " right-width: %" PRIu64 "\n",
+                            VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> split load at-left: 0x%" PRI_ADDR " left-width: %" PRIu64 " / at-right: 0x%" PRI_ADDR " right-width: %" PRIu64 "\n",
                                 load_address, load_width_left, load_address + load_width_left, load_width_right);
                         }
 
@@ -900,7 +918,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                             load_address + load_width_left, load_ins->getInstructionAddress(), load_ins->getHWThread());
                     } else {
                         if(output->getVerboseLevel() >= 9) {
-                            output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: standard load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                            VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: standard load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                                 load_address, load_width);
                         }
 
@@ -909,7 +927,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                         if(UNLIKELY(0 == (load_address & address_mask))) {
                             if(output->getVerboseLevel() >= 16) {
-                                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> address resolves to zero, flag as error and do not generate event.\n");
+                                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> address resolves to zero, flag as error and do not generate event.\n");
                             }
 
                             load_ins->flagError();
@@ -923,10 +941,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 case MEM_TRANSACTION_LLSC_LOAD:
                 {
                     if(UNLIKELY(needs_split)) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> load is marked LLSC but it requires a cache line split, generates an error\n");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> load is marked LLSC but it requires a cache line split, generates an error\n");
                         load_ins->flagError();
                     } else {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: LLSC-load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: LLSC-load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                             load_address, load_width);
                         load_req = new StandardMem::LoadLink(load_address & address_mask, load_width, 0,
                                             load_address, load_ins->getInstructionAddress(), load_ins->getHWThread());
@@ -941,10 +959,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 case MEM_TRANSACTION_LOCK:
                 {
                     if(UNLIKELY(needs_split)) {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> load is marked LOCK but it requires a cache line split, this generates an error\n");
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> load is marked LOCK but it requires a cache line split, this generates an error\n");
                         load_ins->flagError();
                     } else {
-                        output->verbose(CALL_INFO, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: LOCK-load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
+                        VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG, "---> [memory-transaction]: LOCK-load (not split) load-at: 0x%" PRI_ADDR " width: %" PRIu64 "\n",
                             load_address, load_width);
                         load_req = new StandardMem::ReadLock(load_address & address_mask, load_width, 0,
                                             load_address, load_ins->getInstructionAddress(), load_ins->getHWThread());
@@ -961,7 +979,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 addLoadRequest(load_ins,load_entry, load_req);
                 memInterface->send(load_req);
 
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-----> ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " processed and requests sent to memory system. numRequests=%lu\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-----> ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " processed and requests sent to memory system. numRequests=%lu\n",
                     load_ins->getInstructionAddress(), load_ins->getHWThread(), load_entry->countRequests());
 
                 loads_pending.push_back(load_entry);
@@ -970,17 +988,17 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         virtual bool sendLoadReq(VanadisLoadInstruction* load_ins)
         {
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                 "In sendLoadReq (ScalarLSQ) hw_thr:%d\n", load_ins->getHWThread());
             std::vector<uint64_t> load_addresses;
             std::vector<uint16_t> load_widths;
 
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 "\n",
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 "\n",
             load_ins->getInstructionAddress(), load_ins->getHWThread());
             bool result = load_process(load_ins->getHWThread(),load_ins,
                     load_addresses, load_widths);
 
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " result=%s #load_address=%lu #load_widths=%lu...\n",
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " result=%s #load_address=%lu #load_widths=%lu...\n",
                     load_ins->getInstructionAddress(), load_ins->getHWThread(), (result==true) ? "success":"fail", load_addresses.size(), load_widths.size());
 
             if(LIKELY((load_addresses.size()>0) & (load_widths.size()>0)))
@@ -993,7 +1011,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         virtual bool sendStoreReq(VanadisInstruction* store_ins_temp)
         {
             VanadisStoreInstruction* store_ins = store_ins_temp->asStore();
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                 "In sendstoreReq (ScalarLSQ) hw_thr:%d\n", store_ins->getHWThread());
             uint64_t store_address_last = 0;
             uint8_t trap_error = 0;
@@ -1009,7 +1027,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     output->fatal(CALL_INFO, -1, "Error: store process failed (ins: 0x%" PRI_ADDR ", thr: %" PRIu32 ")\n",
                         store_ins->getInstructionAddress(), store_ins->getHWThread());
                 }
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> queue front is store: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, " (ScalarLSQ) -> queue front is store: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
                         new_pending_store->getStoreInstruction()->getInstructionAddress(), new_pending_store->getStoreInstruction()->getHWThread());
                 stores_pending[store_ins->getHWThread()].push_back(new_pending_store);
                 stores_pending_size++;
@@ -1024,13 +1042,13 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 return false;
             }
             VanadisBasicLoadStoreEntry* front_entry = op_q[thr].front();
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> cycle: %" PRIu64 " / attempt: %" PRIu16 " / thr: %" PRId32"\n", cycle, attempt_this_cycle, thr);
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> cycle: %" PRIu64 " / attempt: %" PRIu16 " / thr: %" PRId32"\n", cycle, attempt_this_cycle, thr);
 
 
 
             if(! front_entry->getInstruction()->completedIssue()) {
                 if(output->getVerboseLevel() >= 16) {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has not completed issue, will not process this cycle.\n",
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has not completed issue, will not process this cycle.\n",
                         front_entry->getInstruction()->getInstructionAddress(), front_entry->getInstruction()->getHWThread());
                 }
                 return false;
@@ -1039,7 +1057,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             switch(front_entry->getEntryOp()) {
                 case VanadisBasicLoadStoreEntryOp::LOAD:
                 {
-                    //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue LOAD\n", cycle);
+                    //VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue LOAD\n", cycle);
                     VanadisLoadInstruction* load_ins =
                         front_entry->getInstruction()->asLoad();
 
@@ -1052,11 +1070,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     // can't do anything this cycle, so return false
                     if(loads_pending.size() >= max_loads)
                     {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue LOAD failed: max_loads\n", cycle);
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue LOAD failed: max_loads\n", cycle);
                         return false;
                     }
 
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> queue front is load: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> queue front is load: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
                         load_ins->getInstructionAddress(), load_ins->getHWThread());
 
                     bool result = sendLoadReq(load_ins);
@@ -1067,7 +1085,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         delete op_q[thr].front();
                         op_q[thr].pop_front();
                         op_q_size--;
-                        //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue LOAD succeeded\n", cycle);
+                        //VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue LOAD succeeded\n", cycle);
                         return true;
                     }
                     return result;
@@ -1075,7 +1093,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 case VanadisBasicLoadStoreEntryOp::STORE:
                 {
 
-                    //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue STORE\n", cycle);
+                    //VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue STORE\n", cycle);
                     // VanadisStoreInstruction* store_ins = dynamic_cast<VanadisStoreInstruction*>(
                     //     front_entry->getInstruction());
                     VanadisInstruction* store_ins = front_entry->getInstruction();
@@ -1087,12 +1105,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     // if we have too many operations pending, return false to tell handler
                     // we couldn't perform any operations this cycle
                     if(stores_pending_size >= max_stores) {
-                        //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue STORE failed: max stores\n", cycle);
+                        //VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue STORE failed: max stores\n", cycle);
                         return false;
                     }
 
                     if(output->getVerboseLevel() >= 16) {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> queue front is store: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> queue front is store: ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " has issued so will process...\n",
                             front_entry->getInstructionAddress(), front_entry->getHWThread());
                     }
 
@@ -1101,12 +1119,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     delete op_q[thr].front();
                     op_q[thr].pop_front();
                     op_q_size--;
-                    //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue STORE succeeded\n", cycle);
+                    //VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue STORE succeeded\n", cycle);
                     return true;
                 } break;
                 case VanadisBasicLoadStoreEntryOp::FENCE:
                 {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue FENCE\n", cycle);
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue FENCE\n", cycle);
                     VanadisInstruction* current_ins = op_q[thr].front()->getInstruction();
                     VanadisFenceInstruction* current_fence_ins = current_ins->asFence();
 
@@ -1129,7 +1147,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     if(can_execute) {
                         // if(output->getVerboseLevel() >= 16)
                         {
-                            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> execute fence instruction (0x%" PRI_ADDR "), all checks have passed.\n",
+                            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> execute fence instruction (0x%" PRI_ADDR "), all checks have passed.\n",
                                 current_fence_ins->getInstructionAddress());
                         }
                         current_fence_ins->markExecuted();
@@ -1139,10 +1157,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         delete op_q[thr].front();
                         op_q[thr].pop_front();
                         op_q_size--;
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue FENCE succeeded\n", cycle);
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue FENCE succeeded\n", cycle);
                         return true;
                     } else {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue FENCE failed: cannot execute\n", cycle);
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " issue FENCE failed: cannot execute\n", cycle);
                         return false;
                     }
                 } break;
@@ -1158,16 +1176,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             VanadisRegisterFile* hw_thr_reg = registerFiles->at(sw_thr);
             uint64_t load_address = 0;
             uint16_t load_width   = 0;
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> computeLoadAddress for sw_thr: %" PRIu32 "\n",sw_thr);
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> computeLoadAddress for sw_thr: %" PRIu32 "\n",sw_thr);
             load_ins->computeLoadAddress(output, hw_thr_reg, &load_address, &load_width);
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> computeLoadAddress for 0x%" PRI_ADDR " / sw_thr: %" PRIu32 "\n",
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> computeLoadAddress for 0x%" PRI_ADDR " / sw_thr: %" PRIu32 "\n",
                 load_address, sw_thr);
 
             if(UNLIKELY(load_ins->trapsError()))
             {
                 // if(output->getVerboseLevel() >= 16)
                 {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 "sw_thr: %" PRIu32 " traps error, will not process and allow pipeline to handle \n",
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / hw_thr: %" PRIu32 "sw_thr: %" PRIu32 " traps error, will not process and allow pipeline to handle \n",
                         load_ins->getInstructionAddress(), load_ins->getHWThread(), sw_thr);
                     // load_ins->setNumLoads(0);
                     load_addresses.clear();
@@ -1179,7 +1197,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             {
                 if(output->getVerboseLevel() >= 16)
                 {
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " want load at 0x%" PRI_ADDR " / width: %" PRIu16 "\n",
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " want load at 0x%" PRI_ADDR " / width: %" PRIu16 "\n",
                         load_ins->getInstructionAddress(), load_ins->getHWThread(), load_address, load_width);
                 }
 
@@ -1189,12 +1207,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 {
                     if(output->getVerboseLevel() >= 16)
                     {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " conflicts with store entry, will not issue until conflict is resolved (load-addr: 0x%" PRI_ADDR " / width: %" PRIu32 ")\n",
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " conflicts with store entry, will not issue until conflict is resolved (load-addr: 0x%" PRI_ADDR " / width: %" PRIu32 ")\n",
                             load_ins->getInstructionAddress(), load_ins->getHWThread(), load_address, load_width);
                     }
 
                     // tell caller we would not issue
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LOAD failed: store conflict\n");
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LOAD failed: store conflict\n");
                     return false;
 
                     // Drain store q to ensure that a paired SC/Unlock can be issued close to the LL/Lock
@@ -1203,12 +1221,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 {
                     if (!stores_pending[load_ins->getHWThread()].empty())
                     {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LLSC/LOCK LOAD failed: store pending\n");
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LLSC/LOCK LOAD failed: store pending\n");
                         return false;
                     }
                     else
                     {
-                        output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LLSC/LOCK LOAD possible sw_thr=%d\n", sw_thr);
+                        VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> issue LLSC/LOCK LOAD possible sw_thr=%d\n", sw_thr);
                         // issueLoad(load_ins, load_address, load_width);
                         load_addresses.push_back(load_address);
                         load_widths.push_back(load_width);
@@ -1218,7 +1236,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 {
                     // We are good to issue with all checks completed!
                     // issueLoad(load_ins, load_address, load_width);
-                    output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> issue LOAD possible sw_thr=%d\n", sw_thr);
+                    VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> issue LOAD possible sw_thr=%d\n", sw_thr);
                     load_addresses.push_back(load_address);
                     load_widths.push_back(load_width);
                 }
@@ -1234,18 +1252,18 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             uint64_t store_address = 0;
             uint16_t store_width  = 0;
             *trap_error = 0;
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> computeStoreAddress for sw_thr: %" PRIu32 "\n",sw_thr);
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> computeStoreAddress for sw_thr: %" PRIu32 "\n",sw_thr);
             store_ins->computeStoreAddress(output, hw_thr_reg, &store_address, &store_width);
             if(store_ins->trapsError())
             {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> warning: 0x%" PRI_ADDR " / thr: %" PRIu32 " traps error, marks executed and does not process.\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> warning: 0x%" PRI_ADDR " / thr: %" PRIu32 " traps error, marks executed and does not process.\n",
                     store_ins->getInstructionAddress(), store_ins->getHWThread());
                 // store_ins->setNumStores(0);
                 store_ins->markExecuted();
                 *store_address_last = store_address;
                 *trap_error=1;
             }
-            output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> computed store address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 " ins_addr: 0x%" PRI_ADDR "\n",
+            VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> computed store address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 " ins_addr: 0x%" PRI_ADDR "\n",
                 store_address, *store_address_last, store_width, sw_thr, store_ins->getHWThread(),store_ins->getInstructionAddress());
             if ((*store_address_last != store_address) || (*store_address_last ==0))
             {
@@ -1254,14 +1272,14 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 new_pending_store->setSWThr(sw_thr);
                 new_pending_store->addThr(sw_thr);
 
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> ins_addr: 0x%" PRI_ADDR " store address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 "\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> ins_addr: 0x%" PRI_ADDR " store address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 "\n",
                     new_pending_store->getStoreInstruction()->getInstructionAddress(), store_address, *store_address_last, store_width, sw_thr, store_ins->getHWThread());
                 *store_address_last = store_address;
                 return new_pending_store;
             }
             else
             {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> pending_store=null address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 "\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "----> pending_store=null address: 0x%" PRI_ADDR " store_address_last: 0x%" PRI_ADDR " width: %" PRIu16 " sw_thr: %" PRIu32 " hw_thr: %" PRIu32 "\n",
                     store_address, *store_address_last, store_width, sw_thr, store_ins->getHWThread());
                 return nullptr;
             }
@@ -1276,7 +1294,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             const bool splits_line = cache_line_left != cache_line_right;
 
             if(output->getVerboseLevel() >= 16) {
-                output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> check split addr: %" PRIu64 " (0x%" PRI_ADDR ") / width: %" PRIu64 " / cache-line: %" PRIu64 " / line-left: %" PRIu64 " / line-right: %" PRIu64 " / split: %3s\n",
+                VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "---> check split addr: %" PRIu64 " (0x%" PRI_ADDR ") / width: %" PRIu64 " / cache-line: %" PRIu64 " / line-left: %" PRIu64 " / line-right: %" PRIu64 " / split: %3s\n",
                     address, address, width, cache_line_width, cache_line_left, cache_line_right, splits_line ? "yes" : "no");
             }
 
