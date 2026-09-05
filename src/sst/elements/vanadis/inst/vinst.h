@@ -374,7 +374,19 @@ class VanadisInstruction
         virtual VanadisSpeculatedInstruction*       asSpeculated()       { return nullptr; }
         virtual VanadisSysCallInstruction*          asSysCall()          { return nullptr; }
 
+        // THE LAST MICRO-OP OF ONE PROGRAM INSTRUCTION.
+        //
+        // A decoder may expand one instruction of the program into several
+        // micro-ops -- an ECALL becomes a fence and a system call, an atomic
+        // read-modify-write becomes a load, a store-conditional and a branch --
+        // and every one of them carries the same instruction address. The
+        // bundle that holds them sets this flag on the last one and clears it on
+        // the others (VanadisInstructionBundle::addInstruction), so a counter
+        // that wants PROGRAM instructions rather than micro-ops counts the
+        // retirements this flag is set on, which is exactly one per instruction
+        // the program executed.
         void markEndOfMicroOpGroup() { end_uop_group_ = true; }
+        void clearEndOfMicroOpGroup() { end_uop_group_ = false; }
         bool endsMicroOpGroup() const { return end_uop_group_; }
         bool trapsError() const { return trap_error_; }
 
