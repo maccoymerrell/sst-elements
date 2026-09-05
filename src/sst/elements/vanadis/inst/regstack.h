@@ -33,8 +33,31 @@ namespace Vanadis {
 class VanadisRegisterStack
 {
 public:
-    // count - number of registers to manage
-    VanadisRegisterStack(const size_t count) : max_capacity_(count)
+    // count       - number of registers in the file
+    // first_usable - the lowest register index this stack may hand out
+    //
+    // WHY A REGISTER FILE CAN HAVE A REGISTER THE STACK MUST NOT HAND OUT.
+    //
+    // VanadisRegisterFile::getIntReg and setIntReg compare their argument --
+    // which is a PHYSICAL register index -- against
+    // VanadisDecoderOptions::getRegisterIgnoreWrites(), which is an
+    // ARCHITECTURAL register number. On RISC-V that number is 0, so PHYSICAL
+    // integer register 0 reads as zero and swallows every write to it. An
+    // instruction that is renamed onto it produces nothing and any consumer of
+    // its result reads zero, silently and thousands of cycles before anything
+    // goes visibly wrong.
+    //
+    // It never mattered while the old issue stage held so few instructions in
+    // flight that the free list never emptied. It matters the moment renaming
+    // runs ahead: the free list is a stack, physical register 0 sits at the
+    // bottom of it, and it is handed out exactly when the last register is
+    // taken. So the integer stack is built with first_usable = 1 and the file's
+    // hardwired register is never allocated. Nothing else about the machine
+    // changes; there is one fewer RENAMEABLE integer register, which is what a
+    // machine with a hardwired-zero architectural register has anyway.
+    VanadisRegisterStack(const size_t count, const uint16_t first_usable = 0) :
+        max_capacity_(count),
+        first_usable_(first_usable)
     {
         regs_ = new uint16_t[max_capacity_];
         reset();
@@ -65,7 +88,7 @@ public:
     size_t unused() const { return stack_top_; }
 
     // Returns whether all registers are available (reg stack is full)
-    bool full() { return (max_capacity_ == stack_top_); }
+    bool full() { return ((max_capacity_ - first_usable_) == stack_top_); }
 
     // Returns whether no registers are available (stack is empty)
     bool empty() { return ( max_capacity_ == 0); }
@@ -85,14 +108,15 @@ private:
 
     // Reset the register stack to all available
     void reset() {
-        stack_top_ = max_capacity_;
+        stack_top_ = max_capacity_ - first_usable_;
 
-        for(auto i = 0; i < max_capacity_; ++i) {
-            regs_[i] = i;
+        for(size_t i = 0; i < stack_top_; ++i) {
+            regs_[i] = static_cast<uint16_t>(i + first_usable_);
         }
     }
 
-    const size_t    max_capacity_; // Total number of registers
+    const size_t    max_capacity_; // Total number of registers in the file
+    const uint16_t  first_usable_; // Lowest index this stack will hand out
     size_t          stack_top_;    // Stack index of the most recently allocated (pop'd) entry
 
     uint16_t* regs_; // Indices of available registers

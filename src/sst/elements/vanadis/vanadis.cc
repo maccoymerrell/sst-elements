@@ -32,7 +32,7 @@ using namespace std;
 
 
 VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params) : Component(id), current_cycle(0),
-    m_curRetireHwThread(0), m_curIssueHwThread(0), m_checkpointing(nullptr)
+    m_curRetireHwThread(0), m_curIssueHwThread(0), m_curDispatchHwThread(0), m_checkpointing(nullptr)
 {
 
     instPrintBuffer = new char[1024];
@@ -122,9 +122,25 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
     char* decoder_name = new char[64];
 
-    // Create register stacks to manage allocation of available registers
-    int_register_stack = new VanadisRegisterStack(int_reg_count);
+    // Create register stacks to manage allocation of available registers.
+    // PHYSICAL integer register 0 is not one of them -- VanadisRegisterFile
+    // hardwires it to zero, see the note on VanadisRegisterStack's constructor.
+    // The floating-point file has no such register.
+    int_register_stack = new VanadisRegisterStack(int_reg_count, 1);
     fp_register_stack = new VanadisRegisterStack(fp_reg_count);
+
+    // ONE BIT PER PHYSICAL REGISTER: has the value it is going to hold been
+    // produced? Every register starts on the free list holding nothing, so
+    // every bit starts set; the bit is cleared where a register is popped to be
+    // written (assignRegistersToInstruction) and set again where the write
+    // happens (VanadisInstruction::markExecuted, via the write-back queue) or
+    // where the register goes back on the free list. Bits past the register
+    // count are set and never asked about.
+    //
+    // Shared rather than per hardware thread, because the free list is: a
+    // physical register belongs to whichever thread popped it, and to no other.
+    int_phys_ready.assign((static_cast<size_t>(int_reg_count) + 63) / 64, ~static_cast<uint64_t>(0));
+    fp_phys_ready.assign((static_cast<size_t>(fp_reg_count) + 63) / 64, ~static_cast<uint64_t>(0));
 
     // Create the decoder(s) - one per HW thread
     SubComponentSlotInfo * decoders = getSubComponentSlotInfo("decoder");
@@ -202,9 +218,31 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
         thread_decoders[i]->setThreadROB(rob[i]);
 
-        // Reserve ISA registers
+        // Reserve ISA registers.
+        //
+        // THE HARDWIRED-ZERO ARCHITECTURAL REGISTER LIVES AT PHYSICAL REGISTER
+        // 0, AND IS NEVER RENAMED. VanadisRegisterFile::getIntReg and setIntReg
+        // already treat physical index 0 as the ignore-writes register -- they
+        // compare a PHYSICAL index against an ARCHITECTURAL register number --
+        // so physical register 0 reads as zero and swallows writes whatever is
+        // mapped onto it. Putting x0 there and nothing else makes that
+        // behaviour exactly right instead of a trap: every read of x0 is zero at
+        // every instant, and an instruction that "writes" x0 writes nothing.
+        //
+        // The alternative, which is what this did before, is to rename x0 like
+        // any other register and re-zero whatever it currently maps to at the
+        // top of each cycle. That leaves a window -- a consumer renamed onto a
+        // freshly popped physical register reads whatever the last owner left in
+        // it until the next cycle begins -- and a coprocessor instruction, which
+        // reads its operands out of the register file at the instant it issues,
+        // falls straight into it. The old issue stage hid the window by refusing
+        // to issue anything that read a register an older un-retired instruction
+        // wrote, x0 included; a scheduler that wakes on write-back does not have
+        // that accident to rely on, and should not need one.
+        const uint16_t zero_isa_int_reg = isa_options[i]->getRegisterIgnoreWrites();
         for ( uint16_t j = 0; j < thread_decoders[i]->countISAIntReg(); ++j ) {
-            issue_isa_tables[i]->setIntPhysReg(j, int_register_stack->pop());
+            if ( j == zero_isa_int_reg ) { issue_isa_tables[i]->setIntPhysReg(j, 0); }
+            else                         { issue_isa_tables[i]->setIntPhysReg(j, int_register_stack->pop()); }
         }
 
         // Reserve ISA registers
@@ -253,6 +291,22 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
         tmp_fp_reg_write.push_back( 0 );
         resetRegisterUseTemps(i, max_int_regs, max_fp_regs);
     }
+
+    // The scheduling window IS the reorder buffer, so its bit sets are indexed
+    // by reorder-buffer slot and 0xFFFF is the "no slot" marker.
+    if ( rob_count >= VanadisIssueScheduler::NO_SLOT ) {
+        output->fatal(
+            CALL_INFO, -1,
+            "reorder_slots is %" PRIu32 "; the issue scheduler indexes reorder-buffer slots in 16 bits and so "
+            "supports at most %" PRIu32 ".\n",
+            rob_count, (uint32_t)VanadisIssueScheduler::NO_SLOT - 1);
+    }
+
+    sched.resize(hw_threads);
+    for ( uint32_t i = 0; i < hw_threads; ++i ) {
+        sched[i].configure(rob_count, int_reg_count, fp_reg_count);
+    }
+    writeback_q.reserve(64);
 
 
     //	memDataInterface =
@@ -529,7 +583,8 @@ VANADIS_COMPONENT::performDecode(const uint64_t cycle)
         }
     }
     if ( blocked ) { // If all threads are blocked, attempt next thread first on next cycle
-        decode_start_thread_ = ( start_thr + 1 ) % hw_threads;
+        decode_start_thread_ = ( start_thr + 1 );
+        if ( decode_start_thread_ >= hw_threads ) { decode_start_thread_ = 0; }
     }
 }
 
@@ -610,241 +665,386 @@ vanadisIssueResourceCheck(
     return 0;
 }
 
-int
-VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_start, int& unallocated_memory_op_seen)
+// THE ISSUE STAGE IS WAKEUP AND SELECT, NOT A SCAN OF THE REORDER BUFFER.
+//
+// What this stage used to be: one pass over every entry of the reorder buffer,
+// every cycle, asking of each one "do any of the instructions ahead of you
+// write a register you read, read a register you write, or write a register you
+// write" -- at the ARCHITECTURAL register level, and with "ahead of you" meaning
+// "has not RETIRED yet". The pass could not stop early, because the two
+// scoreboard words it accumulates have to cover every entry ahead of any entry
+// that might still issue. On this core's 352-entry buffer, which the rule above
+// kept full at 350.9 entries, that was 351 pointer chases and about 2.5 cache
+// misses a cycle -- 53 % of the simulator on one workload and 74 % on another.
+//
+// What it is now, which is what the machine it models actually does:
+//
+//   WAKEUP   an instruction becomes eligible when its producers have WRITTEN
+//            BACK, not when they have committed. The reorder buffer exists so
+//            that architectural state is updated in order; it has never gated
+//            dataflow, and gating on it made a dependent chain's latency equal
+//            to the buffer's drain time. Cost: one pass over the instructions
+//            that produced a result this cycle, each walking the waiter list of
+//            the registers it wrote.
+//
+//   SELECT   the oldest READY instruction of each functional-unit class, up to
+//            the issue width, oldest first across classes. Cost: nine class
+//            scans of six words each per slot.
+//
+//   DISPATCH rename, strictly in program order, of the oldest not-yet-renamed
+//            entries. Renaming in order is what removes the name dependences --
+//            the WAR and WAW tests above -- rather than merely relaxing them:
+//            the map is always consistent, so the younger writer's new physical
+//            register makes the hazard impossible instead of detectable. Cost:
+//            O(issue width).
+//
+// Everything the old stage guaranteed about ORDER is still guaranteed, and by
+// construction rather than by rescanning: loads, stores and fences enter the
+// load/store queue in program order because only the head of `mem_order_` is
+// selectable; a coprocessor instruction issues only at the head of the reorder
+// buffer, because an accelerator command cannot be taken back; a syscall issues
+// only with the load/store queue drained, and nothing renames past it.
+void
+VANADIS_COMPONENT::performIssue(const uint64_t cycle)
 {
-    #ifdef VANADIS_BUILD_DEBUG
-    const int output_verbosity = output->getVerboseLevel();
-    #endif
-    bool      issued_an_ins    = false;
+    // WAKEUP //////////////////////////////////////////////////////////////////
+    processWritebacks();
 
-    auto i = hwThr;
+    for ( uint32_t i = 0; i < hw_threads; ++i ) { sched[i].blocked_ = 0; }
 
-    if ( LIKELY(! halted_masks[i] )) {
-        #ifdef VANADIS_BUILD_DEBUG
-        if ( output->getVerboseLevel() >= 4 ) {
-            if(print_issue_tables) {
-                issue_isa_tables[i]->print(output, register_files[i], print_int_reg, print_fp_reg);
-            }
-        }
-        #endif
-        // we have not issued an instruction this cycle
-        issued_an_ins = false;
-        VanadisCircularQueue<VanadisInstruction*>* thr_rob;
-        thr_rob = rob[hwThr];
-        // Find the next instruction which has not been issued yet
-        const auto rob_size = thr_rob->size();
+    // SELECT //////////////////////////////////////////////////////////////////
+    for ( uint32_t n = 0; n < issues_per_cycle; ++n ) {
+        bool progressed = false;
 
-        // The scoreboard for this thread, held in registers for the length of
-        // the scan and written back once at the end. It carries across the
-        // several calls this stage makes per cycle (issues_per_cycle of them,
-        // each resuming where the last one issued); tick() clears it once per
-        // cycle before the first.
-        uint64_t int_reg_write_mask       = tmp_int_reg_write[i];
-        uint64_t not_issued_int_read_mask = tmp_not_issued_int_reg_read[i];
-        uint64_t fp_reg_write_mask        = tmp_fp_reg_write[i];
-        uint64_t not_issued_fp_read_mask  = tmp_not_issued_fp_reg_read[i];
+        for ( uint32_t t = 0; t < hw_threads; ++t ) {
+            const uint32_t thr = m_curIssueHwThread;
+            // A remainder by a run-time thread count, on a path taken tens of
+            // times a cycle, is a hardware division. Both operands are known to
+            // be in range, so the wrap is a compare.
+            if ( ++m_curIssueHwThread == hw_threads ) { m_curIssueHwThread = 0; }
 
-        VanadisISATable* const thr_isa_table = issue_isa_tables[i];
-
-        // Both are loop-invariant: the only thing in this loop that takes a
-        // physical register is assignRegistersToInstruction, and the scan stops
-        // at the instruction it ran for.
-        const size_t int_regs_unused = int_register_stack->unused();
-        const size_t fp_regs_unused  = fp_register_stack->unused();
-
-        for ( auto j = rob_start; j < rob_size; ++j )
-        {
-            VanadisInstruction* ins = thr_rob->peekAt(j);
-
-            if ( ! ins->completedIssue() )
-            {
-                #ifdef VANADIS_BUILD_DEBUG
-                if ( output_verbosity >= 8 )
-                {
-                    if ( j == 0 )
-                    {
-                        ins->printToBuffer(instPrintBuffer, 1024);
-                        output->verbose(
-                            CALL_INFO, 8, 0, "%d: --> Attempting issue for: rob[%" PRIu32 "]: 0x%" PRI_ADDR " / %s\n", i, j,
-                            ins->getInstructionAddress(), instPrintBuffer);
-                    }
-                }
-                #endif
-                const int resource_check = vanadisIssueResourceCheck(
-                    ins, int_regs_unused, fp_regs_unused, thr_isa_table, int_reg_write_mask,
-                    not_issued_int_read_mask, fp_reg_write_mask, not_issued_fp_read_mask, output);
-
-                #ifdef VANADIS_BUILD_DEBUG
-                if ( output_verbosity >= 8 )
-                {
-                    if ( j == 0 )
-                    {
-                        output->verbose(
-                        CALL_INFO, 8, 0, "%d ----> Check if registers are usable? result: %d (%s)\n", i, resource_check,
-                        (0 == resource_check) ? "success" : "cannot issue");
-                    }
-                }
-                #endif
-                if ( 0 == resource_check ) // Resources available, can issue
-                {
-                    const auto ins_type = ins->getInstFuncType();
-                    int allocate_fu = 1;
-                    const bool is_rocc = (ins_type == INST_ROCC0 || ins_type == INST_ROCC1 ||
-                                          ins_type == INST_ROCC2 || ins_type == INST_ROCC3);
-
-                    // A coprocessor instruction is architecturally visible the
-                    // moment it issues: an accelerator may have sent something
-                    // no one can take back -- an NMFC FORK puts an invocation
-                    // on the fabric. So it issues only when it is the oldest
-                    // instruction in the reorder buffer and therefore cannot be
-                    // squashed. Without this a branch mispredict flushes an
-                    // instruction that has already executed, and the response
-                    // later writes a physical register that has since been
-                    // recovered and handed to somebody else.
-                    if (is_rocc && j != 0) { allocate_fu = 1; }
-                    else if (ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE || is_rocc)
-                    {
-                        if(unallocated_memory_op_seen) {
-                            // the instruction should not be allocated because memory operations
-                            // must be issued to the LSQ in order to maintain memory ordering
-                            // semantics
-                            allocate_fu = 1;
-
-                        } else {
-
-                            allocate_fu = allocateFunctionalUnit(ins);
-
-                        }
-                    }
-                    else
-                    {
-                        allocate_fu = allocateFunctionalUnit(ins);
-                    }
-
-                    #ifdef VANADIS_BUILD_DEBUG
-                    if ( output_verbosity >= 8 ) {
-                        if ( j == 0 )
-                        {
-                        output->verbose(
-                            CALL_INFO, 8, 0, "%d: ----> allocated functional unit: %s\n",
-                            i, (0 == allocate_fu) ? "yes" : "no");
-                        }
-                    }
-                    #endif
-                    if ( 0 == allocate_fu )
-                    {
-                        int status = 0;
-
-                        status = assignRegistersToInstruction(
-                                thread_decoders[i]->countISAIntReg(), thread_decoders[i]->countISAFPReg(), ins,
-                                int_register_stack, fp_register_stack, issue_isa_tables[i]);
-                        #ifdef VANADIS_BUILD_DEBUG
-                            if ( checkVerboseAddr( ins->getInstructionAddress() ) )
-                            {
-                                output->setVerboseLevel(8);
-                            }
-                            if ( output_verbosity >= 8 )
-                            {
-                                ins->printToBuffer(instPrintBuffer, 1024);
-                                output->verbose(
-                                    CALL_INFO, 8, 0, "%d: ----> Issued for: %s / 0x%" PRI_ADDR " / status: %d\n",
-                                    ins->getHWThread(), instPrintBuffer, ins->getInstructionAddress(), status);
-                                if ( print_rob && i != 0) {
-                                    printRob(i,thr_rob);
-                                }
-                            }
-                        #endif
-
-                        ins->markIssued();
-                        ins_issued_this_cycle++;
-                        issued_an_ins = true;
-                    }
-                    else
-                    {
-                        if(ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE)
-                        {
-                            // we have seen a memory operation which is not issued, downstream operations
-                            // cannot issue yet to maintain ordering
-                            unallocated_memory_op_seen = true;
-                        }
-                    }
-                }
-                else
-                {
-                    // This trace is now compiled out of a non-debug build, like
-                    // every other trace in this function. It was the one that
-                    // was not, so a build with no debug support still formatted
-                    // an instruction into a print buffer for every blocked
-                    // reorder-buffer entry, every cycle, and then discarded it
-                    // because the verbosity was 0.
-                    #ifdef VANADIS_BUILD_DEBUG
-                    if(1 == resource_check)
-                    {
-                        ins->printToBuffer(instPrintBuffer, 1024);
-                        output->verbose(
-                            CALL_INFO, 8, 0, "%d: --> Failed to issue for: rob[%" PRIu32 "]: 0x%" PRI_ADDR " / %s\n", i, j,
-                            ins->getInstructionAddress(), instPrintBuffer);
-                    }
-                    #endif
-
-                    // getInstFuncType() is virtual, so it is asked only when the
-                    // answer can still change something: once a memory
-                    // operation has been seen this cycle the flag stays set.
-                    if ( !unallocated_memory_op_seen ) {
-                        const auto ins_type = ins->getInstFuncType();
-
-                        if(ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE) {
-                            // we have seen a memory operation which is not issued, downstream operations
-                            // cannot issue yet to maintain ordering
-                            unallocated_memory_op_seen = true;
-                        }
-                    }
-                }
-
-                // if the instruction is *not* issued yet, we need to keep track
-                // of which instructions are being read
-                not_issued_int_read_mask |= ins->getISAIntRegInMask();
-                not_issued_fp_read_mask  |= ins->getISAFPRegInMask();
-            }
-            // Collect up all integer and fp registers we write to
-            int_reg_write_mask |= ins->getISAIntRegOutMask();
-            fp_reg_write_mask  |= ins->getISAFPRegOutMask();
-            // We issued an instruction this cycle, so exit
-            if ( issued_an_ins ) {
-                // tell the caller where we got this from
-                rob_start = j;
+            if ( LIKELY(!halted_masks[thr]) && selectAndIssue(thr) ) {
+                progressed = true;
                 break;
             }
         }
 
-        tmp_int_reg_write[i]                = int_reg_write_mask;
-        tmp_not_issued_int_reg_read[i]      = not_issued_int_read_mask;
-        tmp_fp_reg_write[i]                 = fp_reg_write_mask;
-        tmp_not_issued_fp_reg_read[i]       = not_issued_fp_read_mask;
+        if ( !progressed ) { break; }
+    }
 
-        // Only print the table if we issued an instruction, reduce print out
-        // clutter
+    // DISPATCH ////////////////////////////////////////////////////////////////
+    for ( uint32_t n = 0; n < issues_per_cycle; ++n ) {
+        bool progressed = false;
+
+        for ( uint32_t t = 0; t < hw_threads; ++t ) {
+            const uint32_t thr = m_curDispatchHwThread;
+            if ( ++m_curDispatchHwThread == hw_threads ) { m_curDispatchHwThread = 0; }
+
+            if ( LIKELY(!halted_masks[thr]) && dispatchOne(thr) ) {
+                progressed = true;
+                break;
+            }
+        }
+
+        if ( !progressed ) { break; }
+    }
+}
+
+// WAKEUP. Every instruction that produced a result since the last time this ran
+// marks each of its destination physical registers produced and hands the
+// register's waiter list on.
+void
+VANADIS_COMPONENT::processWritebacks()
+{
+    if ( LIKELY(writeback_q.empty()) ) { return; }
+
+    for ( size_t i = 0; i < writeback_q.size(); ++i ) {
+        VanadisInstruction* ins = writeback_q[i];
+        const uint32_t      thr = ins->getHWThread();
+
+        const uint16_t n_int = ins->countPhysIntRegOut();
+        for ( uint16_t k = 0; k < n_int; ++k ) { produceIntReg(thr, ins->getPhysIntRegOut(k)); }
+
+        const uint16_t n_fp = ins->countPhysFPRegOut();
+        for ( uint16_t k = 0; k < n_fp; ++k ) { produceFPReg(thr, ins->getPhysFPRegOut(k)); }
+    }
+
+    writeback_q.clear();
+}
+
+void
+VANADIS_COMPONENT::produceIntReg(const uint32_t hw_thr, const uint16_t phys_reg)
+{
+    setIntRegReady(phys_reg);
+
+    VanadisIssueScheduler& s = sched[hw_thr];
+    uint16_t               w = s.int_waiter_[phys_reg];
+
+    if ( LIKELY(VanadisIssueScheduler::NO_SLOT == w) ) { return; }
+    s.int_waiter_[phys_reg] = VanadisIssueScheduler::NO_SLOT;
+
+    while ( VanadisIssueScheduler::NO_SLOT != w ) {
+        const uint16_t nxt = s.wait_next_[w];
+        s.wait_next_[w]    = VanadisIssueScheduler::NO_SLOT;
+        waitOrReady(hw_thr, w);
+        w = nxt;
+    }
+}
+
+void
+VANADIS_COMPONENT::produceFPReg(const uint32_t hw_thr, const uint16_t phys_reg)
+{
+    setFPRegReady(phys_reg);
+
+    VanadisIssueScheduler& s = sched[hw_thr];
+    uint16_t               w = s.fp_waiter_[phys_reg];
+
+    if ( LIKELY(VanadisIssueScheduler::NO_SLOT == w) ) { return; }
+    s.fp_waiter_[phys_reg] = VanadisIssueScheduler::NO_SLOT;
+
+    while ( VanadisIssueScheduler::NO_SLOT != w ) {
+        const uint16_t nxt = s.wait_next_[w];
+        s.wait_next_[w]    = VanadisIssueScheduler::NO_SLOT;
+        waitOrReady(hw_thr, w);
+        w = nxt;
+    }
+}
+
+// An instruction waits on ONE missing source at a time. Called at dispatch and
+// again each time the register it was waiting on arrives: it re-reads its own
+// source list, moves to the next register that has not been produced, and only
+// when there is none becomes ready. An instruction is therefore woken at most
+// once per source operand it has, and reading a hundred registers -- which only
+// a syscall does -- costs no storage at all.
+void
+VANADIS_COMPONENT::waitOrReady(const uint32_t hw_thr, const uint16_t slot)
+{
+    VanadisIssueScheduler& s   = sched[hw_thr];
+    VanadisInstruction*    ins = rob[hw_thr]->peekAtPhysical(static_cast<int>(slot));
+
+    const uint16_t n_int = ins->countPhysIntRegIn();
+    for ( uint16_t k = 0; k < n_int; ++k ) {
+        const uint16_t p = ins->getPhysIntRegIn(k);
+        if ( !intRegReady(p) ) {
+            s.wait_next_[slot] = s.int_waiter_[p];
+            s.int_waiter_[p]   = slot;
+            return;
+        }
+    }
+
+    const uint16_t n_fp = ins->countPhysFPRegIn();
+    for ( uint16_t k = 0; k < n_fp; ++k ) {
+        const uint16_t p = ins->getPhysFPRegIn(k);
+        if ( !fpRegReady(p) ) {
+            s.wait_next_[slot] = s.fp_waiter_[p];
+            s.fp_waiter_[p]    = slot;
+            return;
+        }
+    }
+
+    s.markReady(s.slot_class_[slot], slot);
+}
+
+// SELECT. One instruction, the oldest ready one whose class still has a unit
+// this cycle. Returns false when nothing could be issued for this thread.
+bool
+VANADIS_COMPONENT::selectAndIssue(const uint32_t hw_thr)
+{
+    VanadisIssueScheduler&                     s       = sched[hw_thr];
+    VanadisCircularQueue<VanadisInstruction*>* thr_rob = rob[hw_thr];
+
+    if ( thr_rob->empty() ) { return false; }
+
+    const int    head = thr_rob->headIndex();
+    const size_t cap  = thr_rob->capacity();
+
+    // At most VSC_COUNT rounds: each failed allocation retires one class.
+    for ( int round = 0; round < VSC_COUNT; ++round ) {
+        uint16_t best     = VanadisIssueScheduler::NO_SLOT;
+        uint8_t  best_cls = 0;
+        size_t   best_age = cap + 1;
+
+        for ( uint8_t c = 0; c < VSC_COUNT; ++c ) {
+            if ( s.blocked_ & (static_cast<uint32_t>(1) << c) ) { continue; }
+
+            uint16_t cand;
+
+            if ( VSC_MEMORY == c ) {
+                // MEMORY ORDER. Only the oldest not-yet-queued memory operation
+                // may go to the load/store queue, because the queue is strictly
+                // in order and only ever looks at its front. This is the same
+                // rule the old stage enforced with `unallocated_memory_op_seen`,
+                // including its effect across cycles.
+                if ( s.mem_order_.empty() ) { continue; }
+                cand = s.mem_order_.front();
+                if ( !s.isReady(VSC_MEMORY, cand) ) { continue; }
+            }
+            else if ( VSC_ROCC == c ) {
+                // A coprocessor instruction is architecturally visible the
+                // moment it issues -- an NMFC FORK puts an invocation on the
+                // fabric that nothing can take back -- so it issues only when it
+                // is the oldest instruction in the reorder buffer and therefore
+                // cannot be squashed.
+                cand = static_cast<uint16_t>(head);
+                if ( !s.isReady(VSC_ROCC, cand) ) { continue; }
+            }
+            else {
+                cand = s.oldestReady(c, head);
+                if ( VanadisIssueScheduler::NO_SLOT == cand ) { continue; }
+            }
+
+            const size_t age = (static_cast<size_t>(cand) >= static_cast<size_t>(head))
+                                   ? (static_cast<size_t>(cand) - static_cast<size_t>(head))
+                                   : (static_cast<size_t>(cand) + cap - static_cast<size_t>(head));
+
+            if ( age < best_age ) {
+                best_age = age;
+                best     = cand;
+                best_cls = c;
+            }
+        }
+
+        if ( VanadisIssueScheduler::NO_SLOT == best ) { return false; }
+
+        VanadisInstruction* ins = thr_rob->peekAtPhysical(static_cast<int>(best));
+
         #ifdef VANADIS_BUILD_DEBUG
-        if ( (output_verbosity >= 8) && issued_an_ins ) {
-            if(print_issue_tables) {
-                issue_isa_tables[i]->print(output, register_files[i], print_int_reg, print_fp_reg, output_verbosity );
+        // A wakeup bug shows up as a wrong answer thousands of cycles later, so
+        // say it here instead.
+        for ( uint16_t k = 0; k < ins->countPhysIntRegIn(); ++k ) {
+            if ( !intRegReady(ins->getPhysIntRegIn(k)) ) {
+                output->fatal(
+                    CALL_INFO, -1,
+                    "scheduler: 0x%" PRI_ADDR " (%s) selected while int phys reg %" PRIu16 " has not been produced\n",
+                    ins->getInstructionAddress(), ins->getInstCode(), ins->getPhysIntRegIn(k));
+            }
+        }
+        for ( uint16_t k = 0; k < ins->countPhysFPRegIn(); ++k ) {
+            if ( !fpRegReady(ins->getPhysFPRegIn(k)) ) {
+                output->fatal(
+                    CALL_INFO, -1,
+                    "scheduler: 0x%" PRI_ADDR " (%s) selected while fp phys reg %" PRIu16 " has not been produced\n",
+                    ins->getInstructionAddress(), ins->getInstCode(), ins->getPhysFPRegIn(k));
             }
         }
         #endif
-    }
-    else {
+
+        // allocateFunctionalUnit is unchanged, and it is still what decides
+        // whether there is a unit, an LSQ slot, room in the coprocessor queue,
+        // or a drained LSQ for a syscall. A refusal means the whole class is out
+        // of room for this cycle -- there is no second unit to try.
+        if ( 0 != allocateFunctionalUnit(ins) ) {
+            s.blocked_ |= (static_cast<uint32_t>(1) << best_cls);
+            continue;
+        }
+
+        s.clearReady(best_cls, best);
+
+        if ( VSC_MEMORY == best_cls ) { s.mem_order_.pop_front(); }
+        else if ( VSC_ROCC == best_cls ) { issueRoCCCommand(ins); }
+
         #ifdef VANADIS_BUILD_DEBUG
-        if(output_verbosity >= 8) {
+        if ( output->getVerboseLevel() >= 8 ) {
+            if ( checkVerboseAddr(ins->getInstructionAddress()) ) { output->setVerboseLevel(8); }
+            ins->printToBuffer(instPrintBuffer, 1024);
             output->verbose(
-                CALL_INFO, 16, 0, "thread %" PRIu32 " is halted, did not process for issue this cycle.\n", i);
+                CALL_INFO, 8, 0, "%d: ----> Issued for: %s / 0x%" PRI_ADDR " / slot: %" PRIu16 "\n", hw_thr,
+                instPrintBuffer, ins->getInstructionAddress(), best);
         }
         #endif
+
+        ins->markIssued();
+        ins_issued_this_cycle++;
+        return true;
     }
 
-    // if we issued an instruction tell the caller we want to be called again
-    // (return 0)
-    return issued_an_ins ? 0 : 1;
+    return false;
+}
+
+// DISPATCH. Rename the oldest not-yet-renamed entry, in program order, and put
+// it in the window. If the oldest cannot be renamed, nothing behind it is:
+// the rename map and the physical-register free list are sequential structures
+// and instruction n+1 must see instruction n's update to both.
+bool
+VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
+{
+    VanadisIssueScheduler&                     s       = sched[hw_thr];
+    VanadisCircularQueue<VanadisInstruction*>* thr_rob = rob[hw_thr];
+
+    if ( UNLIKELY(s.syscall_barrier_) ) { return false; }
+    if ( thr_rob->size() <= s.renamed_count_ ) { return false; }
+
+    const int           slot = thr_rob->physicalIndex(s.renamed_count_);
+    VanadisInstruction* ins  = thr_rob->peekAtPhysical(slot);
+
+    // Somewhere to put the results. This is the old stage's `return 1`, and the
+    // only resource dispatch asks about: it needs no functional unit, no LSQ
+    // slot and no operand.
+    if ( UNLIKELY(
+             (int_register_stack->unused() < ins->countISAIntRegOut()) ||
+             (fp_register_stack->unused() < ins->countISAFPRegOut()) ) ) {
+        return false;
+    }
+
+    const VanadisFunctionalUnitType ins_type = ins->getInstFuncType();
+
+    // A SYSCALL is a trap, and it renames only at the head of the reorder
+    // buffer. It does not take new physical registers -- it renames every
+    // architectural register onto its own existing mapping -- so a squash that
+    // caught it after rename would hand the architectural mapping back to the
+    // free list. The old stage reached the same place by another road: a
+    // syscall reads every architectural register, so its dependency test could
+    // not pass while any older instruction had an outstanding write.
+    if ( UNLIKELY(INST_SYSCALL == ins_type) && (slot != thr_rob->headIndex()) ) { return false; }
+
+    assignRegistersToInstruction(
+        thread_decoders[hw_thr]->countISAIntReg(), thread_decoders[hw_thr]->countISAFPReg(), ins,
+        int_register_stack, fp_register_stack, issue_isa_tables[hw_thr]);
+
+    ins->setWritebackQueue(&writeback_q);
+    ins->markRenamed();
+
+    const uint16_t uslot = static_cast<uint16_t>(slot);
+    const uint8_t  cls   = vanadisSchedClassOf(ins_type);
+
+    s.slot_class_[uslot] = cls;
+    s.wait_next_[uslot]  = VanadisIssueScheduler::NO_SLOT;
+
+    if ( VSC_MEMORY == cls ) { s.mem_order_.push_back(uslot); }
+    if ( UNLIKELY(INST_SYSCALL == ins_type) ) { s.syscall_barrier_ = true; }
+
+    waitOrReady(hw_thr, uslot);
+
+    s.renamed_count_++;
+
+    #ifdef VANADIS_BUILD_DEBUG
+    if ( output->getVerboseLevel() >= 8 ) {
+        ins->printToBuffer(instPrintBuffer, 1024);
+        output->verbose(
+            CALL_INFO, 8, 0, "%d: ----> Dispatched: %s / 0x%" PRI_ADDR " / slot: %" PRIu16 "\n", hw_thr,
+            instPrintBuffer, ins->getInstructionAddress(), uslot);
+    }
+    #endif
+
+    return true;
+}
+
+// Everything the scheduler knows about one hardware thread goes away. Called
+// where the reorder buffer is emptied -- a mis-speculation repair and a thread
+// reset -- and it must run BEFORE the instructions are deleted, because the
+// write-back queue holds raw pointers to them.
+void
+VANADIS_COMPONENT::dropSchedulerState(const uint32_t hw_thr)
+{
+    if ( !writeback_q.empty() ) {
+        size_t keep = 0;
+        for ( size_t i = 0; i < writeback_q.size(); ++i ) {
+            if ( writeback_q[i]->getHWThread() != hw_thr ) { writeback_q[keep++] = writeback_q[i]; }
+        }
+        writeback_q.resize(keep);
+    }
+
+    sched[hw_thr].clear();
 }
 
 void
@@ -1131,6 +1331,14 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
         if ( perform_cleanup )
         {
             rob->pop();
+            // The renamed prefix of the buffer just got one shorter. Dispatch
+            // finds the oldest not-yet-renamed entry from this count, so it has
+            // to follow the head.
+            if ( sched[ins_thread].renamed_count_ > 0 ) { sched[ins_thread].renamed_count_--; }
+            if ( UNLIKELY(INST_SYSCALL == rob_front->getInstFuncType()) ) {
+                // The trap is over; rename may run past it again.
+                sched[ins_thread].syscall_barrier_ = false;
+            }
 
             #ifdef VANADIS_BUILD_DEBUG
             if ( output->getVerboseLevel() >= 8 )
@@ -1185,6 +1393,9 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
             {
 
                 VanadisInstruction* delay_ins = rob->pop();
+                if ( sched[delay_ins->getHWThread()].renamed_count_ > 0 ) {
+                    sched[delay_ins->getHWThread()].renamed_count_--;
+                }
                 #ifdef VANADIS_BUILD_DEBUG
                 output->verbose(
                     CALL_INFO, 8, VANADIS_DBG_RETIRE_FLG, "----> Retire delay: 0x%" PRI_ADDR " / %s\n", delay_ins->getInstructionAddress(),
@@ -1212,6 +1423,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 #endif
                 ins_retired_this_cycle++;
 
+                processWritebacks();
                 delete delay_ins;
             }
 
@@ -1256,6 +1468,13 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 handleMisspeculate(ins_thread, pipeline_reset_addr);
                 stat_branch_mispredicts->addData(1);
             }
+
+            // NOTHING MAY BE DELETED WHILE IT IS STILL ON THE WRITE-BACK QUEUE.
+            // Retire runs before the issue stage drains it, and two things put
+            // an instruction on it this late: an emulated-OS response arriving
+            // between two cycles, and syscallReturn a few lines up in this same
+            // function. Draining here is an empty() test on every other cycle.
+            processWritebacks();
 
             delete rob_front;
         }
@@ -1497,6 +1716,11 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     ins_retired_this_cycle = 0;
     ins_decoded_this_cycle = 0;
 
+    // Results that landed BETWEEN two cycles -- a cache response, an
+    // emulated-OS response -- wake their consumers before anything else
+    // happens, because retire is next and retire deletes instructions.
+    processWritebacks();
+
 
     if ( UNLIKELY( nullptr != m_checkpointing ) ) {
         bool should_process = false;
@@ -1575,10 +1799,11 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     auto cnt = hw_threads;
     for ( uint32_t i = 0; i < retires_per_cycle; ++i ) {
 
-        // find an unblocked hardware thread
+        // find an unblocked hardware thread. The wrap is a compare and not a
+        // remainder: hw_threads is a run-time uint32_t, so `%=` is a hardware
+        // division, and this runs retires_per_cycle times every cycle.
         while ( 1 == rc[m_curRetireHwThread] && cnt ) {
-            ++m_curRetireHwThread;
-            m_curRetireHwThread %= (hw_threads);
+            if ( ++m_curRetireHwThread == hw_threads ) { m_curRetireHwThread = 0; }
             --cnt;
         }
 
@@ -1586,8 +1811,7 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
         if ( cnt ) {
             auto thr = m_curRetireHwThread;
             rc[thr] = performRetire(thr, rob[thr], cycle);
-            ++m_curRetireHwThread;
-            m_curRetireHwThread %= (hw_threads);
+            if ( ++m_curRetireHwThread == hw_threads ) { m_curRetireHwThread = 0; }
             cnt = hw_threads;
         } else {
             break;
@@ -1622,39 +1846,10 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
             "<==========================================================\n");
     }
     #endif
-    // Clear our temps on a per-thread basis
-    for ( uint32_t i = 0; i < hw_threads; ++i ) {
-        resetRegisterUseTemps(i, thread_decoders[i]->countISAIntReg(), thread_decoders[i]->countISAFPReg());
-    }
-
-    {
-    std::vector<uint32_t> rob_start(hw_threads,0);
-    std::vector<int> unallocated_memory_op_seen(hw_threads,false);
-
-    // Attempt to perform issues, cranking through the entire ROB call by call or until we
-    // reach the max issues this cycle
-    std::vector<int> rc(hw_threads,0);
-    auto cnt = hw_threads;
-    for ( uint32_t i = 0; i < issues_per_cycle; ++i ) {
-        // find an unblocked hardware thread
-        while ( 0 != rc[m_curIssueHwThread] && cnt ) {
-            ++m_curIssueHwThread;
-            m_curIssueHwThread %= (hw_threads);
-            --cnt;
-        }
-
-        // we found a unblocked hardware thread
-        if ( cnt ) {
-            auto thr = m_curIssueHwThread;
-            rc[thr] = performIssue(cycle, thr, rob_start[thr], unallocated_memory_op_seen[thr]);
-            ++m_curIssueHwThread;
-            m_curIssueHwThread %= (hw_threads);
-            cnt = (hw_threads);
-        } else {
-            break;
-        }
-    }
-    }
+    // Wakeup, select and dispatch, once for the whole core. There is no
+    // per-thread scan to crank through any more, and no per-cycle scoreboard to
+    // clear: the scheduler carries what it knows from cycle to cycle.
+    performIssue(cycle);
 
     // Record how many instructions we issued this cycle
     stat_ins_issued->addData(ins_issued_this_cycle);
@@ -1841,8 +2036,27 @@ VANADIS_COMPONENT::assignRegistersToInstruction(
                     ins_isa_reg, int_reg_count);
             }
 
+            // WRITING THE HARDWIRED-ZERO REGISTER TAKES NOTHING AND CHANGES
+            // NOTHING. x0 is not renameable: it stays on physical register 0,
+            // which the register file reads as zero and whose writes it drops.
+            // Taking a physical register for it would put a value nobody can
+            // read into a register somebody else needs, and would hand a
+            // consumer of x0 a register whose contents are the last owner's.
+            if ( UNLIKELY(ins_isa_reg == ins->getISAOptions()->getRegisterIgnoreWrites()) ) {
+                ins->setPhysIntRegOut(i, isa_table->getIntPhysReg(ins_isa_reg));
+                isa_table->incIntWrite(ins_isa_reg);
+                continue;
+            }
+
             // Acquire the next free register for output
             const uint16_t out_reg        = int_regs->pop();
+
+            // THIS IS WHERE A PHYSICAL REGISTER STOPS BEING READABLE. From the
+            // instant it leaves the free list it is going to hold a value that
+            // has not been computed yet, and a consumer renamed against it has
+            // to wait for this instruction to write back. Registers still on the
+            // free list are ready by definition: what they hold is dead.
+            clearIntRegReady(out_reg);
 
             #ifdef VANADIS_BUILD_DEBUG
             if(output->getVerboseLevel() >= 16) {
@@ -1871,6 +2085,10 @@ VANADIS_COMPONENT::assignRegistersToInstruction(
             // Acquire the next free register for output
             const uint16_t out_reg     = fp_regs->pop();
 
+            // See the integer case above. There is no hardwired-zero
+            // floating-point register, so there is no exception here.
+            clearFPRegReady(out_reg);
+
             #ifdef VANADIS_BUILD_DEBUG
             if(output->getVerboseLevel() >= 16) {
                 output->verbose(CALL_INFO, 16, 0, "-----> creating ins-addr: 0x%" PRI_ADDR " fp reg-out for isa: %" PRIu16 " output will map to phys: %" PRIu16 "\n",
@@ -1886,38 +2104,55 @@ VANADIS_COMPONENT::assignRegistersToInstruction(
     }
 
 
-    if (ins->getInstFuncType() >= INST_ROCC0 && ins->getInstFuncType() <= INST_ROCC3) {
-        int rocc_index = ins->getInstFuncType() - INST_ROCC0;
-        output->verbose(CALL_INFO, 16, 0, "issuing rocc%d instruction\n", rocc_index);
+    return 0;
+}
 
-        if (rocc_index > roccs_.size() - 1) {
-            output->fatal(
-                CALL_INFO, -1,
-                "Error: rocc%d instruction (ins-addr: 0x%" PRI_ADDR ") attempted to issue but rocc%d interface is not loaded\n",
-                rocc_index, ins->getInstructionAddress(), rocc_index);
-        }
+// THE COPROCESSOR COMMAND IS SENT WHERE THE INSTRUCTION ISSUES, NOT WHERE IT
+// RENAMES.
+//
+// This used to be the tail of assignRegistersToInstruction, which was correct
+// while rename and issue were the same event. They are not any more: dispatch
+// renames as soon as there is a physical register, and the operand values a
+// RoCC command carries are only in the register file once the instruction has
+// been selected -- which is exactly what waiting for its sources to be produced
+// means. Reading them at rename would send the accelerator whatever happened to
+// be in the register file at the time.
+//
+// The core's queue and the accelerator's are still filled at the same instant,
+// which is what keeps them from drifting: a response is matched to
+// rocc_queues_.front() by position, and any drift hands an instruction another
+// one's result. allocateFunctionalUnit has already checked RoCCFull().
+void
+VANADIS_COMPONENT::issueRoCCCommand(VanadisInstruction* ins)
+{
+    const int rocc_index = ins->getInstFuncType() - INST_ROCC0;
+    output->verbose(CALL_INFO, 16, 0, "issuing rocc%d instruction\n", rocc_index);
 
-        if (!roccs_[rocc_index]->RoCCFull()) {
-            rocc_queues_[rocc_index].push_back(ins);
-            VanadisRegisterFile* regFile = register_files[ins->getHWThread()];
-            // Dumping the whole register file on every coprocessor issue is a
-            // debugging leftover, and an unconditional one: it dominated the
-            // run time of any program that actually used RoCC.
-            if ( UNLIKELY(output->getVerboseLevel() >= 16) ) { regFile->print(output); }
-
-            uint64_t rs1_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(0));
-            uint64_t rs2_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(1));
-
-            VanadisRoCCInstruction* vrocc_inst = static_cast<VanadisRoCCInstruction*>(ins);
-            RoCCInstruction* rocc_inst = new RoCCInstruction(
-                vrocc_inst->func7, vrocc_inst->rd, vrocc_inst->xs1, vrocc_inst->xs2, vrocc_inst->xd
-            );
-
-            roccs_[rocc_index]->push(new RoCCCommand(rocc_inst, rs1_val, rs2_val));
-        }
+    if ( rocc_index > (int)roccs_.size() - 1 ) {
+        output->fatal(
+            CALL_INFO, -1,
+            "Error: rocc%d instruction (ins-addr: 0x%" PRI_ADDR ") attempted to issue but rocc%d interface is not loaded\n",
+            rocc_index, ins->getInstructionAddress(), rocc_index);
     }
 
-    return 0;
+    if ( !roccs_[rocc_index]->RoCCFull() ) {
+        rocc_queues_[rocc_index].push_back(ins);
+        VanadisRegisterFile* regFile = register_files[ins->getHWThread()];
+        // Dumping the whole register file on every coprocessor issue is a
+        // debugging leftover, and an unconditional one: it dominated the
+        // run time of any program that actually used RoCC.
+        if ( UNLIKELY(output->getVerboseLevel() >= 16) ) { regFile->print(output); }
+
+        uint64_t rs1_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(0));
+        uint64_t rs2_val = regFile->getIntReg<int64_t>(ins->getPhysIntRegIn(1));
+
+        VanadisRoCCInstruction* vrocc_inst = static_cast<VanadisRoCCInstruction*>(ins);
+        RoCCInstruction* rocc_inst = new RoCCInstruction(
+            vrocc_inst->func7, vrocc_inst->rd, vrocc_inst->xs1, vrocc_inst->xs2, vrocc_inst->xd
+        );
+
+        roccs_[rocc_index]->push(new RoCCCommand(rocc_inst, rs1_val, rs2_val));
+    }
 }
 
 int
@@ -1951,7 +2186,12 @@ VANADIS_COMPONENT::recoverRetiredRegisters(
 
             issue_isa_table->decIntWrite(isa_reg);
 
-            recovered_phys_reg_int.push_back(cur_phys_reg);
+            // ...unless the ISA value is the hardwired zero, which was never
+            // renamed and whose physical register is not the free list's to
+            // give away. See the note where the mapping is made.
+            if ( LIKELY(isa_reg != ins->getISAOptions()->getRegisterIgnoreWrites()) ) {
+                recovered_phys_reg_int.push_back(cur_phys_reg);
+            }
 
             // Set the ISA register in the retirement table to point
             // to the physical register used by this instruction
@@ -2005,14 +2245,20 @@ VANADIS_COMPONENT::recoverRetiredRegisters(
     }
     #endif
 
-    // Return recovered int registers to the stack of available registers
+    // Return recovered int registers to the stack of available registers. A
+    // register on the free list is ready by definition -- these were written
+    // back long before their writer reached the head of the reorder buffer, so
+    // the bit is already set, but saying so here is what makes "free implies
+    // ready" true of every path rather than of most of them.
     for ( uint16_t next_reg : recovered_phys_reg_int ) {
         int_regs->push(next_reg);
+        setIntRegReady(next_reg);
     }
 
     // Return recovered fp registers to the stack of available registers
     for ( uint16_t next_reg : recovered_phys_reg_fp ) {
         fp_regs->push(next_reg);
+        setFPRegReady(next_reg);
     }
 
     return 0;
@@ -2189,11 +2435,28 @@ VANADIS_COMPONENT::clearROBMisspeculate(const uint32_t hw_thr)
     thr_rob = rob[hw_thr];
     stat_rob_cleared_entries->addData(thr_rob->size());
 
+    // THE SCHEDULER GOES FIRST. Its ready sets, waiter lists, memory-order queue
+    // and the core's write-back queue all name instructions that are about to be
+    // deleted, and speculation that is being undone must leave nothing behind
+    // that a later cycle could select.
+    dropSchedulerState(hw_thr);
+
     // Delete all the instructions which we aren't going to process
     for ( size_t i = 0; i < thr_rob->size(); ++i ) {
         VanadisInstruction* next_ins = thr_rob->peekAt(i);
-        if ( next_ins->completedIssue() )  {
+        // RENAMED, not issued: an instruction that has been through dispatch
+        // owns physical registers whether or not it ever reached a functional
+        // unit, and those are the ones that have to go back.
+        if ( next_ins->completedRename() )  {
             next_ins->returnOutRegs( int_register_stack, fp_register_stack  );
+
+            // Back on the free list, holding nothing anyone is waiting for.
+            for ( uint16_t k = 0; k < next_ins->countPhysIntRegOut(); ++k ) {
+                setIntRegReady(next_ins->getPhysIntRegOut(k));
+            }
+            for ( uint16_t k = 0; k < next_ins->countPhysFPRegOut(); ++k ) {
+                setFPRegReady(next_ins->getPhysFPRegOut(k));
+            }
         }
         delete next_ins;
     }
@@ -2619,6 +2882,15 @@ VANADIS_COMPONENT::resetHwThread(uint32_t thr)
     auto thr_rob = rob[thr];
 
     thr_rob->clear();
+
+    // The window went with the buffer. Nothing is deleted here, so this is only
+    // about not leaving a ready bit or a waiter pointing at a slot that no
+    // longer holds what it held. The registers the thread's issue table maps are
+    // what a new instruction of this thread can read, and the register file has
+    // just been re-initialised under them, so they are readable now.
+    dropSchedulerState(thr);
+    for ( uint16_t r = 0; r < decoder->countISAIntReg(); ++r ) { setIntRegReady(issue_table->getIntPhysReg(r)); }
+    for ( uint16_t r = 0; r < decoder->countISAFPReg(); ++r ) { setFPRegReady(issue_table->getFPPhysReg(r)); }
 
     #if 0
     output->setVerboseLevel( 16 );

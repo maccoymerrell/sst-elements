@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <map>
+#include <vector>
 #include <sst/core/output.h>
 #include <string>
 #include <sstream>
@@ -86,6 +87,7 @@ class VanadisInstruction
             trap_error_           = false;
             has_executed_         = false;
             has_issued_           = false;
+            has_renamed_          = false;
             end_uop_group_        = false;
             is_front_of_rob_      = false;
             has_rob_slot_         = false;
@@ -121,6 +123,7 @@ class VanadisInstruction
             trap_error_           = copy_me.trap_error_;
             has_executed_         = copy_me.has_executed_;
             has_issued_           = copy_me.has_issued_;
+            has_renamed_          = copy_me.has_renamed_;
             end_uop_group_        = copy_me.end_uop_group_;
             is_front_of_rob_      = false;
             has_rob_slot_         = false;
@@ -426,7 +429,46 @@ class VanadisInstruction
         bool completedExecution() const { return has_executed_; }
         bool completedIssue() const { return has_issued_; }
 
-        virtual void markExecuted() { has_executed_ = true; }
+        // RENAMED IS NOT ISSUED, NOW THAT THE TWO ARE SEPARATE STAGES.
+        //
+        // completedIssue() still means what it has always meant: this
+        // instruction has been given a functional unit, an LSQ slot or a
+        // coprocessor queue entry, and every caller that asks the question is
+        // asking that. completedRename() is the new, earlier fact: the
+        // instruction has been through dispatch, so it owns physical registers
+        // and mis-speculation has to hand them back. Between the two it is
+        // sitting in the scheduling window waiting for its operands.
+        bool completedRename() const { return has_renamed_; }
+        void markRenamed() { has_renamed_ = true; }
+
+        // WAKING THE CONSUMERS IS DONE HERE, AND NOWHERE ELSE.
+        //
+        // An instruction becomes readable by its dependents at the instant its
+        // result is written back, and there are a dozen places that happens: a
+        // functional unit finishing, a load response, a store completing, a
+        // fence draining, a coprocessor answering, a syscall returning, and the
+        // zero-latency classes that complete at issue. Rather than trust twelve
+        // call sites to stay complete as instruction classes are added, the
+        // single definition of "this instruction has produced its result" puts
+        // itself on the core's write-back queue, which the issue stage drains
+        // at the top of the next cycle. markExecuted() was virtual and had no
+        // overrides anywhere in the tree, so nothing is lost by making it the
+        // only definition there can be.
+        //
+        // The guard is not defensive: several paths mark an instruction
+        // executed more than once, and a second entry would wake its consumers
+        // twice and corrupt the waiter lists.
+        void markExecuted()
+        {
+            if ( LIKELY(!has_executed_) ) {
+                has_executed_ = true;
+                if ( LIKELY(nullptr != writeback_q_) ) { writeback_q_->push_back(this); }
+            }
+        }
+
+        // Set at dispatch, which is the earliest an instruction can execute.
+        void setWritebackQueue(std::vector<VanadisInstruction*>* q) { writeback_q_ = q; }
+
         void markIssued() { has_issued_ = true; }
 
         bool checkFrontOfROB() const { return is_front_of_rob_; }
@@ -448,6 +490,11 @@ class VanadisInstruction
         virtual void returnOutRegs( VanadisRegisterStack* int_stack, VanadisRegisterStack* fp_stack )
         {
             for ( auto i = 0; i < countPhysIntRegOut(); i++ ) {
+                // The hardwired-zero architectural register is not renamed and
+                // its physical register is not the free list's to hand out; an
+                // instruction that "writes" it took nothing and has nothing to
+                // give back.
+                if ( UNLIKELY(isa_int_regs_out[i] == isa_options->getRegisterIgnoreWrites()) ) { continue; }
                 int_stack->push( getPhysIntRegOut(i) );
             }
             for ( auto i = 0; i < countPhysFPRegOut(); i++ ) {
@@ -536,6 +583,7 @@ class VanadisInstruction
         bool end_uop_group_;
         bool is_front_of_rob_;
         bool has_rob_slot_;
+        bool has_renamed_;
 
         const uint32_t hw_thread;
 
@@ -546,6 +594,13 @@ class VanadisInstruction
 
         const VanadisDecoderOptions* isa_options;
         uint32_t sw_thread;
+
+        // The core's write-back queue, handed to the instruction at dispatch.
+        // Deliberately NOT in the first cache line: markExecuted() runs a
+        // couple of times a cycle, where the first line is what the stages that
+        // walk instructions read.
+        std::vector<VanadisInstruction*>* writeback_q_ = nullptr;
+
         uint16_t* isa_int_regs_in;
         uint16_t* isa_int_regs_out;
         uint16_t* isa_fp_regs_in;

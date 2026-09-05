@@ -78,6 +78,23 @@ public:
     size_t size() const { return count; }
     size_t capacity() const { return max_capacity; }
 
+    // ADDRESSING AN ENTRY BY THE SLOT IT SITS IN, NOT BY ITS AGE.
+    //
+    // The issue stage keeps one bit per reorder-buffer entry per
+    // functional-unit class, so that "the oldest ready instruction of this
+    // class" is a bit scan instead of a walk. Numbering those bits by LOGICAL
+    // position would move every bit one place each time the head retires;
+    // numbering them by the slot in `data` means a bit belongs to an entry for
+    // as long as the entry is in the buffer, and the head advancing is one
+    // integer changing. These four accessors are what turns a bit index back
+    // into an instruction and into an age, and what lets the dispatch pointer
+    // walk the buffer in program order.
+    int    headIndex() const { return head; }
+    int    tailIndex() const { return tail; }
+    T      peekAtPhysical(const int index) const { return data[index]; }
+    int    physicalIndex(const size_t logical) const { return calculateIndex(logical); }
+    int    nextPhysicalIndex(const int index) const { return incrementIndex(index); }
+
     void clear() {
         head = 0;
         tail = 0;

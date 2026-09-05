@@ -34,9 +34,12 @@
 #include "os/vdumpregsreq.h"
 #include "os/vcheckpointreq.h"
 
+#include <algorithm>
 #include <array>
+#include <deque>
 #include <limits>
 #include <set>
+#include <vector>
 #include <sst/core/component.h>
 #include <sst/core/interfaces/stdMem.h>
 #include <sst/core/link.h>
@@ -52,6 +55,205 @@ namespace Vanadis {
 #else
 #define VANADIS_COMPONENT VanadisComponent
 #endif
+
+// THE SCHEDULER'S FUNCTIONAL-UNIT CLASSES.
+//
+// One class per group of units that can be contended for independently, so
+// that a class whose units are all busy this cycle cannot starve a class whose
+// units are free -- select considers one candidate from each. Memory is one
+// class because loads, stores and fences all enter the one in-order load/store
+// queue; the coprocessors are one class because a RoCC instruction is only ever
+// selectable at the head of the reorder buffer, so at most one is a candidate;
+// and NOOP/FAULT/SPECIAL are one class because they complete at issue and take
+// no unit at all.
+enum VanadisSchedClass {
+    VSC_INT_ARITH = 0,
+    VSC_INT_DIV   = 1,
+    VSC_FP_ARITH  = 2,
+    VSC_FP_DIV    = 3,
+    VSC_BRANCH    = 4,
+    VSC_MEMORY    = 5,
+    VSC_ROCC      = 6,
+    VSC_SYSCALL   = 7,
+    VSC_IMMEDIATE = 8,
+    VSC_COUNT     = 9
+};
+
+inline uint8_t
+vanadisSchedClassOf(const VanadisFunctionalUnitType t)
+{
+    switch ( t ) {
+    case INST_INT_ARITH: return VSC_INT_ARITH;
+    case INST_INT_DIV:   return VSC_INT_DIV;
+    case INST_FP_ARITH:  return VSC_FP_ARITH;
+    case INST_FP_DIV:    return VSC_FP_DIV;
+    case INST_BRANCH:    return VSC_BRANCH;
+    case INST_LOAD:
+    case INST_STORE:
+    case INST_FENCE:     return VSC_MEMORY;
+    case INST_ROCC0:
+    case INST_ROCC1:
+    case INST_ROCC2:
+    case INST_ROCC3:     return VSC_ROCC;
+    case INST_SYSCALL:   return VSC_SYSCALL;
+    default:             return VSC_IMMEDIATE;
+    }
+}
+
+// THE SCHEDULING WINDOW OF ONE HARDWARE THREAD.
+//
+// The window IS the reorder buffer, as it has always been; what is new is that
+// the stage no longer walks it. Everything here is indexed by the buffer's
+// PHYSICAL slot, so an entry keeps its index for as long as it is in the
+// buffer.
+//
+//   ready_[class]   one bit per slot: this instruction's operands have all been
+//                   produced and it is waiting for a unit of that class. Select
+//                   takes the oldest set bit at or after the buffer's head,
+//                   which is a scan of six machine words, not of 352 pointers.
+//
+//   wait_next_      the intrusive link of the waiter lists below. An
+//                   instruction waits on ONE not-yet-produced source register
+//                   at a time: when that one arrives it re-reads its own source
+//                   list and either moves to the next missing operand or
+//                   becomes ready. Waiting on one instead of counting all of
+//                   them is why no per-source storage is needed, and why a
+//                   SYSCALL -- which reads every architectural register -- costs
+//                   the same as an add.
+//
+//   int_waiter_ / fp_waiter_
+//                   head of the waiter list of each PHYSICAL register. A
+//                   physical register belongs to exactly one hardware thread
+//                   while it is allocated, so these are per thread.
+//
+//   mem_order_      the slots of the load, store and fence instructions in
+//                   dispatch order, which is program order. Only the head is
+//                   selectable, which is what puts them into the load/store
+//                   queue in program order -- the same guarantee the old
+//                   stage's `unallocated_memory_op_seen` gave, expressed as a
+//                   pointer rather than as a rescan every cycle.
+//
+//   renamed_count_  how many of the buffer's entries, counting from the head,
+//                   have been through dispatch. Rename is strictly in program
+//                   order, so the renamed entries are always a prefix.
+//
+//   syscall_barrier_  a SYSCALL renames every architectural register onto its
+//                   existing mapping and the emulated OS writes its result
+//                   through the retire table, so nothing younger may rename
+//                   until it has retired. That is the serialisation the old
+//                   stage got from accumulating the syscall's output mask over
+//                   the whole window.
+class VanadisIssueScheduler
+{
+public:
+    // An enumerator, not a static const member: `std::fill` and friends bind it
+    // to a const reference, which would need a definition in a translation unit
+    // and produce an undefined symbol in the shared library.
+    enum : uint16_t { NO_SLOT = 0xFFFF };
+
+    VanadisIssueScheduler() :
+        rob_slots_(0), words_(0), nonempty_(0), blocked_(0), renamed_count_(0), syscall_barrier_(false)
+    {}
+
+    void configure(const uint32_t rob_slots, const uint16_t int_phys, const uint16_t fp_phys)
+    {
+        rob_slots_ = rob_slots;
+        words_     = (rob_slots + 63) >> 6;
+
+        for ( int c = 0; c < VSC_COUNT; ++c ) { ready_[c].assign(words_, 0); }
+        slot_class_.assign(rob_slots, static_cast<uint8_t>(VSC_IMMEDIATE));
+        wait_next_.assign(rob_slots, NO_SLOT);
+        int_waiter_.assign(int_phys, NO_SLOT);
+        fp_waiter_.assign(fp_phys, NO_SLOT);
+
+        clear();
+    }
+
+    void clear()
+    {
+        for ( int c = 0; c < VSC_COUNT; ++c ) {
+            std::fill(ready_[c].begin(), ready_[c].end(), static_cast<uint64_t>(0));
+        }
+        std::fill(wait_next_.begin(), wait_next_.end(), NO_SLOT);
+        std::fill(int_waiter_.begin(), int_waiter_.end(), NO_SLOT);
+        std::fill(fp_waiter_.begin(), fp_waiter_.end(), NO_SLOT);
+
+        nonempty_        = 0;
+        blocked_         = 0;
+        renamed_count_   = 0;
+        syscall_barrier_ = false;
+        mem_order_.clear();
+    }
+
+    void markReady(const uint8_t cls, const uint16_t slot)
+    {
+        ready_[cls][slot >> 6] |= (static_cast<uint64_t>(1) << (slot & 63));
+        nonempty_ |= (static_cast<uint32_t>(1) << cls);
+    }
+
+    void clearReady(const uint8_t cls, const uint16_t slot)
+    {
+        ready_[cls][slot >> 6] &= ~(static_cast<uint64_t>(1) << (slot & 63));
+    }
+
+    bool isReady(const uint8_t cls, const uint16_t slot) const
+    {
+        return 0 != (ready_[cls][slot >> 6] & (static_cast<uint64_t>(1) << (slot & 63)));
+    }
+
+    // The oldest ready slot of this class, searching from the buffer's head and
+    // wrapping, or NO_SLOT. Exact, not approximate: it is the oldest.
+    uint16_t oldestReady(const uint8_t cls, const int head)
+    {
+        if ( 0 == (nonempty_ & (static_cast<uint32_t>(1) << cls)) ) { return NO_SLOT; }
+
+        int b = scan(ready_[cls], head, static_cast<int>(rob_slots_));
+        if ( b < 0 ) { b = scan(ready_[cls], 0, head); }
+        if ( b < 0 ) {
+            // Nothing of this class is waiting; stop paying for the scan until
+            // something is.
+            nonempty_ &= ~(static_cast<uint32_t>(1) << cls);
+            return NO_SLOT;
+        }
+        return static_cast<uint16_t>(b);
+    }
+
+    std::vector<uint8_t>  slot_class_;
+    std::vector<uint16_t> wait_next_;
+    std::vector<uint16_t> int_waiter_;
+    std::vector<uint16_t> fp_waiter_;
+    std::deque<uint16_t>  mem_order_;
+
+    uint32_t rob_slots_;
+    uint32_t words_;
+    uint32_t nonempty_;       // which classes may have a ready instruction
+    uint32_t blocked_;        // which classes have run out of units THIS cycle
+    uint32_t renamed_count_;
+    bool     syscall_barrier_;
+
+private:
+    // The first set bit in [from, to), or -1.
+    static int scan(const std::vector<uint64_t>& w, const int from, const int to)
+    {
+        if ( from >= to ) { return -1; }
+
+        int      wi    = from >> 6;
+        uint64_t m     = w[wi] & (~static_cast<uint64_t>(0) << (from & 63));
+        const int wlast = (to - 1) >> 6;
+
+        for ( ;; ) {
+            if ( m ) {
+                const int b = (wi << 6) + __builtin_ctzll(m);
+                return (b < to) ? b : -1;
+            }
+            if ( wi == wlast ) { return -1; }
+            ++wi;
+            m = w[wi];
+        }
+    }
+
+    std::vector<uint64_t> ready_[VSC_COUNT];
+};
 
 class VanadisInsCacheLoadRecord
 {
@@ -251,8 +453,32 @@ private:
 
     void performFetch(const uint64_t cycle);
     void performDecode(const uint64_t cycle);
-    int  performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_start, int& unallocated_memory_op_seen);
+    void performIssue(const uint64_t cycle);
     void performExecute(const uint64_t cycle);
+
+    // The three halves of the issue stage. See performIssue.
+    void processWritebacks();
+    bool selectAndIssue(const uint32_t hw_thr);
+    bool dispatchOne(const uint32_t hw_thr);
+
+    void produceIntReg(const uint32_t hw_thr, const uint16_t phys_reg);
+    void produceFPReg(const uint32_t hw_thr, const uint16_t phys_reg);
+    void waitOrReady(const uint32_t hw_thr, const uint16_t slot);
+    void dropSchedulerState(const uint32_t hw_thr);
+    void issueRoCCCommand(VanadisInstruction* ins);
+
+    bool intRegReady(const uint16_t p) const
+    {
+        return 0 != (int_phys_ready[p >> 6] & (static_cast<uint64_t>(1) << (p & 63)));
+    }
+    bool fpRegReady(const uint16_t p) const
+    {
+        return 0 != (fp_phys_ready[p >> 6] & (static_cast<uint64_t>(1) << (p & 63)));
+    }
+    void setIntRegReady(const uint16_t p) { int_phys_ready[p >> 6] |= (static_cast<uint64_t>(1) << (p & 63)); }
+    void setFPRegReady(const uint16_t p) { fp_phys_ready[p >> 6] |= (static_cast<uint64_t>(1) << (p & 63)); }
+    void clearIntRegReady(const uint16_t p) { int_phys_ready[p >> 6] &= ~(static_cast<uint64_t>(1) << (p & 63)); }
+    void clearFPRegReady(const uint16_t p) { fp_phys_ready[p >> 6] &= ~(static_cast<uint64_t>(1) << (p & 63)); }
     int  performRetire(int rob_num, VanadisCircularQueue<VanadisInstruction*>* rob, const uint64_t cycle);
     int  allocateFunctionalUnit(VanadisInstruction* ins);
     bool mapInstructiontoFunctionalUnit(VanadisInstruction* ins, std::vector<VanadisFunctionalUnit*>& functional_units);
@@ -296,6 +522,7 @@ private:
 
     uint32_t m_curRetireHwThread;
     uint32_t m_curIssueHwThread;
+    uint32_t m_curDispatchHwThread;
 
     std::vector<VanadisCircularQueue<VanadisInstruction*>*> rob;
     std::vector<VanadisCircularQueue<VanadisInstruction*>*> v_warp_rob;
@@ -328,6 +555,22 @@ private:
     std::vector<uint64_t> tmp_int_reg_write;
     std::vector<uint64_t> tmp_not_issued_fp_reg_read;
     std::vector<uint64_t> tmp_fp_reg_write;
+
+    // THE SCHEDULER. One window per hardware thread; one produced/not-produced
+    // bit per PHYSICAL register, shared because the physical register free list
+    // is shared. A register on the free list is ready by definition -- what it
+    // holds is dead -- so the bits start set and are cleared only when a
+    // register is popped to hold a value that has not been computed yet.
+    std::vector<VanadisIssueScheduler> sched;
+    std::vector<uint64_t>              int_phys_ready;
+    std::vector<uint64_t>              fp_phys_ready;
+
+    // Instructions that produced their result since the issue stage last looked.
+    // Filled by VanadisInstruction::markExecuted from wherever a result lands --
+    // a functional unit, a load response, a coprocessor, the emulated OS -- and
+    // drained at the top of the issue stage, which is what wakes their
+    // consumers.
+    std::vector<VanadisInstruction*> writeback_q;
 
     std::list<VanadisInsCacheLoadRecord*>* icache_load_records;
 
