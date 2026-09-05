@@ -61,6 +61,9 @@ public:
             fp_reg_pending_read[i]  = 0;
             fp_reg_pending_write[i] = 0;
         }
+
+        int_reg_pending_write_mask = 0;
+        fp_reg_pending_write_mask  = 0;
     }
 
     ~VanadisISATable()
@@ -80,6 +83,10 @@ public:
 
     bool pendingIntWrites(const uint16_t int_reg) { return int_reg_pending_write[int_reg] > 0; }
 
+    // Bit r set exactly when pendingIntWrites(r) / pendingFPWrites(r) is true.
+    uint64_t pendingIntWriteMask() const { return int_reg_pending_write_mask; }
+    uint64_t pendingFPWriteMask() const { return fp_reg_pending_write_mask; }
+
     bool pendingFPReads(const uint16_t fp_reg) { return fp_reg_pending_read[fp_reg] > 0; }
 
     bool pendingFPWrites(const uint16_t fp_reg) { return fp_reg_pending_write[fp_reg] > 0; }
@@ -91,7 +98,10 @@ public:
 
     void incIntWrite(const uint16_t int_reg)
     {
-        if ( int_reg != decoder_opts->getRegisterIgnoreWrites() ) { int_reg_pending_write[int_reg]++; }
+        if ( int_reg != decoder_opts->getRegisterIgnoreWrites() ) {
+            int_reg_pending_write[int_reg]++;
+            int_reg_pending_write_mask |= (static_cast<uint64_t>(1) << int_reg);
+        }
     }
 
     void decIntRead(const uint16_t int_reg)
@@ -101,16 +111,32 @@ public:
 
     void decIntWrite(const uint16_t int_reg)
     {
-        if ( int_reg != decoder_opts->getRegisterIgnoreWrites() ) { int_reg_pending_write[int_reg]--; }
+        if ( int_reg != decoder_opts->getRegisterIgnoreWrites() ) {
+            // The bit follows the counter exactly, INCLUDING the counter going
+            // negative: an underflow leaves a huge unsigned value, which is
+            // still "> 0", and pendingIntWrites would still say yes.
+            if ( 0 == --int_reg_pending_write[int_reg] ) {
+                int_reg_pending_write_mask &= ~(static_cast<uint64_t>(1) << int_reg);
+            }
+        }
     }
 
     void incFPRead(const uint16_t fp_reg) { fp_reg_pending_read[fp_reg]++; }
 
-    void incFPWrite(const uint16_t fp_reg) { fp_reg_pending_write[fp_reg]++; }
+    void incFPWrite(const uint16_t fp_reg)
+    {
+        fp_reg_pending_write[fp_reg]++;
+        fp_reg_pending_write_mask |= (static_cast<uint64_t>(1) << fp_reg);
+    }
 
     void decFPRead(const uint16_t fp_reg) { fp_reg_pending_read[fp_reg]--; }
 
-    void decFPWrite(const uint16_t fp_reg) { fp_reg_pending_write[fp_reg]--; }
+    void decFPWrite(const uint16_t fp_reg)
+    {
+        if ( 0 == --fp_reg_pending_write[fp_reg] ) {
+            fp_reg_pending_write_mask &= ~(static_cast<uint64_t>(1) << fp_reg);
+        }
+    }
 
     void setIntPhysReg(const uint16_t int_reg, const uint16_t phys_reg) { int_reg_ptr[int_reg] = phys_reg; }
 
@@ -122,16 +148,31 @@ public:
 
     void reset(VanadisISATable* tbl)
     {
+        // The mask is REBUILT from the counters this copies rather than copied
+        // from the other table's mask: it is then correct by construction
+        // whatever state the source was in, and this runs on misspeculation
+        // recovery, not per cycle.
+        int_reg_pending_write_mask = 0;
+        fp_reg_pending_write_mask  = 0;
+
         for ( uint16_t i = 0; i < count_int_reg; ++i ) {
             int_reg_ptr[i]           = tbl->int_reg_ptr[i];
             int_reg_pending_read[i]  = tbl->int_reg_pending_read[i];
             int_reg_pending_write[i] = tbl->int_reg_pending_write[i];
+
+            if ( int_reg_pending_write[i] > 0 ) {
+                int_reg_pending_write_mask |= (static_cast<uint64_t>(1) << i);
+            }
         }
 
         for ( uint16_t i = 0; i < count_fp_reg; ++i ) {
             fp_reg_ptr[i]           = tbl->fp_reg_ptr[i];
             fp_reg_pending_read[i]  = tbl->fp_reg_pending_read[i];
             fp_reg_pending_write[i] = tbl->fp_reg_pending_write[i];
+
+            if ( fp_reg_pending_write[i] > 0 ) {
+                fp_reg_pending_write_mask |= (static_cast<uint64_t>(1) << i);
+            }
         }
     }
 
@@ -237,6 +278,19 @@ protected:
 
     uint32_t* int_reg_pending_write;
     uint32_t* fp_reg_pending_write;
+
+    // The same information as the two arrays above, one bit per architectural
+    // register: bit r is set exactly when *_reg_pending_write[r] > 0. It is
+    // maintained by the four inc/dec methods rather than derived, because the
+    // issue stage asks "does this instruction read anything with a write in
+    // flight" once per reorder-buffer entry per cycle, and with the mask that
+    // is one AND against the instruction's own operand mask instead of a loop.
+    //
+    // One machine word holds one register per bit, so an ISA may declare at
+    // most VANADIS_MASKED_ISA_REGS of each kind; VanadisComponent checks that
+    // at construction (see vanadis.cc) and refuses to start otherwise.
+    uint64_t int_reg_pending_write_mask;
+    uint64_t fp_reg_pending_write_mask;
 
     const VanadisDecoderOptions* decoder_opts;
 

@@ -232,11 +232,25 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     //	printf("MAX INT: %" PRIu16 ", MAX FP: %" PRIu16 "\n", max_int_regs,
     // max_fp_regs );
 
+    // The issue stage keeps its register scoreboard as one bit per
+    // architectural register in a machine word, so an ISA that declares more
+    // registers than a word has bits cannot be checked. Refuse to start rather
+    // than drop a register out of the dependency test, which would not fail --
+    // it would produce a machine that issues instructions it should have held.
+    if ( (max_int_regs > VANADIS_MASKED_ISA_REGS) || (max_fp_regs > VANADIS_MASKED_ISA_REGS) ) {
+        output->fatal(
+            CALL_INFO, -1,
+            "the decoders on this core declare %" PRIu16 " integer and %" PRIu16 " floating-point architectural "
+            "registers; the issue stage holds its register scoreboard one bit per register in a machine word and "
+            "so supports at most %" PRIu16 " of each.\n",
+            max_int_regs, max_fp_regs, VANADIS_MASKED_ISA_REGS);
+    }
+
     for ( uint32_t i = 0; i < hw_threads; ++i ) {
-        tmp_not_issued_int_reg_read.push_back( new uint8_t[max_int_regs] );
-        tmp_int_reg_write.push_back( new uint8_t[max_int_regs] );
-        tmp_not_issued_fp_reg_read.push_back( new uint8_t[max_fp_regs] );
-        tmp_fp_reg_write.push_back( new uint8_t[max_fp_regs] );
+        tmp_not_issued_int_reg_read.push_back( 0 );
+        tmp_int_reg_write.push_back( 0 );
+        tmp_not_issued_fp_reg_read.push_back( 0 );
+        tmp_fp_reg_write.push_back( 0 );
         resetRegisterUseTemps(i, max_int_regs, max_fp_regs);
     }
 
@@ -416,12 +430,6 @@ VANADIS_COMPONENT::~VANADIS_COMPONENT()
 		delete next_fp_flags;
 	}
 
-    for ( uint32_t i = 0; i < hw_threads; i++ ) {
-        delete[] tmp_not_issued_int_reg_read[i];
-        delete[] tmp_int_reg_write[i];
-        delete[] tmp_not_issued_fp_reg_read[i];
-        delete[] tmp_fp_reg_write[i];
-    }
 }
 
 void
@@ -528,10 +536,78 @@ VANADIS_COMPONENT::performDecode(const uint64_t cycle)
 void
 VANADIS_COMPONENT::resetRegisterUseTemps(const int hw_thr, const uint16_t int_reg_count, const uint16_t fp_reg_count)
 {
-    std::memset(tmp_not_issued_int_reg_read[hw_thr], 0, int_reg_count);
-    std::memset(tmp_int_reg_write[hw_thr], 0, int_reg_count);
-    std::memset(tmp_not_issued_fp_reg_read[hw_thr], 0, fp_reg_count);
-    std::memset(tmp_fp_reg_write[hw_thr], 0, fp_reg_count);
+    // The register counts are no longer needed -- the scoreboard is a word per
+    // thread, cleared whole -- but the signature is left alone because that is
+    // what "clear the register-use temporaries for this thread" is called here.
+    (void)int_reg_count;
+    (void)fp_reg_count;
+
+    tmp_not_issued_int_reg_read[hw_thr] = 0;
+    tmp_int_reg_write[hw_thr]           = 0;
+    tmp_not_issued_fp_reg_read[hw_thr]  = 0;
+    tmp_fp_reg_write[hw_thr]            = 0;
+}
+
+// THE ISSUE STAGE'S REGISTER-DEPENDENCY TEST.
+//
+// This is the body of VANADIS_COMPONENT::checkInstructionResources, and it is a
+// free function for two reasons. It is called once per reorder-buffer entry per
+// cycle -- 352 times a cycle on the configuration this core is usually given --
+// and a call to a member function of a class in a shared library goes through
+// the PLT, an indirect jump, on that path; as a static function it inlines into
+// performIssue. And the four scoreboard words are then passed in registers,
+// where the caller is already holding them, rather than re-loaded from the
+// component per entry.
+//
+// The answers are the ones the method always gave, and the five return codes
+// are kept exactly: performIssue distinguishes 1 (no physical register to
+// rename into) from a dependency, and the numbers appear in traces.
+//
+// What changed is only the representation. "Does this instruction read a
+// register that something ahead of it writes" was a loop over the
+// instruction's operand list, indexing a byte array, and each operand list is
+// its own heap allocation -- so the test touched four scattered cache lines
+// per entry. Both sides are now bit sets over the architectural registers, so
+// it is one AND per operand class, reading the instruction's own header line.
+static inline int
+vanadisIssueResourceCheck(
+    VanadisInstruction* ins, const size_t int_regs_unused, const size_t fp_regs_unused, VanadisISATable* isa_table,
+    const uint64_t int_reg_write, const uint64_t not_issued_int_reg_read, const uint64_t fp_reg_write,
+    const uint64_t not_issued_fp_reg_read, SST::Output* output)
+{
+    (void)output;
+
+    // We need places to store our output registers
+    if ( UNLIKELY( (int_regs_unused < ins->countISAIntRegOut()) || (fp_regs_unused < ins->countISAFPRegOut()) ) ) {
+        #ifdef VANADIS_BUILD_DEBUG
+        output->verbose(CALL_INFO, 8, 0, "hw_thr=%d: --> Attempting issue for: ins:0x%" PRI_ADDR " / %s\n",
+                                ins->getHWThread(), ins->getInstructionAddress(), ins->getInstCode());
+        output->verbose(
+            CALL_INFO, 16, 0,
+            "----> insufficient output / req: int: %" PRIu16 " fp: %" PRIu16 " / free: int: %" PRIu16 " fp: %" PRIu16
+            "\n",
+            (uint16_t)ins->countISAIntRegOut(), (uint16_t)ins->countISAFPRegOut(), (uint16_t)int_regs_unused,
+            (uint16_t)fp_regs_unused);
+        #endif
+        return 1;
+    }
+
+    // If there are any pending writes against our reads, we can't issue until
+    // they are done
+    if ( LIKELY( 0 != (ins->getISAIntRegInMask() & (isa_table->pendingIntWriteMask() | int_reg_write)) ) ) {
+        return 2;
+    }
+
+    if ( UNLIKELY( 0 != (ins->getISAFPRegInMask() & (isa_table->pendingFPWriteMask() | fp_reg_write)) ) ) {
+        return 3;
+    }
+
+    // Check there are no RAW in the pending instruction queue
+    if ( LIKELY( 0 != (ins->getISAIntRegOutMask() & (not_issued_int_reg_read | int_reg_write)) ) ) { return 4; }
+
+    if ( UNLIKELY( 0 != (ins->getISAFPRegOutMask() & (not_issued_fp_reg_read | fp_reg_write)) ) ) { return 5; }
+
+    return 0;
 }
 
 int
@@ -558,7 +634,25 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
         thr_rob = rob[hwThr];
         // Find the next instruction which has not been issued yet
         const auto rob_size = thr_rob->size();
-        int k_in=0;
+
+        // The scoreboard for this thread, held in registers for the length of
+        // the scan and written back once at the end. It carries across the
+        // several calls this stage makes per cycle (issues_per_cycle of them,
+        // each resuming where the last one issued); tick() clears it once per
+        // cycle before the first.
+        uint64_t int_reg_write_mask       = tmp_int_reg_write[i];
+        uint64_t not_issued_int_read_mask = tmp_not_issued_int_reg_read[i];
+        uint64_t fp_reg_write_mask        = tmp_fp_reg_write[i];
+        uint64_t not_issued_fp_read_mask  = tmp_not_issued_fp_reg_read[i];
+
+        VanadisISATable* const thr_isa_table = issue_isa_tables[i];
+
+        // Both are loop-invariant: the only thing in this loop that takes a
+        // physical register is assignRegistersToInstruction, and the scan stops
+        // at the instruction it ran for.
+        const size_t int_regs_unused = int_register_stack->unused();
+        const size_t fp_regs_unused  = fp_register_stack->unused();
+
         for ( auto j = rob_start; j < rob_size; ++j )
         {
             VanadisInstruction* ins = thr_rob->peekAt(j);
@@ -577,8 +671,9 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                     }
                 }
                 #endif
-                const int resource_check = checkInstructionResources(
-                    ins, int_register_stack, fp_register_stack, issue_isa_tables[i]);
+                const int resource_check = vanadisIssueResourceCheck(
+                    ins, int_regs_unused, fp_regs_unused, thr_isa_table, int_reg_write_mask,
+                    not_issued_int_read_mask, fp_reg_write_mask, not_issued_fp_read_mask, output);
 
                 #ifdef VANADIS_BUILD_DEBUG
                 if ( output_verbosity >= 8 )
@@ -591,10 +686,9 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                     }
                 }
                 #endif
-                const auto ins_type = ins->getInstFuncType();
-
                 if ( 0 == resource_check ) // Resources available, can issue
                 {
+                    const auto ins_type = ins->getInstFuncType();
                     int allocate_fu = 1;
                     const bool is_rocc = (ins_type == INST_ROCC0 || ins_type == INST_ROCC1 ||
                                           ins_type == INST_ROCC2 || ins_type == INST_ROCC3);
@@ -678,6 +772,13 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                 }
                 else
                 {
+                    // This trace is now compiled out of a non-debug build, like
+                    // every other trace in this function. It was the one that
+                    // was not, so a build with no debug support still formatted
+                    // an instruction into a print buffer for every blocked
+                    // reorder-buffer entry, every cycle, and then discarded it
+                    // because the verbosity was 0.
+                    #ifdef VANADIS_BUILD_DEBUG
                     if(1 == resource_check)
                     {
                         ins->printToBuffer(instPrintBuffer, 1024);
@@ -685,32 +786,30 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                             CALL_INFO, 8, 0, "%d: --> Failed to issue for: rob[%" PRIu32 "]: 0x%" PRI_ADDR " / %s\n", i, j,
                             ins->getInstructionAddress(), instPrintBuffer);
                     }
+                    #endif
 
-                    if(ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE) {
-                        // we have seen a memory operation which is not issued, downstream operations
-                        // cannot issue yet to maintain ordering
-                        unallocated_memory_op_seen = true;
+                    // getInstFuncType() is virtual, so it is asked only when the
+                    // answer can still change something: once a memory
+                    // operation has been seen this cycle the flag stays set.
+                    if ( !unallocated_memory_op_seen ) {
+                        const auto ins_type = ins->getInstFuncType();
+
+                        if(ins_type == INST_LOAD || ins_type == INST_STORE || ins_type == INST_FENCE) {
+                            // we have seen a memory operation which is not issued, downstream operations
+                            // cannot issue yet to maintain ordering
+                            unallocated_memory_op_seen = true;
+                        }
                     }
                 }
 
                 // if the instruction is *not* issued yet, we need to keep track
                 // of which instructions are being read
-                for ( auto k = 0; k < ins->countISAIntRegIn(); ++k ) {
-                    tmp_not_issued_int_reg_read[i][ins->getISAIntRegIn(k)] = 1;
-                }
-
-                for ( auto k = 0; k < ins->countISAFPRegIn(); ++k ) {
-                    tmp_not_issued_fp_reg_read[i][ins->getISAFPRegIn(k)] = 1;
-                }
+                not_issued_int_read_mask |= ins->getISAIntRegInMask();
+                not_issued_fp_read_mask  |= ins->getISAFPRegInMask();
             }
-            // Collect up all integer registers we write to
-            for ( auto k = 0; k < ins->countISAIntRegOut(); ++k ) {
-                tmp_int_reg_write[i][ins->getISAIntRegOut(k)] = 1;
-            }
-            // Collect up all fp registers we write to
-            for ( auto k = 0; k < ins->countISAFPRegOut(); ++k ) {
-                tmp_fp_reg_write[i][ins->getISAFPRegOut(k)] = 1;
-            }
+            // Collect up all integer and fp registers we write to
+            int_reg_write_mask |= ins->getISAIntRegOutMask();
+            fp_reg_write_mask  |= ins->getISAFPRegOutMask();
             // We issued an instruction this cycle, so exit
             if ( issued_an_ins ) {
                 // tell the caller where we got this from
@@ -718,6 +817,11 @@ VANADIS_COMPONENT::performIssue(const uint64_t cycle, int hwThr, uint32_t& rob_s
                 break;
             }
         }
+
+        tmp_int_reg_write[i]                = int_reg_write_mask;
+        tmp_not_issued_int_reg_read[i]      = not_issued_int_read_mask;
+        tmp_fp_reg_write[i]                 = fp_reg_write_mask;
+        tmp_not_issued_fp_reg_read[i]       = not_issued_fp_read_mask;
 
         // Only print the table if we issued an instruction, reduce print out
         // clutter
@@ -1614,106 +1718,15 @@ int
 VANADIS_COMPONENT::checkInstructionResources(
     VanadisInstruction* ins, VanadisRegisterStack* int_regs, VanadisRegisterStack* fp_regs, VanadisISATable* isa_table)
 {
+    // The test itself is vanadisIssueResourceCheck, above performIssue -- see
+    // the note there for why it is a free function. This is the same call with
+    // the scoreboard read from the component, for any caller that is not the
+    // issue scan itself.
     const auto hwThr = ins->getHWThread();
-    auto int_reg_write = tmp_int_reg_write[hwThr];
-    auto not_issued_int_reg_read = tmp_not_issued_int_reg_read[hwThr];
-    auto fp_reg_write = tmp_fp_reg_write[hwThr];
-    auto not_issued_fp_reg_read = tmp_not_issued_fp_reg_read[hwThr];
 
-    bool      resources_good   = true;
-    #ifdef VANADIS_BUILD_DEBUG
-    const int output_verbosity = output->getVerboseLevel();
-    #endif
-
-    const uint16_t int_reg_in_count = ins->countISAIntRegIn();
-    const uint16_t int_reg_out_count = ins->countISAIntRegOut();
-    const uint16_t fp_reg_out_count = ins->countISAFPRegOut();
-    const uint16_t fp_reg_in_count = ins->countISAFPRegIn();
-
-    // We need places to store our output registers
-    resources_good &= (int_regs->unused() >= int_reg_out_count) && (fp_regs->unused() >= fp_reg_out_count);
-
-    if ( UNLIKELY(!resources_good )) {
-        #ifdef VANADIS_BUILD_DEBUG
-        output->verbose(CALL_INFO, 8, 0, "hw_thr=%d: --> Attempting issue for: ins:0x%" PRI_ADDR " / %s\n", hwThr,
-                                ins->getInstructionAddress(), ins->getInstCode());
-        output->verbose(
-            CALL_INFO, 16, 0,
-            "----> insufficient output / req: int: %" PRIu16 " fp: %" PRIu16 " / free: int: %" PRIu16 " fp: %" PRIu16
-            "\n",
-            (uint16_t)ins->countISAIntRegOut(), (uint16_t)ins->countISAFPRegOut(), (uint16_t)int_regs->unused(),
-            (uint16_t)fp_regs->unused());
-        #endif
-        return 1;
-    }
-
-    // If there are any pending writes against our reads, we can't issue until
-    // they are done
-
-    for ( uint16_t i = 0; i < int_reg_in_count; ++i ) {
-        const uint16_t ins_isa_reg = ins->getISAIntRegIn(i);
-        resources_good &= (!isa_table->pendingIntWrites(ins_isa_reg)) && (!int_reg_write[ins_isa_reg]);
-    }
-
-    #ifdef VANADIS_BUILD_DEBUG
-    // if ( output_verbosity > 16 ) {
-    //     output->verbose(
-    //         CALL_INFO, 16, 0, "--> Check input integer registers, issue-status: %s\n", (resources_good ? "yes" : "no"));
-    // }
-    #endif
-
-    if ( LIKELY(!resources_good )) { return 2; }
-
-    for ( uint16_t i = 0; i < fp_reg_in_count; ++i ) {
-        const uint16_t ins_isa_reg = ins->getISAFPRegIn(i);
-        resources_good &= (!isa_table->pendingFPWrites(ins_isa_reg)) & (!fp_reg_write[ins_isa_reg]);
-    }
-
-    #ifdef VANADIS_BUILD_DEBUG
-    // if ( output_verbosity > 16 ) {
-    //     output->verbose(
-    //         CALL_INFO, 16, 0, "--> Check input floating-point registers, issue-status: %s\n",
-    //         (resources_good ? "yes" : "no"));
-    // }
-    #endif
-
-    if ( UNLIKELY(!resources_good )) { return 3; }
-
-    for ( uint16_t i = 0; i < int_reg_out_count; ++i ) {
-        const uint16_t ins_isa_reg = ins->getISAIntRegOut(i);
-
-        // Check there are no RAW in the pending instruction queue
-        resources_good &= (!not_issued_int_reg_read[ins_isa_reg]) && (!int_reg_write[ins_isa_reg]);
-    }
-
-    #ifdef VANADIS_BUILD_DEBUG
-    // if ( output_verbosity > 16 ) {
-    //     output->verbose(
-    //         CALL_INFO, 16, 0, "--> Check output integer registers, issue-status: %s\n",
-    //         (resources_good ? "yes" : "no"));
-    // }
-    #endif
-
-    if ( LIKELY(!resources_good )) { return 4; }
-
-    for ( uint16_t i = 0; i < fp_reg_out_count; ++i ) {
-        const uint16_t ins_isa_reg = ins->getISAFPRegOut(i);
-
-        // Check there are no RAW in the pending instruction queue
-        resources_good &= (!not_issued_fp_reg_read[ins_isa_reg]) && (!fp_reg_write[ins_isa_reg]);
-    }
-
-    #ifdef VANADIS_BUILD_DEBUG
-    // if ( output_verbosity > 16 ) {
-    //     output->verbose(
-    //         CALL_INFO, 16, 0, "--> Check output floating-point registers, issue-status: %s\n",
-    //         (resources_good ? "yes" : "no"));
-    // }
-    #endif
-
-    if ( UNLIKELY(!resources_good )) { return 5; }
-
-    return 0;
+    return vanadisIssueResourceCheck(
+        ins, int_regs->unused(), fp_regs->unused(), isa_table, tmp_int_reg_write[hwThr],
+        tmp_not_issued_int_reg_read[hwThr], tmp_fp_reg_write[hwThr], tmp_not_issued_fp_reg_read[hwThr], output);
 }
 
 int

@@ -316,10 +316,18 @@ private:
     std::vector<VanadisISATable*> issue_isa_tables;
     std::vector<VanadisISATable*> retire_isa_tables;
 
-    std::vector<uint8_t*> tmp_not_issued_int_reg_read;
-    std::vector<uint8_t*> tmp_int_reg_write;
-    std::vector<uint8_t*> tmp_not_issued_fp_reg_read;
-    std::vector<uint8_t*> tmp_fp_reg_write;
+    // THE ISSUE STAGE'S PER-CYCLE SCOREBOARD, one word per hardware thread and
+    // one BIT per architectural register, where it used to be one byte. It says
+    // exactly what it always said -- which registers instructions ahead of the
+    // scan point write, and which registers the ones that have not issued read
+    // -- but an instruction can now be tested against the whole of it with four
+    // ANDs instead of four loops over its operand lists. The issue stage walks
+    // every reorder-buffer entry every cycle, so that is the difference the
+    // stage's cost is made of. See VANADIS_MASKED_ISA_REGS.
+    std::vector<uint64_t> tmp_not_issued_int_reg_read;
+    std::vector<uint64_t> tmp_int_reg_write;
+    std::vector<uint64_t> tmp_not_issued_fp_reg_read;
+    std::vector<uint64_t> tmp_fp_reg_write;
 
     std::list<VanadisInsCacheLoadRecord*>* icache_load_records;
 

@@ -85,12 +85,32 @@ public:
     }
 
 private:
+    // WRAPPING BY CONDITIONAL SUBTRACT, NOT BY REMAINDER.
+    //
+    // These are the same function they were: for the only inputs either one is
+    // ever called with, the result is identical, and the power-of-two path is
+    // untouched. What changes is the cost of the other path. `max_capacity` is
+    // a size_t, so `(head + index) % max_capacity` was a 64-bit unsigned
+    // DIVISION -- tens of cycles, and not one the compiler can strength-reduce
+    // because the capacity is a run-time value. A reorder buffer whose size is
+    // not a power of two (352, the size a big core's is) therefore paid a
+    // division for every peekAt, and the issue stage does one of those per ROB
+    // entry per cycle.
+    //
+    // The subtract is exact because both callers stay inside one wrap:
+    // `head` < max_capacity and `index` < count <= max_capacity, so
+    // head + index < 2 * max_capacity; and incrementIndex's argument is an
+    // index < max_capacity, so index + 1 <= max_capacity.
     int calculateIndex(const int index) const {
-        return max_power_two ? (head + index) & bit_mask : (head + index) % max_capacity;
+        if ( max_power_two ) { return (head + index) & bit_mask; }
+        const int i = head + index;
+        return ( i >= static_cast<int>(max_capacity) ) ? ( i - static_cast<int>(max_capacity) ) : i;
     }
 
     int incrementIndex(const int index) const {
-        return max_power_two ? (index + 1) & bit_mask : (index + 1) % max_capacity;
+        if ( max_power_two ) { return (index + 1) & bit_mask; }
+        const int i = index + 1;
+        return ( i >= static_cast<int>(max_capacity) ) ? ( i - static_cast<int>(max_capacity) ) : i;
     }
 
     const size_t  max_capacity;

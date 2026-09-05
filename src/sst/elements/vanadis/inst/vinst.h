@@ -32,6 +32,14 @@
 
 namespace SST {
 namespace Vanadis {
+
+// How many architectural registers of one kind the issue stage's register
+// scoreboard can hold in a machine word. RISC-V declares 35 integer and 32
+// floating-point; MIPS declares 34 of each. VanadisComponent checks its
+// decoders against this at construction and refuses to start rather than
+// silently dropping a register out of the dependency check.
+static constexpr uint16_t VANADIS_MASKED_ISA_REGS = 64;
+
 class VanadisInstruction
 {
     public:
@@ -81,6 +89,7 @@ class VanadisInstruction
             end_uop_group_        = false;
             is_front_of_rob_      = false;
             has_rob_slot_         = false;
+            isa_reg_masks_valid_  = false;
             sw_thread             = hw_thr;
         }
 
@@ -115,6 +124,9 @@ class VanadisInstruction
             end_uop_group_        = copy_me.end_uop_group_;
             is_front_of_rob_      = false;
             has_rob_slot_         = false;
+            // Not copied: the clone's register lists are rebuilt below, and a
+            // derived copy constructor may rewrite them again afterwards.
+            isa_reg_masks_valid_  = false;
             sw_thread             = copy_me.sw_thread;
 
             phys_int_regs_in  = (count_phys_int_reg_in > 0) ? new uint16_t[count_phys_int_reg_in] : nullptr;
@@ -297,6 +309,15 @@ class VanadisInstruction
         uint16_t getISAFPRegIn(const uint16_t index) const { return isa_fp_regs_in[index]; }
         uint16_t getISAFPRegOut(const uint16_t index) const { return isa_fp_regs_out[index]; }
 
+        // The same four register lists as bit sets. See the note on the mask
+        // members: these are what the issue stage's scoreboard checks read, so
+        // that checking an instruction against every older one in the reorder
+        // buffer is four ANDs rather than four loops over heap arrays.
+        uint64_t getISAIntRegInMask()  { ensureISARegMasks(); return isa_int_reg_in_mask_; }
+        uint64_t getISAIntRegOutMask() { ensureISARegMasks(); return isa_int_reg_out_mask_; }
+        uint64_t getISAFPRegInMask()   { ensureISARegMasks(); return isa_fp_reg_in_mask_; }
+        uint64_t getISAFPRegOutMask()  { ensureISARegMasks(); return isa_fp_reg_out_mask_; }
+
         void setPhysIntRegIn(const uint16_t index, const uint16_t reg) { phys_int_regs_in[index] = reg; }
         void setPhysIntRegOut(const uint16_t index, const uint16_t reg) { phys_int_regs_out[index] = reg; }
         void setPhysFPRegIn(const uint16_t index, const uint16_t reg) { phys_fp_regs_in[index] = reg; }
@@ -443,26 +464,85 @@ class VanadisInstruction
 
     protected:
 
+        void ensureISARegMasks()
+        {
+            if ( !isa_reg_masks_valid_ ) { buildISARegMasks(); }
+        }
+
+        void buildISARegMasks()
+        {
+            isa_int_reg_in_mask_  = isaRegSetMask(isa_int_regs_in, count_isa_int_reg_in);
+            isa_int_reg_out_mask_ = isaRegSetMask(isa_int_regs_out, count_isa_int_reg_out);
+            isa_fp_reg_in_mask_   = isaRegSetMask(isa_fp_regs_in, count_isa_fp_reg_in);
+            isa_fp_reg_out_mask_  = isaRegSetMask(isa_fp_regs_out, count_isa_fp_reg_out);
+            isa_reg_masks_valid_  = true;
+        }
+
+        static uint64_t isaRegSetMask(const uint16_t* regs, const uint16_t count)
+        {
+            uint64_t mask = 0;
+            for ( uint16_t i = 0; i < count; ++i ) {
+                const uint16_t reg = regs[i];
+                // A register number this large cannot be in the mask at all.
+                // The component refuses to start on an ISA that declares that
+                // many registers, so reaching here means a corrupt register
+                // list, which assignRegistersToInstruction fatals on when the
+                // instruction gets to issue.
+                if ( reg < VANADIS_MASKED_ISA_REGS ) { mask |= (static_cast<uint64_t>(1) << reg); }
+            }
+            return mask;
+        }
+
+        // MEMBER ORDER HERE IS DELIBERATE, AND IT IS ABOUT THE ISSUE STAGE.
+        //
+        // The issue stage walks EVERY entry of the reorder buffer every cycle,
+        // and for most of them it only wants to know four things: has this one
+        // issued, and which architectural registers does it read and write.
+        // Everything needed to answer that -- the vtable pointer, the four
+        // masks, the two output counts, has_issued_ -- is kept inside the first
+        // 64 bytes of the object, so walking past a ROB entry touches ONE cache
+        // line. It used to touch the object plus four separately-allocated
+        // uint16_t arrays. At 352 entries a cycle that is the whole cost of the
+        // stage.
         const uint64_t ins_address;
-        const uint32_t hw_thread;
+
+        // The ISA registers this instruction reads and writes, as bit sets --
+        // one bit per architectural register, which is why the component
+        // refuses to start on an ISA with more than VANADIS_MASKED_ISA_REGS of
+        // them (vanadis.cc). The scoreboard checks at issue are then one AND
+        // each instead of a loop over a heap array.
+        //
+        // BUILT LAZILY, and that is not an optimisation: a DERIVED constructor
+        // may still be rewriting the register lists after this one has run --
+        // VanadisPartialLoadInstruction deletes and reallocates both of its
+        // integer lists and changes their counts -- so there is no point during
+        // construction at which the base class may read them. Nothing asks for
+        // a mask before the instruction reaches issue, which is long after any
+        // constructor has finished.
+        uint64_t isa_int_reg_in_mask_;
+        uint64_t isa_int_reg_out_mask_;
+        uint64_t isa_fp_reg_in_mask_;
+        uint64_t isa_fp_reg_out_mask_;
 
         uint16_t count_isa_int_reg_in;
         uint16_t count_isa_int_reg_out;
         uint16_t count_isa_fp_reg_in;
         uint16_t count_isa_fp_reg_out;
 
-
-        uint16_t count_phys_int_reg_in;
-        uint16_t count_phys_int_reg_out;
-        uint16_t count_phys_fp_reg_in;
-        uint16_t count_phys_fp_reg_out;
-
+        bool isa_reg_masks_valid_;
         bool trap_error_ = false;
         bool has_executed_;
         bool has_issued_;
         bool end_uop_group_;
         bool is_front_of_rob_;
         bool has_rob_slot_;
+
+        const uint32_t hw_thread;
+
+        uint16_t count_phys_int_reg_in;
+        uint16_t count_phys_int_reg_out;
+        uint16_t count_phys_fp_reg_in;
+        uint16_t count_phys_fp_reg_out;
 
         const VanadisDecoderOptions* isa_options;
         uint32_t sw_thread;
