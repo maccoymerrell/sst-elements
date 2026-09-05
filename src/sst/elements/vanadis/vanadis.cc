@@ -58,6 +58,28 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     pipelineTrace   = nullptr;
     max_cycle = params.find<uint64_t>("max_cycle", std::numeric_limits<uint64_t>::max());
 
+    // THE WAIT SPAN, the one part of the program whose instruction count belongs to the
+    // machine rather than to the program. Read as text so an address may be written in
+    // hexadecimal, which is how a linker prints one. Equal values are an empty span and are
+    // the default, so a core told neither counts every program instruction as progress.
+    {
+        auto addr = [&](const char* name) {
+            const std::string v = params.find<std::string>(name, "0");
+            return (uint64_t)std::strtoull(v.c_str(), nullptr, 0);
+        };
+        nmfc_wait_start_ = addr("nmfc_wait_start");
+        nmfc_wait_stop_  = addr("nmfc_wait_stop");
+        if ( nmfc_wait_stop_ < nmfc_wait_start_ ) {
+            output->fatal(
+                CALL_INFO, -1,
+                "Error: nmfc_wait_stop (0x%" PRI_ADDR ") is below nmfc_wait_start (0x%" PRI_ADDR
+                "). The two are the ends of one span of the program's own text, in order.\n",
+                nmfc_wait_stop_, nmfc_wait_start_);
+        }
+    }
+    ins_progress_this_cycle = 0;
+    ins_wait_this_cycle     = 0;
+
     // THE ARCHITECTURAL STATE OF A PROGRAM ALREADY RUNNING, from a whole-program image.
     //
     // Parsed here and applied in startThread(); see restoreImageState(). A list that is
@@ -492,6 +514,8 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
     // Register statistics ///////////////////////////////////////////////////////
     stat_ins_retired          = registerStatistic<uint64_t>("instructions_retired", "1");
+    stat_ins_progress         = registerStatistic<uint64_t>("instructions_progress", "1");
+    stat_ins_wait             = registerStatistic<uint64_t>("instructions_wait", "1");
     stat_ins_decoded          = registerStatistic<uint64_t>("instructions_decoded", "1");
     stat_ins_issued           = registerStatistic<uint64_t>("instructions_issued", "1");
     stat_loads_issued         = registerStatistic<uint64_t>("loads_issued", "1");
@@ -1221,6 +1245,8 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
         // accelerator reads inside tick() includes the cycle it is in. See
         // VanadisRoCCInterface::host_insns_retired.
         roccs_[i]->host_insns_retired += ins_retired_this_cycle;
+        roccs_[i]->host_insns_progress += ins_progress_this_cycle;
+        roccs_[i]->host_insns_wait     += ins_wait_this_cycle;
         RoCCResponse* resp;
         if (!(roccs_[i]->isBusy()) && (resp = roccs_[i]->respond())) {
             VanadisInstruction* ins = rocc_queues_[i].front();
@@ -1497,6 +1523,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
             #endif
 
             ins_retired_this_cycle++;
+            countProgress(rob_front);
 
             if ( perform_delay_cleanup )
             {
@@ -1531,6 +1558,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
 			    }
                 #endif
                 ins_retired_this_cycle++;
+                countProgress(delay_ins);
 
                 processWritebacks();
                 delete delay_ins;
@@ -1821,9 +1849,11 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     #endif
 
     stat_cycles->addData(1);
-    ins_issued_this_cycle  = 0;
-    ins_retired_this_cycle = 0;
-    ins_decoded_this_cycle = 0;
+    ins_issued_this_cycle   = 0;
+    ins_retired_this_cycle  = 0;
+    ins_decoded_this_cycle  = 0;
+    ins_progress_this_cycle = 0;
+    ins_wait_this_cycle     = 0;
 
     // Results that landed BETWEEN two cycles -- a cache response, an
     // emulated-OS response -- wake their consumers before anything else
@@ -1930,6 +1960,10 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
 
     // Record how many instructions we retired this cycle
     stat_ins_retired->addData(ins_retired_this_cycle);
+    // ...and how many of them were the program's own instructions, split by whether they
+    // were inside the wait code or outside it. See countProgress().
+    stat_ins_progress->addData(ins_progress_this_cycle);
+    stat_ins_wait->addData(ins_wait_this_cycle);
 
     // Execute
     // //////////////////////////////////////////////////////////////////////////
