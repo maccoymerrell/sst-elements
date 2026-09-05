@@ -39,6 +39,8 @@ public:
     }
 
     void clear() {
+        order_pos.clear();
+
         for (auto val_itr = data_values.begin(); val_itr != data_values.end(); val_itr++ ) {
             switch(D) {
                 case SST::Vanadis::VanadisCacheRecordDeletion::VANADIS_PERFORM_DELETE:
@@ -61,6 +63,7 @@ public:
     void reset() {
         clear();
         data_values.reserve(max_entries);
+        order_pos.reserve(max_entries);
     }
 
     bool contains(const I& value) const { return (data_values.find(value) != data_values.end()); }
@@ -78,6 +81,7 @@ public:
             kill_lru_key();
             data_values.insert(std::pair<I, T>(key, value));
             ordering_q.push_front(key);
+            order_pos[key] = ordering_q.begin();
         }
     }
 
@@ -100,6 +104,7 @@ private:
 
         const I remove_key = ordering_q.back();
         ordering_q.pop_back();
+        order_pos.erase(remove_key);
 
         auto find_key = data_values.find(remove_key);
 
@@ -119,26 +124,32 @@ private:
         data_values.erase(find_key);
     }
 
+    // THE LRU ORDER IS THE SAME ORDER; FINDING A KEY IN IT IS NOT A SEARCH.
+    //
+    // This walked `ordering_q` linearly looking for the key, and the micro-op
+    // cache this class holds has 1536 entries -- so every HIT, which is every
+    // decode of a program that fits in the cache, walked up to 1536 list nodes.
+    // At 14 % of the simulator it was the single most expensive symbol in the
+    // profile once the issue stage stopped being it.
+    //
+    // A second map from key to its position in the list makes the move O(1),
+    // and `std::list::splice` moves the node rather than destroying and
+    // rebuilding it, so every OTHER key's iterator stays valid. The resulting
+    // order is not merely equivalent to the old one, it is the same sequence of
+    // keys -- which is what makes this a change with no behavioural content:
+    // the same entry is evicted at the same moment.
     void send_key_to_front(const I& key) {
-        bool found_key = false;
+        auto pos = order_pos.find(key);
 
-        for (auto order_itr = ordering_q.begin(); order_itr != ordering_q.end();) {
-            if (UNLIKELY(key == (*order_itr))) {
-                ordering_q.erase(order_itr);
-                found_key = true;
-                break;
-            } else {
-                order_itr++;
-            }
-        }
-
-        if (LIKELY(found_key)) {
-            ordering_q.push_front(key);
+        if (LIKELY(pos != order_pos.end())) {
+            ordering_q.splice(ordering_q.begin(), ordering_q, pos->second);
+            pos->second = ordering_q.begin();
         }
     }
 
     const size_t max_entries;
     std::list<I> ordering_q;
+    std::unordered_map<I, typename std::list<I>::iterator> order_pos;
     std::unordered_map<I, T> data_values;
 };
 
