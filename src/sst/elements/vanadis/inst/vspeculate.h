@@ -28,6 +28,9 @@ class VanadisSpeculatedInstruction : public virtual VanadisInstruction
 {
 
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisSpeculatedInstruction* asSpeculated() override { return this; }
+
     VanadisSpeculatedInstruction(
         const uint64_t addr, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts, const uint64_t ins_w,
         const uint16_t c_phys_int_reg_in, const uint16_t c_phys_int_reg_out, const uint16_t c_isa_int_reg_in,

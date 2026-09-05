@@ -24,6 +24,9 @@ namespace Vanadis {
 class VanadisSysCallInstruction : public virtual VanadisInstruction
 {
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisSysCallInstruction* asSysCall() override { return this; }
+
     VanadisSysCallInstruction(const uint64_t addr, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts) :
         VanadisInstruction(
             addr, hw_thr, isa_opts, isa_opts->countISAIntRegisters(), isa_opts->countISAIntRegisters(),

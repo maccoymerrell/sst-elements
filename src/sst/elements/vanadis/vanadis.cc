@@ -1214,7 +1214,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 output->verbose(CALL_INFO, 9, VANADIS_DBG_RETIRE_FLG, "--> instruction is speculated\n");
             }
             #endif
-            VanadisSpeculatedInstruction* spec_ins = dynamic_cast<VanadisSpeculatedInstruction*>(rob_front);
+            VanadisSpeculatedInstruction* spec_ins = rob_front->asSpeculated();
 
             if ( nullptr == spec_ins ) {
                 output->fatal(
@@ -1489,7 +1489,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 // syscall
                 if ( !rob_front->checkFrontOfROB() )
                 {
-                    VanadisSysCallInstruction* the_syscall_ins = dynamic_cast<VanadisSysCallInstruction*>(rob_front);
+                    VanadisSysCallInstruction* the_syscall_ins = rob_front->asSysCall();
 
                     if ( nullptr == the_syscall_ins ) {
                         output->fatal( CALL_INFO, -1,
@@ -1629,7 +1629,7 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
     case INST_LOAD:
         if ( !lsq->loadFull() ) {
             stat_loads_issued->addData(1);
-            lsq->push(dynamic_cast<VanadisLoadInstruction*>(ins));
+            lsq->push(ins->asLoad());
             allocated_fu = true;
         }
         break;
@@ -1637,7 +1637,7 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
     case INST_STORE:
         if ( !lsq->storeFull() ) {
             stat_stores_issued->addData(1);
-            lsq->push(dynamic_cast<VanadisStoreInstruction*>(ins));
+            lsq->push(ins->asStore());
             allocated_fu = true;
         }
         break;
@@ -1665,7 +1665,7 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
 
     case INST_FENCE:
     {
-        VanadisFenceInstruction* fence_ins = dynamic_cast<VanadisFenceInstruction*>(ins);
+        VanadisFenceInstruction* fence_ins = ins->asFence();
 
         if ( nullptr == fence_ins ) {
             output->fatal(
@@ -2476,7 +2476,7 @@ VANADIS_COMPONENT::syscallReturn(uint32_t thr)
     }
 
     VanadisInstruction*        rob_front   = thr_rob->peek();
-    VanadisSysCallInstruction* syscall_ins = dynamic_cast<VanadisSysCallInstruction*>(rob_front);
+    VanadisSysCallInstruction* syscall_ins = rob_front->asSysCall();
 
     if ( nullptr == syscall_ins ) {
         output->fatal(

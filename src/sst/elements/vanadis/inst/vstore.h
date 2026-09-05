@@ -28,6 +28,9 @@ class VanadisStoreInstruction : public virtual VanadisInstruction
 {
 
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisStoreInstruction* asStore() override { return this; }
+
     VanadisStoreInstruction(
         const uint64_t addr, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts, const uint16_t memoryAddr,
         const int64_t offst, const uint16_t valueReg, const uint16_t store_bytes, VanadisMemoryTransaction accessT,

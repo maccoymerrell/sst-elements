@@ -31,6 +31,9 @@ class VanadisLoadInstruction : public virtual VanadisInstruction
 {
 
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisLoadInstruction* asLoad() override { return this; }
+
     VanadisLoadInstruction(
         const uint64_t addr, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts, const uint16_t memAddrReg,
         const int64_t offst, const uint16_t tgtReg, const uint16_t load_bytes, const bool extend_sign,

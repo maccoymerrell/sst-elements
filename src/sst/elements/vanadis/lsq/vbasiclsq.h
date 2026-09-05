@@ -302,7 +302,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     out->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_STORE_FLG, " (ScalarLSQ) -> processLLSC\n");
                     const uint16_t value_reg = store_ins->getPhysIntRegOut(0);
 
-                    VanadisStoreConditionalInstruction* store_cond_ins = dynamic_cast<VanadisStoreConditionalInstruction*>(store_ins);
+                    VanadisStoreConditionalInstruction* store_cond_ins = store_ins->asStoreConditional();
 
                     if(UNLIKELY(nullptr == store_cond_ins)) {
                         out->fatal(CALL_INFO, -1, "Unable to cast an LLSC_STORE into a store-conditional, logic failure.\n");
@@ -392,7 +392,13 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     uint64_t addr_offset = ev->vAddr - load_address;
                     uint32_t reg_width = 0;
 
-                    if(out->getVerboseLevel() >= 0) {
+                    // The level this builds its string for is the level the
+                    // verbose() call below prints at. It used to read `>= 0`,
+                    // which is a tautology on an unsigned level: every load
+                    // response, at every verbosity, hex-formatted its whole
+                    // payload into an ostringstream and copied it out with
+                    // str() to build a string verbose() then discarded.
+                    if(out->getVerboseLevel() >= 16) {
                         std::ostringstream str;
                         str << ", Payload: 0x";
                         str << std::hex << std::setfill('0');
@@ -986,7 +992,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         virtual bool sendStoreReq(VanadisInstruction* store_ins_temp)
         {
-            VanadisStoreInstruction* store_ins = dynamic_cast<VanadisStoreInstruction*>(store_ins_temp);
+            VanadisStoreInstruction* store_ins = store_ins_temp->asStore();
             output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG,
                 "In sendstoreReq (ScalarLSQ) hw_thr:%d\n", store_ins->getHWThread());
             uint64_t store_address_last = 0;
@@ -1034,8 +1040,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 case VanadisBasicLoadStoreEntryOp::LOAD:
                 {
                     //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue LOAD\n", cycle);
-                    VanadisLoadInstruction* load_ins = dynamic_cast<VanadisLoadInstruction*>(
-                        front_entry->getInstruction());
+                    VanadisLoadInstruction* load_ins =
+                        front_entry->getInstruction()->asLoad();
 
                     if(UNLIKELY(load_ins == nullptr))
                     {
@@ -1072,7 +1078,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     //output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue STORE\n", cycle);
                     // VanadisStoreInstruction* store_ins = dynamic_cast<VanadisStoreInstruction*>(
                     //     front_entry->getInstruction());
-                    VanadisInstruction* store_ins = dynamic_cast<VanadisInstruction*>(front_entry->getInstruction());
+                    VanadisInstruction* store_ins = front_entry->getInstruction();
                     if(UNLIKELY(store_ins == nullptr)) {
                         output->fatal(CALL_INFO, -1, "Error: attempted to convert a store entry into store instruction but this failed (ins: 0x%" PRI_ADDR ", thr: %" PRIu32 ")\n",
                             front_entry->getInstructionAddress(), front_entry->getHWThread());
@@ -1102,7 +1108,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 {
                     output->verbose(CALL_INFO, 16, VANADIS_DBG_LSQ_LOAD_FLG, "--> cycle: %" PRIu64 " attempt to issue FENCE\n", cycle);
                     VanadisInstruction* current_ins = op_q[thr].front()->getInstruction();
-                    VanadisFenceInstruction* current_fence_ins = dynamic_cast<VanadisFenceInstruction*>(current_ins);
+                    VanadisFenceInstruction* current_fence_ins = current_ins->asFence();
 
                     bool can_execute = true;
 

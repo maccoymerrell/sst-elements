@@ -24,6 +24,9 @@ namespace Vanadis {
 class VanadisStoreConditionalInstruction : public virtual VanadisStoreInstruction
 {
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisStoreConditionalInstruction* asStoreConditional() override { return this; }
+
     VanadisStoreConditionalInstruction(
         const uint64_t addr, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts, const uint16_t memAddrReg,
         const int64_t offset, const uint16_t valueReg, const uint16_t condResultReg, const uint16_t store_width,

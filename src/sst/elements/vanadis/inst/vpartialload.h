@@ -38,20 +38,11 @@ public:
 
         // We need an extra in register here
 
-        delete[] phys_int_regs_in;
-        delete[] isa_int_regs_in;
-
-        count_isa_int_reg_in  = 2;
-        count_phys_int_reg_in = 2;
-
-        count_isa_int_reg_out = 1;
-        count_phys_int_reg_out = 1;
-
-        phys_int_regs_in = new uint16_t[count_phys_int_reg_in];
-        isa_int_regs_in  = new uint16_t[count_isa_int_reg_in];
-
-        phys_int_regs_out = new uint16_t[count_phys_int_reg_out];
-        isa_int_regs_out = new uint16_t[count_isa_int_reg_out];
+        // Two integer inputs and one integer output, where the load this
+        // derives from declared one and (for an FP target) none. The eight
+        // register lists share one block now, so the shape is changed in one
+        // place rather than by deleting and re-newing four of them.
+        reshapeIntRegisterLists(2, 1, 2, 1);
 
         isa_int_regs_out[0] = tgtReg;
         isa_int_regs_in[0]  = memAddrReg;

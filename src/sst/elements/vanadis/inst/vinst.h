@@ -41,6 +41,103 @@ namespace Vanadis {
 // silently dropping a register out of the dependency check.
 static constexpr uint16_t VANADIS_MASKED_ISA_REGS = 64;
 
+// WHAT AN INSTRUCTION IS, ASKED WITHOUT dynamic_cast.
+//
+// Every one of these classes derives from VanadisInstruction VIRTUALLY, which
+// is why the pipeline could only ask "is this a load?" with dynamic_cast:
+// static_cast cannot go down from a virtual base at all. libstdc++ answers a
+// dynamic_cast by walking the type graph -- __do_dyncast -- and the issue,
+// dispatch, retire and load/store-queue paths ask on every memory instruction,
+// every branch and every fence, which put __dynamic_cast at 3.3 % of the whole
+// simulator. The `as*()` hooks below answer the same question with one virtual
+// call and a compiler-computed this-adjustment. Each returns exactly what the
+// corresponding dynamic_cast returned, including nullptr.
+class VanadisLoadInstruction;
+class VanadisStoreInstruction;
+class VanadisStoreConditionalInstruction;
+class VanadisFenceInstruction;
+class VanadisSpeculatedInstruction;
+class VanadisSysCallInstruction;
+
+// WHERE A DYNAMIC INSTRUCTION'S MEMORY COMES FROM.
+//
+// The decoder clones a cached bundle entry for every instruction it decodes and
+// the core deletes it when it retires or is squashed, so the simulator asks the
+// C library for one object per dynamic instruction and gives it back a few
+// thousand cycles later -- 9.5 million round trips in eight simulated
+// milliseconds on the hash-table point, and that is before the eight register
+// lists each one used to allocate separately. malloc and free together were
+// 11.7 % of the whole simulator.
+//
+// These blocks are all one of a handful of sizes and their lifetime is bounded
+// by the reorder buffer, so a free list per size class is the whole story: an
+// allocation is a pop, a free is a push, and nothing is returned to the C
+// library. A sixteen-byte header carries the size class, which both keeps the
+// natural alignment of ::operator new and gives the free list its link word.
+//
+// The lists are thread-local, so a partitioned run has one per thread. A block
+// freed on a thread other than the one that allocated it is still the right
+// size for that thread's class of the same index, so the pools stay correct if
+// they drift in size.
+class VanadisInstructionArena
+{
+    public:
+        static constexpr size_t kGranule   = 16;   // preserves max_align_t alignment
+        static constexpr size_t kMaxBucket = 64;   // objects up to 1008 bytes are pooled
+
+        static void* alloc(size_t sz)
+        {
+            const size_t b = (sz + kGranule - 1) / kGranule + 1;  // granules, header included
+
+            if ( b > kMaxBucket ) {
+                char* raw = static_cast<char*>(::operator new(b * kGranule));
+                reinterpret_cast<size_t*>(raw)[0] = 0;            // 0: came from the C library
+                return raw + kGranule;
+            }
+
+            void** heads = freeHeads();
+            char*  raw;
+
+            if ( heads[b] != nullptr ) {
+                raw      = static_cast<char*>(heads[b]);
+                heads[b] = reinterpret_cast<void**>(raw)[1];
+            }
+            else {
+                raw = static_cast<char*>(::operator new(b * kGranule));
+            }
+
+            reinterpret_cast<size_t*>(raw)[0] = b;
+            return raw + kGranule;
+        }
+
+        static void release(void* p)
+        {
+            if ( nullptr == p ) { return; }
+
+            char*        raw = static_cast<char*>(p) - kGranule;
+            const size_t b   = reinterpret_cast<size_t*>(raw)[0];
+
+            if ( 0 == b ) { ::operator delete(raw); return; }
+
+            void** heads = freeHeads();
+            reinterpret_cast<void**>(raw)[1] = heads[b];
+            heads[b]                         = raw;
+        }
+
+    private:
+        static void** freeHeads()
+        {
+            static thread_local void* heads[kMaxBucket + 1] = {};
+            return heads;
+        }
+};
+
+// How many register-list entries an instruction keeps inside itself. The eight
+// lists together are six to eight entries for a normal RISC-V instruction, so
+// this covers every one of them and the heap path below is for an ISA that
+// names more. It replaces eight separate new uint16_t[] per instruction.
+static constexpr uint16_t VANADIS_INLINE_REG_SLOTS = 16;
+
 class VanadisInstruction
 {
     public:
@@ -60,29 +157,10 @@ class VanadisInstruction
             count_isa_fp_reg_in(c_isa_fp_reg_in),
             count_isa_fp_reg_out(c_isa_fp_reg_out)
         {
-            phys_int_regs_in = (count_phys_int_reg_in > 0) ? new uint16_t[count_phys_int_reg_in] : nullptr;
-            std::memset(phys_int_regs_in, 0, count_phys_int_reg_in * sizeof( uint16_t ));
-
-            phys_int_regs_out = (count_phys_int_reg_out > 0) ? new uint16_t[count_phys_int_reg_out] : nullptr;
-            std::memset(phys_int_regs_out, 0, count_phys_int_reg_out * sizeof( uint16_t ) );
-
-            isa_int_regs_in = (count_isa_int_reg_in > 0) ? new uint16_t[count_isa_int_reg_in] : nullptr;
-            std::memset(isa_int_regs_in, 0, count_isa_int_reg_in * sizeof( uint16_t ));
-
-            isa_int_regs_out = (count_isa_int_reg_out > 0) ? new uint16_t[count_isa_int_reg_out] : nullptr;
-            std::memset(isa_int_regs_out, 0, count_isa_int_reg_out * sizeof( uint16_t ) );
-
-            phys_fp_regs_in = (count_phys_fp_reg_in > 0) ? new uint16_t[count_phys_fp_reg_in] : nullptr;
-            std::memset(phys_fp_regs_in, 0, count_phys_fp_reg_in * sizeof( uint16_t ));
-
-            phys_fp_regs_out = (count_phys_fp_reg_out > 0) ? new uint16_t[count_phys_fp_reg_out] : nullptr;
-            std::memset(phys_fp_regs_out, 0, count_phys_fp_reg_out * sizeof( uint16_t ));
-
-            isa_fp_regs_in = (count_isa_fp_reg_in > 0) ? new uint16_t[count_isa_fp_reg_in] : nullptr;
-            std::memset(isa_fp_regs_in, 0, count_isa_fp_reg_in * sizeof( uint16_t ) );
-
-            isa_fp_regs_out = (count_isa_fp_reg_out > 0) ? new uint16_t[count_isa_fp_reg_out] : nullptr;
-            std::memset(isa_fp_regs_out, 0, count_isa_fp_reg_out * sizeof( uint16_t ));
+            // One block for all eight register lists, inside the instruction
+            // when it fits. This used to be eight new uint16_t[] and eight
+            // memsets per instruction, and the counts are single digits.
+            bindRegisterLists(true);
 
             trap_error_           = false;
             has_executed_         = false;
@@ -97,14 +175,7 @@ class VanadisInstruction
 
         virtual ~VanadisInstruction()
         {
-            if ( phys_int_regs_in != nullptr ) delete[] phys_int_regs_in;
-            if ( phys_int_regs_out != nullptr ) delete[] phys_int_regs_out;
-            if ( isa_int_regs_in != nullptr ) delete[] isa_int_regs_in;
-            if ( isa_int_regs_out != nullptr ) delete[] isa_int_regs_out;
-            if ( phys_fp_regs_in != nullptr ) delete[] phys_fp_regs_in;
-            if ( phys_fp_regs_out != nullptr ) delete[] phys_fp_regs_out;
-            if ( isa_fp_regs_in != nullptr ) delete[] isa_fp_regs_in;
-            if ( isa_fp_regs_out != nullptr ) delete[] isa_fp_regs_out;
+            if ( reg_heap_ != nullptr ) { delete[] reg_heap_; }
         }
 
         VanadisInstruction(const VanadisInstruction& copy_me) :
@@ -132,49 +203,10 @@ class VanadisInstruction
             isa_reg_masks_valid_  = false;
             sw_thread             = copy_me.sw_thread;
 
-            phys_int_regs_in  = (count_phys_int_reg_in > 0) ? new uint16_t[count_phys_int_reg_in] : nullptr;
-            phys_int_regs_out = (count_phys_int_reg_out > 0) ? new uint16_t[count_phys_int_reg_out] : nullptr;
-
-            isa_int_regs_in  = (count_isa_int_reg_in > 0) ? new uint16_t[count_isa_int_reg_in] : nullptr;
-            isa_int_regs_out = (count_isa_int_reg_out > 0) ? new uint16_t[count_isa_int_reg_out] : nullptr;
-
-            phys_fp_regs_in  = (count_phys_fp_reg_in > 0) ? new uint16_t[count_phys_fp_reg_in] : nullptr;
-            phys_fp_regs_out = (count_phys_fp_reg_out > 0) ? new uint16_t[count_phys_fp_reg_out] : nullptr;
-
-            isa_fp_regs_in  = (count_isa_fp_reg_in > 0) ? new uint16_t[count_isa_fp_reg_in] : nullptr;
-            isa_fp_regs_out = (count_isa_fp_reg_out > 0) ? new uint16_t[count_isa_fp_reg_out] : nullptr;
-
-            for ( uint16_t i = 0; i < count_phys_int_reg_in; ++i ) {
-                phys_int_regs_in[i] = copy_me.phys_int_regs_in[i];
-            }
-
-            for ( uint16_t i = 0; i < count_phys_int_reg_out; ++i ) {
-                phys_int_regs_out[i] = copy_me.phys_int_regs_out[i];
-            }
-
-            for ( uint16_t i = 0; i < count_isa_int_reg_in; ++i ) {
-                isa_int_regs_in[i] = copy_me.isa_int_regs_in[i];
-            }
-
-            for ( uint16_t i = 0; i < count_isa_int_reg_out; ++i ) {
-                isa_int_regs_out[i] = copy_me.isa_int_regs_out[i];
-            }
-
-            for ( uint16_t i = 0; i < count_phys_fp_reg_in; ++i ) {
-                phys_fp_regs_in[i] = copy_me.phys_fp_regs_in[i];
-            }
-
-            for ( uint16_t i = 0; i < count_phys_fp_reg_out; ++i ) {
-                phys_fp_regs_out[i] = copy_me.phys_fp_regs_out[i];
-            }
-
-            for ( uint16_t i = 0; i < count_isa_fp_reg_in; ++i ) {
-                isa_fp_regs_in[i] = copy_me.isa_fp_regs_in[i];
-            }
-
-            for ( uint16_t i = 0; i < count_isa_fp_reg_out; ++i ) {
-                isa_fp_regs_out[i] = copy_me.isa_fp_regs_out[i];
-            }
+            // One block, then one memcpy: the source's eight lists are
+            // contiguous in the same order, so the clone is a straight copy.
+            bindRegisterLists(false);
+            std::memcpy(regBlock(), copy_me.regBlock(), totalRegSlots() * sizeof( uint16_t ));
         }
 
         // different
@@ -326,7 +358,21 @@ class VanadisInstruction
         void setPhysFPRegIn(const uint16_t index, const uint16_t reg) { phys_fp_regs_in[index] = reg; }
         void setPhysFPRegOut(const uint16_t index, const uint16_t reg) { phys_fp_regs_out[index] = reg; }
 
+        // See the note on VanadisInstructionArena above. Every derived class
+        // inherits these, so `new VanadisXxxInstruction(...)` and the virtual
+        // destructor's `delete` both go to the pool.
+        static void* operator new(size_t sz) { return VanadisInstructionArena::alloc(sz); }
+        static void  operator delete(void* p) noexcept { VanadisInstructionArena::release(p); }
+
         virtual VanadisInstruction* clone() = 0;
+
+        // See the note above the forward declarations at the top of this file.
+        virtual VanadisLoadInstruction*             asLoad()             { return nullptr; }
+        virtual VanadisStoreInstruction*            asStore()            { return nullptr; }
+        virtual VanadisStoreConditionalInstruction* asStoreConditional() { return nullptr; }
+        virtual VanadisFenceInstruction*            asFence()            { return nullptr; }
+        virtual VanadisSpeculatedInstruction*       asSpeculated()       { return nullptr; }
+        virtual VanadisSysCallInstruction*          asSysCall()          { return nullptr; }
 
         void markEndOfMicroOpGroup() { end_uop_group_ = true; }
         bool endsMicroOpGroup() const { return end_uop_group_; }
@@ -511,6 +557,72 @@ class VanadisInstruction
 
     protected:
 
+        // THE EIGHT REGISTER LISTS LIVE IN ONE BLOCK, in this order:
+        //   isa_int_in, isa_int_out, isa_fp_in, isa_fp_out,
+        //   phys_int_in, phys_int_out, phys_fp_in, phys_fp_out
+        // inside the instruction when they fit (they always do on RISC-V and
+        // MIPS) and on the heap when they do not. A list whose count is zero
+        // keeps its null pointer, as it did when each was allocated on its own.
+        uint16_t totalRegSlots() const
+        {
+            return static_cast<uint16_t>(
+                count_isa_int_reg_in + count_isa_int_reg_out + count_isa_fp_reg_in + count_isa_fp_reg_out +
+                count_phys_int_reg_in + count_phys_int_reg_out + count_phys_fp_reg_in + count_phys_fp_reg_out);
+        }
+
+        uint16_t*       regBlock()       { return (reg_heap_ != nullptr) ? reg_heap_ : reg_inline_; }
+        const uint16_t* regBlock() const { return (reg_heap_ != nullptr) ? reg_heap_ : reg_inline_; }
+
+        void bindRegisterLists(const bool zero_fill)
+        {
+            const uint16_t total = totalRegSlots();
+
+            reg_heap_ = (total > VANADIS_INLINE_REG_SLOTS) ? new uint16_t[total] : nullptr;
+
+            uint16_t* p = regBlock();
+            if ( zero_fill ) { std::memset(p, 0, total * sizeof( uint16_t )); }
+
+            isa_int_regs_in   = (count_isa_int_reg_in   > 0) ? p : nullptr; p += count_isa_int_reg_in;
+            isa_int_regs_out  = (count_isa_int_reg_out  > 0) ? p : nullptr; p += count_isa_int_reg_out;
+            isa_fp_regs_in    = (count_isa_fp_reg_in    > 0) ? p : nullptr; p += count_isa_fp_reg_in;
+            isa_fp_regs_out   = (count_isa_fp_reg_out   > 0) ? p : nullptr; p += count_isa_fp_reg_out;
+            phys_int_regs_in  = (count_phys_int_reg_in  > 0) ? p : nullptr; p += count_phys_int_reg_in;
+            phys_int_regs_out = (count_phys_int_reg_out > 0) ? p : nullptr; p += count_phys_int_reg_out;
+            phys_fp_regs_in   = (count_phys_fp_reg_in   > 0) ? p : nullptr; p += count_phys_fp_reg_in;
+            phys_fp_regs_out  = (count_phys_fp_reg_out  > 0) ? p : nullptr;
+        }
+
+        // Change the INTEGER list sizes after the base constructor has run.
+        // VanadisPartialLoadInstruction is the only caller: it needs a second
+        // input register that the load it derives from does not have. The
+        // floating-point lists keep their contents; the integer lists come back
+        // zeroed, which is what the base constructor left them as and what the
+        // code that used to delete and re-new them relied on.
+        void reshapeIntRegisterLists(
+            const uint16_t isa_in, const uint16_t isa_out, const uint16_t phys_in, const uint16_t phys_out)
+        {
+            std::vector<uint16_t> keep_isa_fp_in(isa_fp_regs_in, isa_fp_regs_in + count_isa_fp_reg_in);
+            std::vector<uint16_t> keep_isa_fp_out(isa_fp_regs_out, isa_fp_regs_out + count_isa_fp_reg_out);
+            std::vector<uint16_t> keep_phys_fp_in(phys_fp_regs_in, phys_fp_regs_in + count_phys_fp_reg_in);
+            std::vector<uint16_t> keep_phys_fp_out(phys_fp_regs_out, phys_fp_regs_out + count_phys_fp_reg_out);
+
+            if ( reg_heap_ != nullptr ) { delete[] reg_heap_; reg_heap_ = nullptr; }
+
+            count_isa_int_reg_in   = isa_in;
+            count_isa_int_reg_out  = isa_out;
+            count_phys_int_reg_in  = phys_in;
+            count_phys_int_reg_out = phys_out;
+
+            bindRegisterLists(true);
+
+            for ( uint16_t i = 0; i < count_isa_fp_reg_in; ++i )   { isa_fp_regs_in[i]   = keep_isa_fp_in[i]; }
+            for ( uint16_t i = 0; i < count_isa_fp_reg_out; ++i )  { isa_fp_regs_out[i]  = keep_isa_fp_out[i]; }
+            for ( uint16_t i = 0; i < count_phys_fp_reg_in; ++i )  { phys_fp_regs_in[i]  = keep_phys_fp_in[i]; }
+            for ( uint16_t i = 0; i < count_phys_fp_reg_out; ++i ) { phys_fp_regs_out[i] = keep_phys_fp_out[i]; }
+
+            isa_reg_masks_valid_ = false;
+        }
+
         void ensureISARegMasks()
         {
             if ( !isa_reg_masks_valid_ ) { buildISARegMasks(); }
@@ -610,6 +722,11 @@ class VanadisInstruction
         uint16_t* phys_int_regs_out;
         uint16_t* phys_fp_regs_in;
         uint16_t* phys_fp_regs_out;
+
+        // The storage the eight pointers above point into. Kept last so that
+        // nothing above it moves out of the first cache line.
+        uint16_t* reg_heap_ = nullptr;                     // null when inline storage is used
+        uint16_t  reg_inline_[VANADIS_INLINE_REG_SLOTS];
 
 
 };

@@ -26,6 +26,9 @@ enum VanadisFenceType { VANADIS_LOAD_FENCE, VANADIS_STORE_FENCE, VANADIS_LOAD_ST
 class VanadisFenceInstruction : public virtual VanadisInstruction
 {
 public:
+    // See the note above the forward declarations in inst/vinst.h.
+    VanadisFenceInstruction* asFence() override { return this; }
+
     VanadisFenceInstruction(
         const uint64_t address, const uint32_t hw_thr, const VanadisDecoderOptions* isa_opts,
         const VanadisFenceType fenceT) :
