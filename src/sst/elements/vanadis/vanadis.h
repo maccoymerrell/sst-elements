@@ -325,6 +325,19 @@ public:
         { "pause_when_retire_address", "If specified, the simulation will stop when this address is retired.", "0"},
         { "pipeline_trace_file", "If specified, a trace of the pipeline activity will be generated to this file.", ""},
         { "max_cycle", "Maximum number of cycles to execute. The core will halt after this many cycles." , "std::numeric_limits<uint64_t>::max()"},
+        // ---- restoring architectural state from a whole-program image ----
+        //
+        // A sampled run does not start a program at its entry point: it starts it in the
+        // middle, from an image the functional simulator wrote. Everything else about that
+        // image is placed in memory before the clock starts; the general registers cannot
+        // be, because the operating system's start-thread event arrives at time zero and
+        // writes the stack pointer itself. These three parameters are applied on that same
+        // path, immediately after that write, and nowhere else. Left empty -- which is what
+        // every run that is not started from an image leaves them -- they do nothing at all
+        // and this core is byte-for-byte the core it was.
+        { "nmfc_image_int", "32 comma-separated 64-bit hexadecimal values for x0..x31, restored from a whole-program image. Empty means no image and no restore", "" },
+        { "nmfc_image_fp", "32 comma-separated 64-bit hexadecimal bit patterns for f0..f31, restored from a whole-program image. Empty means no image and no restore", "" },
+        { "nmfc_image_fcsr", "The floating-point control and status word from a whole-program image: bits 0-4 the sticky exception flags in RISC-V order (inexact, underflow, overflow, divide-by-zero, invalid) and bits 5-7 the rounding mode in frm encoding. Ignored when nmfc_image_int is empty", "0" },
         { "node_id", "Identifier for the node this core belongs to. Each node in the system needs a unique ID between 0 and (number of nodes) - 1. Used to tag output.", "0"},
         { "core_id", "Identifier for this core. Each core in the system needs a unique ID between 0 and (number of cores) - 1.", 0 },
         { "hardware_threads", "Number of hardware threads in this core", "1" },
@@ -622,6 +635,19 @@ private:
     uint64_t stop_verbose_when_retire_address;
 
     std::vector<VanadisFloatingPointFlags*> fp_flags;
+
+    /// The architectural state a whole-program image restores, parsed once at
+    /// construction and written once, in startThread(). Empty vectors mean the run was
+    /// not started from an image, which is every run that is not a sampled one.
+    std::vector<uint64_t> nmfc_image_int;
+    std::vector<uint64_t> nmfc_image_fp;
+    uint32_t              nmfc_image_fcsr = 0;
+
+    /// Write the image's registers and floating-point status into thread `thr`.
+    /// Called from startThread() after the operating system's stack pointer write, so
+    /// that the image's own stack pointer -- which is the program's -- is the one that
+    /// survives. Does nothing when no image was given.
+    void restoreImageState(int thr);
     SST::Link* os_link;
 
     bool* m_checkpointing;
