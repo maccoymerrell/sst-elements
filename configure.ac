@@ -77,6 +77,25 @@ AS_IF([test "x$use_picky" = "xyes"],
 AM_CFLAGS="$AM_CFLAGS $WARNFLAGS"
 AM_CXXFLAGS="$AM_CXXFLAGS $WARNFLAGS"
 
+# VANADIS DEBUG BUILD -- a choice now, and off by default.
+#
+# Vanadis's instruction-level tracing is COMPILED IN rather than switched on at
+# run time. -DVANADIS_BUILD_DEBUG selects the VanadisDebugComponent class, so
+# the element registers as `dbg_VanadisCPU` instead of `VanadisCPU`, and it
+# compiles in every verbose path in fetch, decode, issue, execute and retire.
+# Those paths are not free at verbosity 0: each one still calls
+# Output::getVerboseLevel(), and several format an instruction into a print
+# buffer before any level is tested.
+#
+# The flag was unconditional in src/sst/elements/vanadis/Makefile.am, so every
+# build was a debug build and there was no way to ask for the other one.
+AC_ARG_ENABLE([vanadis-debug],
+  [AS_HELP_STRING([--enable-vanadis-debug],
+     [compile Vanadis's instruction tracing in; the CPU is then registered as
+      dbg_VanadisCPU rather than VanadisCPU (default: disabled)])],
+  [], [enable_vanadis_debug=no])
+AM_CONDITIONAL([VANADIS_BUILD_DEBUG], [test "x$enable_vanadis_debug" = "xyes"])
+
 AM_EXTRA_RECURSIVE_TARGETS([snippets])
 
 AC_MSG_CHECKING([for SST-Elements Git Branch, Head SHA and Commit Count])
@@ -150,6 +169,8 @@ printf "%38s : %s\n" "C Compiler Options" "$AM_CFLAGS $CFLAGS"
 printf "%38s : %s\n" "C++ Compiler Options" "$AM_CXXFLAGS $CXXFLAGS"
 
 printf "%38s : %s\n" "C++ Standard Compliance" "C++17"
+
+printf "%38s : %s\n" "Vanadis debug build" "$enable_vanadis_debug"
 
 printf "%38s : %s\n" "Linker Options" "$AM_LDFLAGS $LDFLAGS"
 echo ""

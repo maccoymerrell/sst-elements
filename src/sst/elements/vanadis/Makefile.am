@@ -4,8 +4,15 @@
 
 AM_CPPFLAGS += \
 	$(MPI_CPPFLAGS) \
-	-I$(top_srcdir)/src \
-	-DVANADIS_BUILD_DEBUG
+	-I$(top_srcdir)/src
+
+# The instruction tracing is compiled in, not switched on at run time, and it
+# is not free when it is off -- see configure.ac's --enable-vanadis-debug. This
+# was unconditional, so `VanadisCPU` could not be built at all; only the
+# `dbg_VanadisCPU` the debug class registers.
+if VANADIS_BUILD_DEBUG
+AM_CPPFLAGS += -DVANADIS_BUILD_DEBUG
+endif
 
 compdir = $(pkglibdir)
 comp_LTLIBRARIES = libvanadis.la
