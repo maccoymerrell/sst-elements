@@ -125,6 +125,22 @@ public:
     // of the same program. With no span given, every program instruction is progress.
     uint64_t host_insns_progress = 0;
     uint64_t host_insns_wait     = 0;
+
+    // THE WORK COUNTER, published the same way and in the same place.
+    //
+    // A workload counts units of its own useful output -- a vertex settled, one
+    // sum performed, one insertion or lookup performed -- in one 64-bit global,
+    // and both builds of the workload increment it at the same unit. Neither
+    // instruction count is that: the build that offloads executes instructions
+    // the build that does not offload never has, so two spans of equal
+    // instruction count do not cover equal work, and comparing them hides
+    // exactly the overhead the comparison exists to charge the offload for.
+    //
+    // This is the VALUE of that counter as the core's committed stores have left
+    // it, not a count of anything this interface did, so the core assigns it
+    // rather than adding to it. It is 0 on a program that declares no counter
+    // and on a core that was not told where one is.
+    uint64_t host_work           = 0;
 };
 
 } // namespace Vanadis

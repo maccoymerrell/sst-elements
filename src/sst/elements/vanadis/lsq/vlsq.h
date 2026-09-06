@@ -78,6 +78,43 @@ public:
 
         registerFiles = reg_f;
     }
+    // ---- THE WORK COUNTER --------------------------------------------------
+    //
+    // A workload counts units of its own useful output -- a vertex settled, one
+    // sum performed, one insertion or lookup performed -- in one 64-bit global,
+    // `nmfc_work`, and both builds of the workload increment it at the same
+    // unit (src/nmfc/test/nmfc_work.h). That count is the coordinate a sampled
+    // window is placed on when two builds are to be compared, because equal
+    // instruction counts do not cover equal work: the offloaded build executes
+    // instructions the pure-host build does not have.
+    //
+    // This core reads the counter the only way a core can: it watches the
+    // program's committed stores to that address. A store issues from this
+    // queue only at the head of the reorder buffer, so a store this queue sends
+    // is a store the program really makes, in program order -- which is what
+    // makes the published value the architectural value of the counter and not
+    // a speculated one.
+    //
+    // The shadow is eight bytes wide whatever the program's counter is: a
+    // narrower counter writes its own bytes and leaves the rest at the starting
+    // value, so a 32-bit counter reads back as a 32-bit value. `start` is what
+    // the counter already held when this run began, which for a run resumed
+    // from a whole-program image is the value the image was captured with and
+    // for a run started at the program's entry point is zero.
+    void setWorkCounter(uint64_t addr, uint64_t width, uint64_t start)
+    {
+        work_addr_  = addr;
+        work_width_ = (width == 0 || width > 8) ? 8 : width;
+        work_watch_ = (addr != 0);
+        work_value_ = start;
+        for ( unsigned i = 0; i < 8; i++ ) { work_bytes_[i] = uint8_t(start >> (8 * i)); }
+    }
+
+    /// The work counter's value as the program's committed stores have left it.
+    uint64_t workCounter() const { return work_value_; }
+    /// Whether this queue is watching a counter at all.
+    bool watchingWork() const { return work_watch_; }
+
     void setCoreId( int core ) { core_id = core; }
     int getCoreId( ) { return core_id; }
 
@@ -104,6 +141,37 @@ public:
     virtual void printStatus(SST::Output& output) {}
 
 protected:
+
+    /// TRUE WHEN A STORE TOUCHES THE WORK COUNTER. Called on the store path for
+    /// every committed store, so it is one comparison against a constant.
+    bool storeTouchesWork(uint64_t address, uint64_t width) const
+    {
+        return work_watch_ && (address < work_addr_ + work_width_) && (work_addr_ < address + width);
+    }
+
+    /// ONE COMMITTED STORE'S BYTES, merged into the shadow of the counter.
+    ///
+    /// A store may be narrower than the counter, may be wider, and may be
+    /// offset inside it, so the overlap is taken byte by byte rather than
+    /// assuming a store writes the whole word. The bytes are little-endian,
+    /// which is this machine's order.
+    void noteWorkStore(uint64_t address, const uint8_t* bytes, uint64_t width)
+    {
+        for ( uint64_t i = 0; i < width; i++ ) {
+            const uint64_t a = address + i;
+            if ( a < work_addr_ || a >= work_addr_ + work_width_ ) { continue; }
+            work_bytes_[a - work_addr_] = bytes[i];
+        }
+        uint64_t v = 0;
+        for ( unsigned i = 0; i < 8; i++ ) { v |= uint64_t(work_bytes_[i]) << (8 * i); }
+        work_value_ = v;
+    }
+
+    uint64_t work_addr_  = 0;
+    uint64_t work_width_ = 8;
+    uint64_t work_value_ = 0;
+    bool     work_watch_ = false;
+    uint8_t  work_bytes_[8] = {0};
 
     void setDbgInsAddrs( std::string addrs ) {
 

@@ -351,6 +351,28 @@ public:
         // progress count is the count of the program's own instructions.
         { "nmfc_wait_start", "First address of the program's wait and retry code, the value of __start_nmfc_wait. Equal to nmfc_wait_stop means no wait code and nothing excluded", "0" },
         { "nmfc_wait_stop", "One past the last address of the program's wait and retry code, the value of __stop_nmfc_wait. Equal to nmfc_wait_start means no wait code and nothing excluded", "0" },
+        // ---- the work axis: the counter the program keeps its own work in ----
+        //
+        // A WORK UNIT is one unit of the program's own useful output, defined by
+        // the workload -- a vertex settled, one sum performed, one insertion or
+        // lookup performed -- and counted by the program itself in one 64-bit
+        // global, `nmfc_work`, incremented at the same unit in both builds of a
+        // workload. It is the coordinate a sampled window is placed on when two
+        // builds are to be compared, because equal instruction counts do not
+        // cover equal work: the offloaded build executes instructions the
+        // pure-host build does not have -- marshalling a batch, polling for it,
+        // retrying a refused offload.
+        //
+        // This core watches the program's COMMITTED stores to that address and
+        // publishes the value stored beside its retire and progress counts. The
+        // address is read out of the binary's own symbol table by the
+        // configuration, never written by hand, for the reason the wait span is:
+        // an address the two simulators could be pointed at differently is not
+        // one coordinate. Zero -- the default -- watches nothing at all and this
+        // core is byte-for-byte the core it was.
+        { "nmfc_work_addr", "Address of the program's work counter, the value of the symbol `nmfc_work`. 0 watches nothing", "0" },
+        { "nmfc_work_width", "Width of that counter in bytes: 1, 2, 4 or 8 (default 8). A narrower counter's remaining bytes keep their starting value", "8" },
+        { "nmfc_work_start", "What the counter already held when this run began: the value a whole-program image was captured with, or 0 for a run started at the program's entry point", "0" },
         { "node_id", "Identifier for the node this core belongs to. Each node in the system needs a unique ID between 0 and (number of nodes) - 1. Used to tag output.", "0"},
         { "core_id", "Identifier for this core. Each core in the system needs a unique ID between 0 and (number of cores) - 1.", 0 },
         { "hardware_threads", "Number of hardware threads in this core", "1" },
@@ -679,6 +701,12 @@ private:
     uint32_t ins_wait_this_cycle;
     uint64_t nmfc_wait_start_;
     uint64_t nmfc_wait_stop_;
+    /// The work axis. The address of the program's own work counter, how wide
+    /// it is, and what it held when this run began; the load/store queue watches
+    /// the committed stores to it and this core publishes what it reads.
+    uint64_t nmfc_work_addr_;
+    uint64_t nmfc_work_width_;
+    uint64_t nmfc_work_start_;
     uint32_t ins_decoded_this_cycle;
 
     uint64_t pause_on_retire_address;

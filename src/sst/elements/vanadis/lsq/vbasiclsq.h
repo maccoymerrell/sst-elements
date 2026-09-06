@@ -759,6 +759,24 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 return false;
             }
 
+            // THE WORK COUNTER. This store is committed -- it issues only from
+            // the head of the reorder buffer -- so if it touches the counter the
+            // program keeps its own work in, its bytes are the counter's new
+            // architectural value and are published to the core here. Only a
+            // plain store is counted: a store-conditional may fail, and a
+            // counter written with one would be published before the machine
+            // knew whether it had happened.
+            if( UNLIKELY(storeTouchesWork(store_address, store_width))
+                && (store_ins->getTransactionType() == MEM_TRANSACTION_NONE) ) {
+                std::vector<uint8_t> seen(store_width);
+                uint16_t work_thread, work_reg;
+                getStoreTarget(store_entry, store_ins, &work_thread, &work_reg);
+                registerFiles->at(work_thread)->copyFromRegister(
+                    work_reg, store_ins->getRegisterOffset(), &seen[0], store_width,
+                    store_ins->getValueRegisterType() == STORE_FP_REGISTER);
+                noteWorkStore(store_address, &seen[0], store_width);
+            }
+
             const bool needs_split = operationStraddlesCacheLine(store_address, store_width);
             if(output->getVerboseLevel() >= 8)
             {

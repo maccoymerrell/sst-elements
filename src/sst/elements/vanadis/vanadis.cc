@@ -80,6 +80,24 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     ins_progress_this_cycle = 0;
     ins_wait_this_cycle     = 0;
 
+    // THE WORK AXIS. The address of the program's own work counter, read as
+    // text so it may be written in hexadecimal, which is how a symbol table
+    // prints one. Zero -- the default -- watches nothing.
+    {
+        const std::string v = params.find<std::string>("nmfc_work_addr", "0");
+        nmfc_work_addr_  = (uint64_t)std::strtoull(v.c_str(), nullptr, 0);
+        nmfc_work_width_ = params.find<uint64_t>("nmfc_work_width", 8);
+        const std::string sv = params.find<std::string>("nmfc_work_start", "0");
+        nmfc_work_start_ = (uint64_t)std::strtoull(sv.c_str(), nullptr, 0);
+        if ( nmfc_work_addr_ != 0 && nmfc_work_width_ != 1 && nmfc_work_width_ != 2
+             && nmfc_work_width_ != 4 && nmfc_work_width_ != 8 ) {
+            output->fatal(
+                CALL_INFO, -1,
+                "Error: nmfc_work_width is %" PRIu64 ". A counter is 1, 2, 4 or 8 bytes wide.\n",
+                nmfc_work_width_);
+        }
+    }
+
     // THE ARCHITECTURAL STATE OF A PROGRAM ALREADY RUNNING, from a whole-program image.
     //
     // Parsed here and applied in startThread(); see restoreImageState(). A list that is
@@ -403,6 +421,10 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     }
 
     lsq->setRegisterFiles(&register_files);
+    // The work counter the queue watches. Given here rather than to the queue's
+    // own parameters so that one core carries one description of the program it
+    // is running: the wait span and the work counter arrive together.
+    lsq->setWorkCounter(nmfc_work_addr_, nmfc_work_width_, nmfc_work_start_);
 
     //////////////////////////////////////////////////////////////////////////////////////
     SubComponentSlotInfo * lists = getSubComponentSlotInfo("rocc");
@@ -1247,6 +1269,10 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
         roccs_[i]->host_insns_retired += ins_retired_this_cycle;
         roccs_[i]->host_insns_progress += ins_progress_this_cycle;
         roccs_[i]->host_insns_wait     += ins_wait_this_cycle;
+        // THE WORK COUNTER, published the same way and in the same place. It is
+        // the value the program's committed stores have left in it, not a
+        // difference, so it is assigned and not added to.
+        roccs_[i]->host_work            = lsq->workCounter();
         RoCCResponse* resp;
         if (!(roccs_[i]->isBusy()) && (resp = roccs_[i]->respond())) {
             VanadisInstruction* ins = rocc_queues_[i].front();
