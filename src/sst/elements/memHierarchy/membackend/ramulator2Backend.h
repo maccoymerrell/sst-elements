@@ -63,6 +63,26 @@ protected:
     std::map<uint64_t, std::deque<ReqId> > dramReqs;
     std::set<ReqId> writes;
 
+    // ── Idle skipping ──────────────────────────────────────────────────
+    // A DRAM channel with nothing in it costs the same to advance as a busy
+    // one, and a memory link with twelve device channels behind it pays that
+    // twelve times over every device cycle. When the model says a stretch of
+    // its own cycles is provably empty (Ramulator::IController::idle_skip_cycles)
+    // this backend stops calling into it for that stretch and counts the calls
+    // it withheld instead; the count is settled -- one advance of the model's
+    // clock, no work -- the moment anything needs the model to be current.
+    uint64_t skipLeft = 0;   // clock() calls still inside the skipped stretch
+    uint64_t skipOwed = 0;   // ticks withheld and not yet handed to the model
+
+    // Bring the model's clock up to the number of clock() calls it has had.
+    void settleSkip() {
+        if ( skipOwed ) {
+            ramulator2_memorysystem->advance_idle(static_cast<Ramulator::Clk_t>(skipOwed));
+            skipOwed = 0;
+        }
+        skipLeft = 0;
+    }
+
 private:
 };
 

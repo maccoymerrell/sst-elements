@@ -54,6 +54,11 @@ ramulator2Memory::ramulator2Memory(ComponentId_t id, Params &params) :
 bool ramulator2Memory::issueRequest(ReqId reqId, Addr addr, bool isWrite, unsigned numBytes){
     bool enqueue_success = false;
 
+    // A request stamps its arrival with the controller's clock, so the model has
+    // to be current before it is offered one. This ends any skipped stretch: the
+    // stretch was predicated on the model having nothing to do, and it now does.
+    settleSkip();
+
     if (isWrite) {
         // Our fork takes the request size: a cache block wider than one DRAM
         // transaction must be split, and upstream's 4-argument form silently
@@ -94,19 +99,45 @@ bool ramulator2Memory::issueRequest(ReqId reqId, Addr addr, bool isWrite, unsign
 }
 
 bool ramulator2Memory::clock(Cycle_t cycle){
+    // INSIDE A SKIPPED STRETCH. The model told us these cycles change nothing
+    // anywhere in it, so the call is counted and not made. Nothing else can be
+    // pending here: a stretch is only entered with no request outstanding, and
+    // issueRequest() ends one before it enqueues.
+    if ( skipLeft ) {
+        --skipLeft;
+        ++skipOwed;
+        return false;
+    }
+
 #ifdef __SST_DEBUG_OUTPUT__
     output->debug(_L10_, "Ramulator2Backend: Ticking memory system.\n");
 #endif
+    // Hand back whatever the last stretch withheld before ticking, so this tick
+    // lands on the cycle it would have landed on unskipped.
+    settleSkip();
+
     ramulator2_frontend->tick();
     // Ack writes since ramulator won't
     while (!writes.empty()) {
         handleMemResponse(*writes.begin());
         writes.erase(writes.begin());
     }
+
+    // Ask whether the next stretch is empty. Only when this backend is holding
+    // nothing itself: an outstanding read is a response this model still owes,
+    // and a write not yet acked is one this backend owes.
+    if ( dramReqs.empty() && writes.empty() ) {
+        skipLeft = static_cast<uint64_t>(ramulator2_memorysystem->idle_skip_cycles());
+    }
     return false;
 }
 
 void ramulator2Memory::finish(){
+    // Cycle counts are statistics. A stretch still open at the end of the run
+    // has to be paid for before anything is read out, or the model reports a
+    // shorter run than it had.
+    settleSkip();
+
     ramulator2_frontend->finalize();
     ramulator2_memorysystem->finalize();
 
