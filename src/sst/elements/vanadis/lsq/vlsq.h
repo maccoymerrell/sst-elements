@@ -45,6 +45,13 @@ public:
                             { "verboseMask", "Mask bits for masking output", "-1" },
                             { "dbgInsAddrs", "Comma-separated list of instruction addresses to debug", ""},
                             { "dbgAddrs", "Comma-separated list of addresses to debug", ""},
+                            { "lsq_speculate", "1 lets a load issue past an older store whose address is not yet known, forward from an older store, and be replayed when an older store later resolves onto its bytes. 0 is the strictly in-order queue.", "1"},
+                            { "mem_dep_speculation", "Alias of lsq_speculate.", "1"},
+                            { "lsq_forward", "1 lets a load be answered out of an older store's bytes; 0 makes it wait for the store to reach memory", "1"},
+                            { "mem_dep_predictor", "Which memory-dependence predictor holds a load back from speculating: counter, store_pc, none, or hold", "counter"},
+                            { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
+                            { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
+                            { "mdp_counter_decay", "When the counter predictor counts down: retire (every clean retire) or speculated (only when the load actually went past an unknown store)", "retire"},
             )
 
     /*
@@ -132,6 +139,46 @@ public:
     virtual void push(VanadisStoreInstruction* store_me) = 0;
     virtual void push(VanadisLoadInstruction* load_me) = 0;
     virtual void push(VanadisFenceInstruction* fence) = 0;
+
+    // ---- A SPECULATIVE QUEUE'S FOUR EXTRA OBLIGATIONS ----------------------
+    //
+    // A queue that lets a load issue past an older store needs the core to tell
+    // it three things the in-order queue never needed, and needs the core to
+    // ask it one.
+    //
+    // speculative()  Whether this queue reorders memory operations at all. The
+    //                core asks so that it knows whether it may hand the queue a
+    //                memory instruction that is not the oldest one outstanding.
+    //                A queue that answers false is driven exactly as before.
+    //
+    // reserve()      A slot is taken when the instruction is RENAMED, not when
+    //                it issues, because a load can only be told to wait for an
+    //                older store whose address is unknown if that store already
+    //                holds a slot saying it is older. The core refuses to
+    //                rename a load when loadFull(), a store when storeFull().
+    //
+    // commit()       A load's slot is freed when the load RETIRES, not when its
+    //                value arrives: until then an older store may still resolve
+    //                onto its bytes and invalidate it.
+    //
+    // noteReplay()   The load at the head of the reorder buffer is about to be
+    //                re-executed because an older store wrote bytes it had
+    //                already read. Called before the repair, while the queue
+    //                still holds the record of what happened.
+    virtual bool speculative() const { return false; }
+
+    // TRUE WHILE AN ORDERING INSTRUCTION IS IN THE QUEUE AND HAS NOT EXECUTED.
+    // A fence, a load-linked, a store-conditional and a locked access are the
+    // instructions the machine's synchronisation is written in terms of, and
+    // nothing younger may be handed to a speculative queue while one of them is
+    // outstanding -- the queue would resolve it straight away and it would pass
+    // the fence. The in-order queue needs no such answer: its single queue puts
+    // everything behind the fence by construction.
+    virtual bool orderedPending(const uint32_t thread) { return false; }
+    virtual void reserve(VanadisInstruction* ins) {}
+    virtual void commit(VanadisInstruction* ins) {}
+    virtual void noteReplay(VanadisInstruction* ins) {}
+    virtual void resetPredictors(const uint32_t thread) {}
 
     virtual void tick(uint64_t cycle) = 0;
     virtual void clearLSQByThreadID(const uint32_t thread) = 0;

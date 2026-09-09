@@ -100,6 +100,33 @@ vanadisSchedClassOf(const VanadisFunctionalUnitType t)
     }
 }
 
+// ONE MEMORY INSTRUCTION'S PLACE IN ITS THREAD'S PROGRAM ORDER.
+//
+// The issue stage keeps these in program order and may take one that is not the
+// oldest, which is what lets a load go to the load/store queue ahead of a store
+// whose address is still being computed.
+//
+//   ordered   this operation may not be reordered against memory at all: a
+//             fence, a load-linked or store-conditional, a locked access.
+//             Nothing younger is selected until it has executed.
+//   is_store  stores enter the store queue in program order relative to each
+//             other, so only the oldest not-yet-queued store is a candidate.
+//   selected  already handed to the queue; the entry stays until it reaches the
+//             front, so that the deque is only ever popped from one end.
+struct VanadisMemOrderEntry {
+    uint16_t slot;
+    bool     is_store;
+    bool     ordered;
+    bool     selected;
+    // How many coprocessor instructions of this thread were renamed before this
+    // one. See coproc_executed_ below.
+    uint32_t coproc_seq;
+};
+
+// How far into the memory order one selection will look for something ready.
+// A real scheduler picks out of a window, not out of the whole reorder buffer.
+#define VANADIS_MEM_ORDER_WALK 64
+
 // THE SCHEDULING WINDOW OF ONE HARDWARE THREAD.
 //
 // The window IS the reorder buffer, as it has always been; what is new is that
@@ -152,7 +179,8 @@ public:
     enum : uint16_t { NO_SLOT = 0xFFFF };
 
     VanadisIssueScheduler() :
-        rob_slots_(0), words_(0), nonempty_(0), blocked_(0), renamed_count_(0), syscall_barrier_(false)
+        rob_slots_(0), words_(0), nonempty_(0), blocked_(0), renamed_count_(0),
+        coproc_dispatched_(0), coproc_executed_(0), syscall_barrier_(false)
     {}
 
     void configure(const uint32_t rob_slots, const uint16_t int_phys, const uint16_t fp_phys)
@@ -178,10 +206,12 @@ public:
         std::fill(int_waiter_.begin(), int_waiter_.end(), NO_SLOT);
         std::fill(fp_waiter_.begin(), fp_waiter_.end(), NO_SLOT);
 
-        nonempty_        = 0;
-        blocked_         = 0;
-        renamed_count_   = 0;
-        syscall_barrier_ = false;
+        nonempty_          = 0;
+        blocked_           = 0;
+        renamed_count_     = 0;
+        coproc_dispatched_ = 0;
+        coproc_executed_   = 0;
+        syscall_barrier_   = false;
         mem_order_.clear();
     }
 
@@ -222,13 +252,32 @@ public:
     std::vector<uint16_t> wait_next_;
     std::vector<uint16_t> int_waiter_;
     std::vector<uint16_t> fp_waiter_;
-    std::deque<uint16_t>  mem_order_;
+    std::deque<VanadisMemOrderEntry> mem_order_;
 
     uint32_t rob_slots_;
     uint32_t words_;
     uint32_t nonempty_;       // which classes may have a ready instruction
     uint32_t blocked_;        // which classes have run out of units THIS cycle
     uint32_t renamed_count_;
+
+    // THE COPROCESSOR IS ANOTHER AGENT ON THE MEMORY, and one this core cannot
+    // check itself against. A load that issues early is caught reading stale
+    // bytes only when a STORE OF THIS THREAD later resolves onto them; nothing
+    // catches a load that read a location before the accelerator wrote it,
+    // because this core has no way to be told that a line it has read was
+    // written by somebody else. So a coprocessor instruction is an ordering
+    // point for the memory queue exactly as a fence is: no memory operation
+    // younger than one may go to the load/store queue until it has executed.
+    //
+    // Two counts say it without a search. Each memory-order entry records how
+    // many coprocessor instructions were renamed before it; a memory operation
+    // is selectable when at least that many have finished. Both are reset with
+    // the rest of the window, which is sound because a coprocessor instruction
+    // issues only at the head of the reorder buffer and therefore cannot be in
+    // flight when the window is thrown away.
+    uint32_t coproc_dispatched_;
+    uint32_t coproc_executed_;
+
     bool     syscall_barrier_;
 
 private:

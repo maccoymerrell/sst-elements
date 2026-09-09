@@ -1026,6 +1026,35 @@ VANADIS_COMPONENT::waitOrReady(const uint32_t hw_thr, const uint16_t slot)
     s.markReady(s.slot_class_[slot], slot);
 }
 
+// A MEMORY OPERATION THAT MAY NOT BE REORDERED AGAINST MEMORY.
+//
+// A fence, a load-linked, a store-conditional and a locked access are ordering
+// instructions: the machine's synchronisation depends on their position in the
+// stream, so nothing younger goes to the load/store queue until one of them has
+// executed, and it goes only when everything older has gone.
+static bool
+vanadisMemOpIsOrdered(VanadisInstruction* ins)
+{
+    switch ( ins->getInstFuncType() ) {
+    case INST_FENCE:
+        return true;
+    case INST_LOAD:
+    {
+        VanadisLoadInstruction* load_ins = ins->asLoad();
+        return (nullptr != load_ins) && ((MEM_TRANSACTION_LLSC_LOAD == load_ins->getTransactionType())
+                                      || (MEM_TRANSACTION_LOCK == load_ins->getTransactionType()));
+    }
+    case INST_STORE:
+    {
+        VanadisStoreInstruction* store_ins = ins->asStore();
+        return (nullptr != store_ins) && ((MEM_TRANSACTION_LLSC_STORE == store_ins->getTransactionType())
+                                       || (MEM_TRANSACTION_LOCK == store_ins->getTransactionType()));
+    }
+    default:
+        return false;
+    }
+}
+
 // SELECT. One instruction, the oldest ready one whose class still has a unit
 // this cycle. Returns false when nothing could be issued for this thread.
 bool
@@ -1051,14 +1080,68 @@ VANADIS_COMPONENT::selectAndIssue(const uint32_t hw_thr)
             uint16_t cand;
 
             if ( VSC_MEMORY == c ) {
-                // MEMORY ORDER. Only the oldest not-yet-queued memory operation
-                // may go to the load/store queue, because the queue is strictly
-                // in order and only ever looks at its front. This is the same
-                // rule the old stage enforced with `unallocated_memory_op_seen`,
-                // including its effect across cycles.
+                // MEMORY ORDER. With the in-order queue, only the oldest
+                // not-yet-queued memory operation may go to it, because it is
+                // strictly in order and only ever looks at its front. This is
+                // the same rule the old stage enforced with
+                // `unallocated_memory_op_seen`, including its effect across
+                // cycles.
                 if ( s.mem_order_.empty() ) { continue; }
-                cand = s.mem_order_.front();
-                if ( !s.isReady(VSC_MEMORY, cand) ) { continue; }
+
+                if ( !lsq->speculative() ) {
+                    cand = s.mem_order_.front().slot;
+                    if ( !s.isReady(VSC_MEMORY, cand) ) { continue; }
+                }
+                else if ( lsq->orderedPending(hw_thr) ) {
+                    // A fence, a load-linked, a store-conditional or a locked
+                    // access is in the queue and has not executed. It was taken
+                    // off the memory order when it was queued, so this is what
+                    // keeps everything younger behind it.
+                    continue;
+                }
+                else {
+                    // THE SPECULATIVE QUEUE LOOKS PAST THE FRONT. A load may go
+                    // ahead of a store whose address register has not been
+                    // produced -- which is the serialisation that costs the most
+                    // -- while three things stay in order: nothing passes an
+                    // ordering instruction, an ordering instruction goes only
+                    // when everything older has gone, and stores enter the store
+                    // queue in program order relative to each other.
+                    cand = VanadisIssueScheduler::NO_SLOT;
+
+                    bool         store_seen = false;
+                    const size_t walk       = std::min(s.mem_order_.size(), (size_t)VANADIS_MEM_ORDER_WALK);
+
+                    for ( size_t i = 0; i < walk; ++i ) {
+                        const VanadisMemOrderEntry& e = s.mem_order_[i];
+
+                        // A coprocessor instruction older than this one has not
+                        // finished, so it may still read or write memory. See
+                        // coproc_executed_ in vanadis.h.
+                        if ( e.coproc_seq > s.coproc_executed_ ) { break; }
+
+                        if ( e.selected ) { continue; }
+
+                        if ( e.ordered ) {
+                            // Only at the oldest unselected position, and
+                            // nothing younger is looked at this cycle.
+                            if ( (0 == i) && s.isReady(VSC_MEMORY, e.slot) ) { cand = e.slot; }
+                            break;
+                        }
+
+                        if ( e.is_store ) {
+                            if ( store_seen ) { continue; }
+                            store_seen = true;
+                        }
+
+                        if ( s.isReady(VSC_MEMORY, e.slot) ) {
+                            cand = e.slot;
+                            break;
+                        }
+                    }
+
+                    if ( VanadisIssueScheduler::NO_SLOT == cand ) { continue; }
+                }
             }
             else if ( VSC_ROCC == c ) {
                 // A coprocessor instruction is architecturally visible the
@@ -1121,7 +1204,15 @@ VANADIS_COMPONENT::selectAndIssue(const uint32_t hw_thr)
 
         s.clearReady(best_cls, best);
 
-        if ( VSC_MEMORY == best_cls ) { s.mem_order_.pop_front(); }
+        if ( VSC_MEMORY == best_cls ) {
+            // The entry is marked rather than removed, because the one selected
+            // need not be the oldest; the deque is then popped from the front
+            // for as long as its front has been dealt with, so it stays a deque.
+            for ( auto& e : s.mem_order_ ) {
+                if ( e.slot == best ) { e.selected = true; break; }
+            }
+            while ( (!s.mem_order_.empty()) && s.mem_order_.front().selected ) { s.mem_order_.pop_front(); }
+        }
         else if ( VSC_ROCC == best_cls ) { issueRoCCCommand(ins); }
 
         #ifdef VANADIS_BUILD_DEBUG
@@ -1169,6 +1260,19 @@ VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
 
     const VanadisFunctionalUnitType ins_type = ins->getInstFuncType();
 
+    // THE LOAD/STORE QUEUE SLOT IS TAKEN HERE when the queue is a speculative
+    // one, so the room for it has to be found here too. A load can only be told
+    // to wait for an older store whose address is unknown if that store already
+    // holds a slot saying it is older, and the slot has to be taken before the
+    // address exists -- which is this stage, not issue. Nothing else about this
+    // function changes; with the in-order queue the test is made at issue, as
+    // it always was.
+    if ( UNLIKELY(lsq->speculative()) ) {
+        if ( ((INST_LOAD == ins_type) && lsq->loadFull()) || ((INST_STORE == ins_type) && lsq->storeFull()) ) {
+            return false;
+        }
+    }
+
     // A SYSCALL is a trap, and it renames only at the head of the reorder
     // buffer. It does not take new physical registers -- it renames every
     // architectural register onto its own existing mapping -- so a squash that
@@ -1191,7 +1295,19 @@ VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
     s.slot_class_[uslot] = cls;
     s.wait_next_[uslot]  = VanadisIssueScheduler::NO_SLOT;
 
-    if ( VSC_MEMORY == cls ) { s.mem_order_.push_back(uslot); }
+    if ( VSC_ROCC == cls ) { s.coproc_dispatched_++; }
+
+    if ( VSC_MEMORY == cls ) {
+        VanadisMemOrderEntry mem_entry;
+        mem_entry.slot     = uslot;
+        mem_entry.is_store = (INST_STORE == ins_type);
+        mem_entry.ordered  = vanadisMemOpIsOrdered(ins);
+        mem_entry.selected = false;
+        mem_entry.coproc_seq = s.coproc_dispatched_;
+        s.mem_order_.push_back(mem_entry);
+
+        lsq->reserve(ins);
+    }
     if ( UNLIKELY(INST_SYSCALL == ins_type) ) { s.syscall_barrier_ = true; }
 
     waitOrReady(hw_thr, uslot);
@@ -1312,6 +1428,8 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
             // renamed destination, so ask it.
             register_files[ins->getHWThread()]->setIntReg<uint64_t>(ins->getPhysIntRegOut(0), resp->rd_val);
             ins->markExecuted();
+            // Memory operations younger than this one may go now.
+            sched[ins->getHWThread()].coproc_executed_++;
             rocc_queues_[i].pop_front();
             delete resp;
         }
@@ -1387,6 +1505,36 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
             rob_front->getInstructionAddress(), rob_front->getInstCode(), cycle, inst_asm_buffer);
 
         delete[] inst_asm_buffer;
+    }
+
+    // AN ORDERING VIOLATION, PAID FOR AT THE HEAD OF THE REORDER BUFFER.
+    //
+    // This load read bytes that an older store of the same thread then wrote:
+    // the value in its register is the one that was in memory before the store,
+    // and everything younger that used it used the wrong number. The repair is
+    // the one the branch path takes -- discard this thread's whole reorder
+    // buffer, restore the issue rename map from the retire map, fetch again --
+    // and it is only correct at the head of the buffer, because the retire map
+    // is only correct there. So it is taken here.
+    //
+    // The refetch address is the load's own, so the load itself runs again. It
+    // is tested BEFORE completion, because a load that is going to be thrown
+    // away need not finish first. handleMisspeculate deletes rob_front, so
+    // nothing may touch it afterwards.
+    if ( UNLIKELY(INST_LOAD == rob_front->getInstFuncType()) ) {
+        VanadisLoadInstruction* replay_ins = rob_front->asLoad();
+
+        if ( UNLIKELY((nullptr != replay_ins) && replay_ins->needsReplay()) ) {
+            const uint64_t replay_addr = rob_front->getInstructionAddress();
+
+            VANADIS_VERB(output, 8, 0,
+                "%d: ----> Replay: load 0x%" PRI_ADDR " read bytes an older store then wrote; "
+                "re-executing from it.\n", ins_thread, replay_addr);
+
+            lsq->noteReplay(rob_front);
+            handleMisspeculate(ins_thread, replay_addr);
+            return 1;
+        }
     }
 
     // Instruction is done
@@ -1569,6 +1717,12 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
 			}
 
             VANADIS_VERB(output, 16, VANADIS_DBG_RETIRE_FLG, "------> recovering retired registers thr: %d.\n", ins_thread);
+
+            // A LOAD'S QUEUE SLOT IS FREED HERE and not when its value arrived:
+            // until it retires, an older store may still resolve onto the bytes
+            // it read. This is also where the memory-dependence predictor learns
+            // that this load went through without costing anything.
+            lsq->commit(rob_front);
 
             recoverRetiredRegisters(rob_front, int_register_stack, fp_register_stack,issue_isa_tables[ins_thread], retire_isa_tables[ins_thread]);
 
@@ -1846,7 +2000,9 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
     }
 
     case INST_LOAD:
-        if ( !lsq->loadFull() ) {
+        // The speculative queue took this load's slot when it was renamed, so
+        // there is nothing left to ask for here.
+        if ( lsq->speculative() || !lsq->loadFull() ) {
             stat_loads_issued->addData(1);
             lsq->push(ins->asLoad());
             allocated_fu = true;
@@ -1854,7 +2010,7 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
         break;
 
     case INST_STORE:
-        if ( !lsq->storeFull() ) {
+        if ( lsq->speculative() || !lsq->storeFull() ) {
             stat_stores_issued->addData(1);
             lsq->push(ins->asStore());
             allocated_fu = true;
@@ -3152,6 +3308,11 @@ VANADIS_COMPONENT::resetHwThread(uint32_t thr)
     // what a new instruction of this thread can read, and the register file has
     // just been re-initialised under them, so they are readable now.
     dropSchedulerState(thr);
+
+    // The address space is being replaced, so every load address the
+    // memory-dependence predictor has learned about names something else now.
+    lsq->resetPredictors(thr);
+
     for ( uint16_t r = 0; r < decoder->countISAIntReg(); ++r ) { setIntRegReady(issue_table->getIntPhysReg(r)); }
     for ( uint16_t r = 0; r < decoder->countISAFPReg(); ++r ) { setFPRegReady(issue_table->getFPPhysReg(r)); }
 

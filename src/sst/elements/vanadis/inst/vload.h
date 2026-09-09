@@ -204,12 +204,28 @@ public:
 
     virtual uint16_t getRegisterOffset() const { return 0; }
 
+    // AN ORDERING VIOLATION THIS LOAD HAS TO PAY FOR.
+    //
+    // Set by the load/store queue when an older store of the same thread turns
+    // out to write bytes this load has already read: the value in the register
+    // is the one that was in memory before the store, and every instruction
+    // that has used it has used the wrong number. The flag is read at the head
+    // of the reorder buffer, where the repair discards this load and everything
+    // younger and fetches again from this load's own address.
+    //
+    // It lives on the load rather than on the base instruction class so that
+    // the base class does not grow a word for a case only loads have.
+    void markReplay() { needs_replay_ = true; }
+    bool needsReplay() const { return needs_replay_; }
+    void clearReplay() { needs_replay_ = false; }
+
 protected:
     const bool               signed_extend;
     VanadisMemoryTransaction memAccessType;
     const int64_t            offset;
     const uint16_t           load_width;
     VanadisLoadRegisterType  regType;
+    bool                     needs_replay_ = false;
 
 };
 

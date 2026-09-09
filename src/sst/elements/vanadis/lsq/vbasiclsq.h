@@ -22,12 +22,16 @@
 
 #include "lsq/vlsq.h"
 #include "lsq/vbasiclsqentry.h"
+#include "lsq/vmemdeppredictor.h"
 #include "util/vsignx.h"
 #include "inst/vstorecond.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cinttypes>
 #include <cstdint>
+#include <deque>
+#include <unordered_map>
 #include <vector>
 #include <queue>
 
@@ -53,6 +57,36 @@ using namespace SST::Interfaces;
 
 namespace SST {
 namespace Vanadis {
+
+// The first age a memory operation of a thread can be given. Zero is reserved
+// to mean "no store": see next_age_ in the constructor.
+#define VANADIS_LSQ_FIRST_AGE 1
+
+// The stores ahead of one load, as much of them as the memory-dependence
+// predictor is allowed to see: whether a named store instruction is one of
+// them. Design B asks exactly this and nothing else, so the predictor never
+// holds a pointer into the queue.
+class VanadisBasicOlderStoreView : public VanadisStoreQView
+{
+public:
+    VanadisBasicOlderStoreView(const std::deque<VanadisBasicStorePendingEntry*>& q, uint64_t load_age) :
+        q_(q), load_age_(load_age)
+    {}
+
+    bool containsStorePC(uint64_t store_pc) const override
+    {
+        for ( auto* e : q_ ) {
+            if ( e->getAge() >= load_age_ ) { break; }
+            if ( e->getInstructionAddress() == store_pc ) { return true; }
+        }
+        return false;
+    }
+
+private:
+    const std::deque<VanadisBasicStorePendingEntry*>& q_;
+    const uint64_t                                    load_age_;
+};
+
 class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 {
     public:
@@ -71,7 +105,14 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "max_loads", "Set the maximum number of loads permitted in the queue", "16" },
                 { "address_mask", "Can mask off address bits if needed during construction of a operation", "0xFFFFFFFFFFFFFFFF"},
                 { "issues_per_cycle", "Maximum number of issues the LSQ can attempt per cycle.", "2"},
-                { "cache_line_width", "Number of bytes in a (L1) cache line", "64"}
+                { "cache_line_width", "Number of bytes in a (L1) cache line", "64"},
+                { "lsq_speculate", "1 lets a load issue past an older store whose address is not known yet, be answered from an older store's bytes, and be replayed when an older store later resolves onto bytes it has read. 0 is the strictly in-order queue, in which a load never passes a store.", "1"},
+                { "mem_dep_speculation", "Alias of lsq_speculate, kept because the design document names it.", "1"},
+                { "lsq_forward", "1 lets a load be answered out of an older store's bytes. 0 makes it wait for the store to reach memory, as the in-order queue does. Only meaningful when lsq_speculate is 1.", "1"},
+                { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: counter (a two-bit counter per load address), store_pc (the store that last made this load flush), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "counter"},
+                { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
+                { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
+                { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"}
             )
 
         SST_ELI_DOCUMENT_STATISTICS({ "bytes_read", "Count all the bytes read for data operations", "bytes", 1 },
@@ -88,7 +129,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "store_buffer_entries", "Count the number of stores held in the store buffer", "operations", 1},
                                     { "split_stores", "Count the number of stores which are fractured due to cache boundaries", "operations", 1},
                                     { "split_loads", "Count the number of loads which are fractured due to cache boundaries", "operations", 1},
-                                    { "addr_outside_space", "Count the accesses whose address does not fit address_mask and were therefore faulted rather than sent", "operations", 1})
+                                    { "addr_outside_space", "Count the accesses whose address does not fit address_mask and were therefore faulted rather than sent", "operations", 1},
+                                    { "mem_loads_speculated", "Count the loads answered while at least one older store still had an unknown address", "operations", 1},
+                                    { "mem_loads_forwarded", "Count the loads answered out of an older store's bytes, with no request sent to memory", "operations", 1},
+                                    { "mem_violations", "Count the loads an older store resolved onto after they had already read", "operations", 1},
+                                    { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
+                                    { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1})
 
 
         VanadisBasicLoadStoreQueue(ComponentId_t id, Params& params, int coreid, int hwthreads) : VanadisLoadStoreQueue(id, params, coreid, hwthreads),
@@ -130,6 +176,61 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_loads_pending = registerStatistic<uint64_t>("loads_in_flight", "1");
             stat_op_q_size = registerStatistic<uint64_t>("operations_pending");
             stat_addr_outside_space = registerStatistic<uint64_t>("addr_outside_space", "1");
+
+            stat_mem_loads_speculated = registerStatistic<uint64_t>("mem_loads_speculated", "1");
+            stat_mem_loads_forwarded  = registerStatistic<uint64_t>("mem_loads_forwarded", "1");
+            stat_mem_violations       = registerStatistic<uint64_t>("mem_violations", "1");
+            stat_mem_replays          = registerStatistic<uint64_t>("mem_replays", "1");
+            stat_mem_predictor_holds  = registerStatistic<uint64_t>("mem_predictor_holds", "1");
+
+            // SPECULATION IS THE DEFAULT, and turning it off restores the queue
+            // this one grew out of: one in-order queue per hardware thread, a
+            // load that never passes a store, and no violations to recover
+            // from. Both names are read so that either may be used.
+            spec_ = params.find<bool>("lsq_speculate", params.find<bool>("mem_dep_speculation", true));
+
+            forward_ = params.find<bool>("lsq_forward", true);
+
+            mdp_kind_ = params.find<std::string>("mem_dep_predictor", "counter");
+            const size_t mdp_entries       = params.find<size_t>("mdp_entries", 4096);
+            const size_t mdp_store_entries = params.find<size_t>("mdp_store_entries", 4096);
+            const std::string decay        = params.find<std::string>("mdp_counter_decay", "retire");
+
+            if ( (decay != "retire") && (decay != "speculated") ) {
+                output->fatal(CALL_INFO, -1,
+                    "Error: mdp_counter_decay is \"%s\"; it is either \"retire\" or \"speculated\".\n",
+                    decay.c_str());
+            }
+
+            load_q.resize(hw_threads);
+            ordered_ins_.resize(hw_threads, nullptr);
+            // AGE 0 IS NOT AN AGE. A load records the age of the store it was
+            // answered from, and 0 there means "answered by memory, from no
+            // store at all". If a store could hold age 0 the two would be the
+            // same number, and the violation check -- which asks whether the
+            // resolving store is younger than whatever the load was answered
+            // from -- would skip every load against the first store after a
+            // queue clear. That is not a rare corner: the queues are cleared on
+            // every branch mis-predict, so age 0 comes round constantly.
+            next_age_.resize(hw_threads, VANADIS_LSQ_FIRST_AGE);
+            waiting_loads_.resize(hw_threads, 0);
+            forced_hold_pc_.resize(hw_threads, 0);
+            forced_hold_armed_.resize(hw_threads, false);
+            load_q_size = 0;
+
+            // ONE TABLE PER HARDWARE THREAD. Sharing one would let a thread's
+            // behaviour hold another thread's loads, and the table is a
+            // kilobyte.
+            mem_dep_.resize(hw_threads, nullptr);
+            for ( int t = 0; t < hw_threads; ++t ) {
+                mem_dep_[t] = vanadisMakeMemDepPredictor(
+                    mdp_kind_, mdp_entries, mdp_store_entries, decay == "speculated");
+                if ( nullptr == mem_dep_[t] ) {
+                    output->fatal(CALL_INFO, -1,
+                        "Error: mem_dep_predictor is \"%s\"; it is one of counter, store_pc, none.\n",
+                        mdp_kind_.c_str());
+                }
+            }
         }
 
 
@@ -139,20 +240,161 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     delete (*op_q_itr);
                     op_q_itr = op_q[i].erase(op_q_itr);
                 }
+                for ( auto* entry : load_q[i] ) { delete entry; }
+                load_q[i].clear();
+                delete mem_dep_[i];
             }
             delete std_mem_handlers;
         }
 
-        bool storeFull() override { return op_q_size >= max_stores; }
-        bool loadFull() override { return op_q_size >= max_loads; }
+        bool speculative() const override { return spec_; }
+
+        // WHERE THE BACK-PRESSURE IS APPLIED. In the speculative queue a slot is
+        // taken when the instruction is renamed, so these answer the core at
+        // rename; in the in-order queue they answer it at issue, as before.
+        bool storeFull() override { return spec_ ? (stores_pending_size >= max_stores) : (op_q_size >= max_stores); }
+        bool loadFull() override { return spec_ ? (load_q_size >= max_loads) : (op_q_size >= max_loads); }
         bool storeBufferFull() override { return std_stores_in_flight.size() >= max_stores; }
 
-        size_t storeSize() override { return op_q_size; }
-        size_t loadSize() override { return op_q_size; }
+        size_t storeSize() override { return spec_ ? stores_pending_size : op_q_size; }
+        size_t loadSize() override { return spec_ ? load_q_size : op_q_size; }
         size_t storeBufferSize() override { return std_stores_in_flight.size(); }
+
+        // A SLOT, TAKEN AT RENAME. Until a store holds a slot carrying an age
+        // that says it is older, a younger load has no way to know it exists,
+        // and the whole point of this queue is that a load can decide what to do
+        // about a store whose address nobody has computed yet.
+        void reserve(VanadisInstruction* ins) override
+        {
+            if ( !spec_ ) { return; }
+
+            const uint32_t thr = ins->getHWThread();
+
+            switch ( ins->getInstFuncType() ) {
+            case INST_LOAD:
+            {
+                VanadisBasicLoadPendingEntry* entry =
+                    new VanadisBasicLoadPendingEntry(ins->asLoad(), next_age_[thr]++);
+                load_q[thr].push_back(entry);
+                load_q_size++;
+                reserved_loads_[ins] = entry;
+                stat_loads_issued->addData(1);
+            } break;
+            case INST_STORE:
+            {
+                VanadisBasicStorePendingEntry* entry =
+                    new VanadisBasicStorePendingEntry(ins->asStore(), next_age_[thr]++);
+                stores_pending[thr].push_back(entry);
+                stores_pending_size++;
+                reserved_stores_[ins] = entry;
+                stat_stores_issued->addData(1);
+            } break;
+            default:
+                // A fence takes no slot. It needs no age either: the core will
+                // not hand this queue anything younger than a fence it has not
+                // executed, so every resolved operation in the queue when a
+                // fence arrives is older than the fence.
+                break;
+            }
+        }
+
+        // A LOAD'S SLOT IS FREED WHEN THE LOAD RETIRES, not when its value
+        // arrives: until it retires an older store may still resolve onto its
+        // bytes. This is also where the counter predictor learns that a load
+        // went through without costing anything.
+        void commit(VanadisInstruction* ins) override
+        {
+            if ( !spec_ ) { return; }
+
+            // Retiring is the last moment this pointer is safe to hold, so it is
+            // dropped here whether or not orderedPending() has already noticed
+            // that the instruction executed.
+            if ( ordered_ins_[ins->getHWThread()] == ins ) { ordered_ins_[ins->getHWThread()] = nullptr; }
+
+            if ( INST_LOAD != ins->getInstFuncType() ) { return; }
+
+            const uint32_t thr = ins->getHWThread();
+            const uint64_t pc  = ins->getInstructionAddress();
+
+            for ( auto itr = load_q[thr].begin(); itr != load_q[thr].end(); ++itr ) {
+                if ( (*itr)->getInstruction() != ins ) { continue; }
+
+                VanadisBasicLoadPendingEntry* entry = *itr;
+
+                // A LOAD THE SAFETY NET HELD PRODUCED NO EVIDENCE. It was not
+                // allowed to speculate, so its retiring without a violation
+                // says nothing about whether it would have violated, and
+                // counting it down would leave a load that aliases every time
+                // oscillating between "held" and "flushed" for ever.
+                const bool was_forced = forced_hold_armed_[thr] && (forced_hold_pc_[thr] == pc);
+
+                if ( !was_forced ) { mem_dep_[thr]->retiredClean(pc, entry->didSpeculate()); }
+                else               { forced_hold_armed_[thr] = false; }
+
+                if ( VanadisBasicLoadPendingEntry::WAITING == entry->getState() ) { waiting_loads_[thr]--; }
+                dropFromLoadsPending(entry);
+                reserved_loads_.erase(ins);
+                load_q[thr].erase(itr);
+                load_q_size--;
+                delete entry;
+                return;
+            }
+        }
+
+        // THE FLUSH IS ABOUT TO BE TAKEN. Called while the record of what
+        // happened is still here, because the repair that follows discards it.
+        //
+        // The second half is a safety net that no predictor provides and the
+        // machine cannot run without. Recovery here is a whole-thread flush, so
+        // the store that caused the violation is thrown away with the load and
+        // re-executed from scratch -- and if nothing changed, it would race the
+        // load exactly as before and flush again, for ever. Arming the load's
+        // own address makes its very next execution wait for every older store,
+        // which cannot violate; committing it disarms the net again.
+        void noteReplay(VanadisInstruction* ins) override
+        {
+            if ( !spec_ ) { return; }
+
+            const uint32_t thr = ins->getHWThread();
+            const uint64_t pc  = ins->getInstructionAddress();
+
+            for ( auto* entry : load_q[thr] ) {
+                if ( entry->getInstruction() != ins ) { continue; }
+                mem_dep_[thr]->violated(pc, entry->violatingStorePC());
+                break;
+            }
+
+            forced_hold_pc_[thr]    = pc;
+            forced_hold_armed_[thr] = true;
+            stat_mem_replays->addData(1);
+        }
+
+        // The thread's address space has been replaced, so every load address
+        // the table has learned about names something else now. This is the only
+        // event that clears it: a table wiped on every branch mis-predict would
+        // never hold anything.
+        bool orderedPending(const uint32_t thread) override
+        {
+            if ( !spec_ ) { return false; }
+            if ( nullptr == ordered_ins_[thread] ) { return false; }
+            if ( ordered_ins_[thread]->completedExecution() ) {
+                ordered_ins_[thread] = nullptr;
+                return false;
+            }
+            return true;
+        }
+
+        void resetPredictors(const uint32_t thread) override
+        {
+            if ( !spec_ ) { return; }
+            mem_dep_[thread]->reset();
+            forced_hold_armed_[thread] = false;
+        }
 
         void push(VanadisStoreInstruction* store_me) override
         {
+            if ( spec_ ) { resolveStore(store_me); return; }
+
             op_q[store_me->getHWThread()].push_back( new VanadisBasicStoreEntry(store_me) );
             op_q_size++;
             stat_stores_issued->addData(1);
@@ -160,6 +402,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         void push(VanadisLoadInstruction* load_me) override
         {
+            if ( spec_ ) { resolveLoad(load_me); return; }
+
             op_q[load_me->getHWThread()].push_back( new VanadisBasicLoadEntry(load_me) );
             op_q_size++;
             stat_loads_issued->addData(1);
@@ -167,6 +411,9 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         void push(VanadisFenceInstruction* fence) override
         {
+            // Nothing younger reaches this queue until it has executed.
+            if ( spec_ ) { ordered_ins_[fence->getHWThread()] = fence; }
+
             op_q[fence->getHWThread()].push_back( new VanadisBasicFenceEntry(fence) );
             op_q_size++;
             stat_fences_issued->addData(1);
@@ -185,12 +432,44 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
             }
 
-            for(auto load_itr = loads_pending.begin(); load_itr != loads_pending.end(); ) {
-                if( (*load_itr)->getHWThread() == thread ) {
-                    delete (*load_itr);
-                    load_itr = loads_pending.erase(load_itr);
-                } else {
-                    ++load_itr;
+            if ( spec_ ) {
+                // In this mode the in-flight list holds pointers it does not
+                // own: the load queue does. Take the pointers out of it first,
+                // then free the queue.
+                for(auto load_itr = loads_pending.begin(); load_itr != loads_pending.end(); ) {
+                    if( (*load_itr)->getHWThread() == thread ) {
+                        load_itr = loads_pending.erase(load_itr);
+                    } else {
+                        ++load_itr;
+                    }
+                }
+
+                for ( auto* entry : load_q[thread] ) {
+                    reserved_loads_.erase(entry->getInstruction());
+                    delete entry;
+                }
+                load_q_size -= load_q[thread].size();
+                load_q[thread].clear();
+                waiting_loads_[thread] = 0;
+
+                for ( auto* entry : stores_pending[thread] ) {
+                    reserved_stores_.erase(entry->getInstruction());
+                }
+
+                // Every entry that could have been compared against is gone, so
+                // the ages may start again. The predictors are NOT cleared: what
+                // they have learned about the program survives a repair, and a
+                // table emptied on every mis-predict would stay empty.
+                next_age_[thread] = VANADIS_LSQ_FIRST_AGE;
+                ordered_ins_[thread] = nullptr;
+            } else {
+                for(auto load_itr = loads_pending.begin(); load_itr != loads_pending.end(); ) {
+                    if( (*load_itr)->getHWThread() == thread ) {
+                        delete (*load_itr);
+                        load_itr = loads_pending.erase(load_itr);
+                    } else {
+                        ++load_itr;
+                    }
                 }
             }
 
@@ -263,13 +542,18 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 }
             }
 
-            stat_op_q_size->addData(op_q_size);
+            stat_op_q_size->addData(spec_ ? (load_q_size + stores_pending_size) : op_q_size);
             stat_loads_pending->addData(loads_pending.size());
             stat_stores_pending->addData(std_stores_in_flight.size());
             stat_store_buffer_entries->addData(stores_pending_size);
 
             // this can be called multiple times per cycle
             for(uint32_t attempt = 0; attempt < max_issue_attempts_per_cycle; ++attempt) {
+                if ( spec_ ) {
+                    attempt_to_issue_speculative(op_q_index);
+                    op_q_index = (op_q_index + 1) % hw_threads;
+                    continue;
+                }
                 if (op_q_size == 0)
                     break;
                 const bool attempt_result = attempt_to_issue(cycle, attempt, op_q_index);
@@ -552,7 +836,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         load_ins->markExecuted();
                         lsq->stat_loads_executed->addData(1);
                         lsq->loads_pending.erase(load_itr);
-                        delete load_entry;
+
+                        // In the speculative queue the load queue owns this
+                        // entry and keeps it until the load retires: an older
+                        // store may still resolve onto the bytes it has just
+                        // read, and the record of what it read is what says so.
+                        if ( lsq->spec_ ) {
+                            load_entry->setState(VanadisBasicLoadPendingEntry::DONE);
+                        } else {
+                            delete load_entry;
+                        }
                     } else {
                         if(out->getVerboseLevel() >= 9) {
                             VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_LOAD_FLG,
@@ -657,6 +950,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // check the front store of the pending queue, if this isn't currently dispatched
             // and is front of ROB, then we can execute it into the memory system
             VanadisBasicStorePendingEntry* current_store = stores_pending[thr].front();
+
+            // A STORE WHOSE ADDRESS IS NOT KNOWN YET. Its slot was taken when it
+            // was renamed, so it can be sitting at the front of the store queue
+            // -- and even at the head of the reorder buffer -- before the
+            // register its address is computed from has been produced. There is
+            // nothing to send until it resolves.
+            if( UNLIKELY(! current_store->isResolved()) ) {
+                return false;
+            }
+
             VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current pending store\n");
             VanadisStoreInstruction* store_ins = current_store->getStoreInstruction();
             VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_STORE_FLG, "-> current store\n");
@@ -927,7 +1230,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         }
 
-        void issueLoad(VanadisLoadInstruction* load_ins, uint64_t load_address, uint64_t load_width) {
+        void issueLoad(VanadisLoadInstruction* load_ins, uint64_t load_address, uint64_t load_width,
+            VanadisBasicLoadPendingEntry* reuse_entry = nullptr) {
             StandardMem::Request* load_req = nullptr;
 
             #ifdef VANADIS_BUILD_DEBUG
@@ -948,7 +1252,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // do we need to perform a split load (which loads from two cache lines)?
             const bool needs_split = operationStraddlesCacheLine(load_address, load_width);
 
-            VanadisBasicLoadPendingEntry* load_entry = new VanadisBasicLoadPendingEntry(load_ins, load_address, load_width);
+            // The speculative queue already opened this load's record when the
+            // load was renamed; the in-order one opens it here.
+            VanadisBasicLoadPendingEntry* load_entry = (nullptr != reuse_entry)
+                ? reuse_entry
+                : new VanadisBasicLoadPendingEntry(load_ins, load_address, load_width);
 
             #if 0
             //with virtual memory we shouldn't need this but until we are sure we will leave it here
@@ -1103,6 +1411,426 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 stores_pending_size++;
             }
             return true;
+        }
+
+        // ===================================================================
+        // THE SPECULATIVE PIPELINE
+        // ===================================================================
+        //
+        // Five functions, and between them they are the whole of what a modern
+        // core's memory pipeline does that the in-order queue above does not.
+        //
+        //   resolveStore        a store's address becomes known
+        //   noteStoreResolved   ...and every younger load that has already read
+        //                       overlapping bytes is flagged
+        //   resolveLoad         a load's address becomes known
+        //   searchOlderStores   ...and it decides what to do about the stores
+        //                       ahead of it: go, wait, or take their bytes
+        //   forwardToRegister   taking their bytes
+
+        /// A store's address and value are known. Both arrive together, because
+        /// this core issues an instruction only when every operand is ready:
+        /// there is no separate store-address operation here, so a store still
+        /// waiting for its DATA looks exactly like a store whose ADDRESS is
+        /// unknown, and the predictor is consulted for it. That is conservative
+        /// and never wrong.
+        void resolveStore(VanadisStoreInstruction* store_ins)
+        {
+            const uint32_t thr = store_ins->getHWThread();
+
+            auto reserved = reserved_stores_.find(store_ins);
+            if( UNLIKELY(reserved == reserved_stores_.end()) ) {
+                output->fatal(CALL_INFO, -1,
+                    "Error: store ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " reached the queue without a reserved slot.\n",
+                    store_ins->getInstructionAddress(), thr);
+            }
+
+            VanadisBasicStorePendingEntry* entry = reserved->second;
+            reserved_stores_.erase(reserved);
+
+            uint64_t store_address = 0;
+            uint16_t store_width   = 0;
+            store_ins->computeStoreAddress(output, registerFiles->at(thr), &store_address, &store_width);
+
+            if( UNLIKELY(store_ins->trapsError()) ) {
+                // Nothing will ever be sent for it, so it must not sit in the
+                // queue holding younger loads back. The core stops on it if it
+                // retires.
+                store_ins->markExecuted();
+                removeStoreEntry(thr, entry);
+                return;
+            }
+
+            if( UNLIKELY((store_ins->getTransactionType() == MEM_TRANSACTION_LLSC_STORE)
+                      || (store_ins->getTransactionType() == MEM_TRANSACTION_LOCK)) ) {
+                ordered_ins_[thr] = store_ins;
+            }
+
+            entry->resolve(store_address, store_width, store_ins->getValueRegisterType(),
+                store_ins->getValueRegister());
+            entry->setSWThr(thr);
+            entry->addThr(thr);
+
+            // THE BYTES, kept so a younger load this store covers can be
+            // answered without waiting for the store to reach memory. Read out
+            // of the same register, at the same offset, with the same call the
+            // store itself will use when it issues.
+            if( LIKELY((store_ins->getTransactionType() == MEM_TRANSACTION_NONE)
+                    && (store_width <= VANADIS_LSQ_MAX_FWD_BYTES)) ) {
+                uint8_t  bytes[VANADIS_LSQ_MAX_FWD_BYTES];
+                uint16_t value_thread = 0;
+                uint16_t value_reg    = 0;
+                getStoreTarget(entry, store_ins, &value_thread, &value_reg);
+                registerFiles->at(value_thread)->copyFromRegister(value_reg, store_ins->getRegisterOffset(),
+                    &bytes[0], store_width, store_ins->getValueRegisterType() == STORE_FP_REGISTER);
+                entry->setForwardData(bytes, store_width);
+            } else {
+                entry->clearForwardData();
+            }
+
+            noteStoreResolved(thr, entry);
+        }
+
+        /// THE ORDERING VIOLATION, detected at the one instant it can be: the
+        /// moment a store's address becomes known. Every younger load of the
+        /// same thread that has already read bytes this store writes read the
+        /// wrong ones.
+        void noteStoreResolved(const uint32_t thr, VanadisBasicStorePendingEntry* store_entry)
+        {
+            const uint64_t store_age = store_entry->getAge();
+            const uint64_t store_pc  = store_entry->getInstructionAddress();
+
+            // Ages increase towards the back, so walk back to front and stop as
+            // soon as the entries are older than the store.
+            for( size_t i = load_q[thr].size(); i-- > 0; ) {
+                VanadisBasicLoadPendingEntry* load_entry = load_q[thr][i];
+
+                if( load_entry->getAge() < store_age ) { break; }
+
+                const auto state = load_entry->getState();
+                if( (state != VanadisBasicLoadPendingEntry::INFLIGHT)
+                 && (state != VanadisBasicLoadPendingEntry::DONE) ) { continue; }
+
+                if( load_entry->hasViolated() ) { continue; }
+
+                // A load answered from a store YOUNGER than this one saw the
+                // value that wins; it did not miss anything. A load answered by
+                // memory records age 0 and always fails this test.
+                if( store_age <= load_entry->forwardedFrom() ) { continue; }
+
+                if( ! store_entry->storeAddressOverlaps(load_entry->getLoadAddress(),
+                        load_entry->getLoadWidth()) ) { continue; }
+
+                load_entry->markViolated(store_pc);
+                load_entry->getLoadInstruction()->markReplay();
+                stat_mem_violations->addData(1);
+            }
+        }
+
+        /// A load's address is known. From here it is the load's own decision
+        /// what to do about the stores ahead of it.
+        void resolveLoad(VanadisLoadInstruction* load_ins)
+        {
+            const uint32_t thr = load_ins->getHWThread();
+
+            auto reserved = reserved_loads_.find(load_ins);
+            if( UNLIKELY(reserved == reserved_loads_.end()) ) {
+                output->fatal(CALL_INFO, -1,
+                    "Error: load ins: 0x%" PRI_ADDR " / thr: %" PRIu32 " reached the queue without a reserved slot.\n",
+                    load_ins->getInstructionAddress(), thr);
+            }
+
+            VanadisBasicLoadPendingEntry* entry = reserved->second;
+            reserved_loads_.erase(reserved);
+
+            uint64_t load_address = 0;
+            uint16_t load_width   = 0;
+            load_ins->computeLoadAddress(output, registerFiles->at(thr), &load_address, &load_width);
+
+            if( UNLIKELY(load_ins->trapsError()) ) {
+                // Nothing is sent and nothing will answer, so it must not be
+                // left waiting. The pipeline stops on it if it retires.
+                entry->setState(VanadisBasicLoadPendingEntry::DONE);
+                return;
+            }
+
+            if( UNLIKELY((load_ins->getTransactionType() == MEM_TRANSACTION_LLSC_LOAD)
+                      || (load_ins->getTransactionType() == MEM_TRANSACTION_LOCK)) ) {
+                ordered_ins_[thr] = load_ins;
+            }
+
+            entry->resolve(load_address, load_width);
+            searchOlderStores(thr, entry);
+
+            if( VanadisBasicLoadPendingEntry::WAITING == entry->getState() ) { waiting_loads_[thr]++; }
+        }
+
+        /// The load looks back over the stores ahead of it, youngest first, and
+        /// stops at the first one that decides the matter.
+        void searchOlderStores(const uint32_t thr, VanadisBasicLoadPendingEntry* load_entry)
+        {
+            VanadisLoadInstruction* load_ins = load_entry->getLoadInstruction();
+            auto&                   store_q  = stores_pending[thr];
+
+            const uint64_t load_address = load_entry->getLoadAddress();
+            const uint64_t load_width   = load_entry->getLoadWidth();
+            const uint64_t load_age     = load_entry->getAge();
+            const uint64_t load_pc      = load_ins->getInstructionAddress();
+
+            // How many entries at the front of the store queue are older than
+            // this load. Ages increase towards the back.
+            size_t older = 0;
+            while( (older < store_q.size()) && (store_q[older]->getAge() < load_age) ) { older++; }
+
+            // A load-linked or a locked load is a synchronisation instruction,
+            // not an ordinary read: it never passes a store and is never
+            // answered from one. This is what load_process() asks for the
+            // in-order queue, said against ages instead of against emptiness.
+            if( UNLIKELY((load_ins->getTransactionType() == MEM_TRANSACTION_LLSC_LOAD)
+                      || (load_ins->getTransactionType() == MEM_TRANSACTION_LOCK)) ) {
+                if( older > 0 ) { return; }
+                sendLoadFromEntry(load_entry);
+                return;
+            }
+
+            // A load that has just been replayed waits for every older store,
+            // whatever the predictor thinks. See noteReplay().
+            const bool forced = forced_hold_armed_[thr] && (forced_hold_pc_[thr] == load_pc);
+
+            bool speculated = false;
+
+            for( size_t i = older; i-- > 0; ) {
+                VanadisBasicStorePendingEntry* store_entry = store_q[i];
+
+                if( ! store_entry->isResolved() ) {
+                    // Nobody knows whether this store touches the load. Ask.
+                    const VanadisBasicOlderStoreView view(store_q, load_age);
+                    const bool predictor_go = mem_dep_[thr]->speculate(load_pc, view);
+
+                    if( forced || (! predictor_go) ) {
+                        // Counted only when it is the PREDICTOR holding the
+                        // load, so that the statistic says what the table is
+                        // doing and not what the safety net is doing.
+                        if( (! predictor_go) && (! load_entry->wasHeld()) ) {
+                            load_entry->markHeld();
+                            stat_mem_predictor_holds->addData(1);
+                        }
+                        return;                 // stays WAITING, retried next cycle
+                    }
+
+                    speculated = true;
+                    continue;
+                }
+
+                if( ! store_entry->storeAddressOverlaps(load_address, load_width) ) { continue; }
+
+                if( store_entry->fullyCovers(load_address, load_width)
+                 && canForwardFrom(load_ins, store_entry) ) {
+                    if( speculated ) {
+                        load_entry->markSpeculated();
+                        stat_mem_loads_speculated->addData(1);
+                    }
+                    forwardToRegister(load_entry, store_entry);
+                    load_entry->setForwardedFrom(store_entry->getAge());
+                    load_entry->setState(VanadisBasicLoadPendingEntry::DONE);
+                    load_ins->markExecuted();
+                    stat_loads_executed->addData(1);
+                    stat_mem_loads_forwarded->addData(1);
+                    return;
+                }
+
+                // The store writes some of the load's bytes but not all of
+                // them, or it is a store nothing may be forwarded from. Wait
+                // for it to reach memory and read it back, which is what the
+                // in-order queue does for every overlap.
+                return;
+            }
+
+            if( speculated ) {
+                load_entry->markSpeculated();
+                stat_mem_loads_speculated->addData(1);
+            }
+            sendLoadFromEntry(load_entry);
+        }
+
+        /// What may be answered out of a store queue entry. Deliberately narrow.
+        /// A floating-point destination is excluded because the load response
+        /// path writes one differently, and two pieces of code that must agree
+        /// byte for byte are better replaced by one that is never taken.
+        bool canForwardFrom(VanadisLoadInstruction* load_ins, VanadisBasicStorePendingEntry* store_entry) const
+        {
+            if( ! forward_ ) { return false; }
+            if( load_ins->getValueRegisterType() != LOAD_INT_REGISTER ) { return false; }
+            if( load_ins->getTransactionType() != MEM_TRANSACTION_NONE ) { return false; }
+            if( store_entry->getStoreInstruction()->getTransactionType() != MEM_TRANSACTION_NONE ) { return false; }
+            if( store_entry->isDispatched() ) { return false; }
+            if( ! store_entry->canForward() ) { return false; }
+            if( load_ins->getLoadWidth() > VANADIS_LSQ_MAX_FWD_BYTES ) { return false; }
+            return true;
+        }
+
+        /// The bytes of an older store, put into the load's destination register
+        /// with the sign extension the load asked for. This is the read-response
+        /// path's integer case with the response replaced by the store's copy of
+        /// what it is going to write, and one request rather than two, so there
+        /// is no split to reassemble.
+        void forwardToRegister(VanadisBasicLoadPendingEntry* load_entry,
+            VanadisBasicStorePendingEntry* store_entry)
+        {
+            VanadisLoadInstruction* load_ins = load_entry->getLoadInstruction();
+
+            if( UNLIKELY(load_ins->trapsError()) ) { return; }
+
+            const uint32_t thr        = load_ins->getHWThread();
+            const uint16_t target_reg = load_ins->getPhysIntRegOut(0);
+
+            if( target_reg == load_ins->getISAOptions()->getRegisterIgnoreWrites() ) { return; }
+
+            const uint64_t load_width  = load_entry->getLoadWidth();
+            const uint64_t reg_offset  = load_ins->getRegisterOffset();
+            const uint64_t byte_offset = load_entry->getLoadAddress() - store_entry->getStoreAddress();
+            const uint8_t* source      = store_entry->forwardData() + byte_offset;
+
+            const uint32_t reg_width = registerFiles->at(thr)->getIntRegWidth();
+
+            if( UNLIKELY((reg_offset + load_width) > reg_width) ) {
+                output->fatal(CALL_INFO, -1,
+                    "store-to-load forward does not fit the register: ins 0x%" PRI_ADDR " (%s), width %" PRIu64
+                    ", reg-offset %" PRIu64 ", reg-width %" PRIu32 "\n",
+                    load_ins->getInstructionAddress(), load_ins->getInstCode(), load_width, reg_offset, reg_width);
+            }
+
+            std::vector<uint8_t> register_value(reg_width);
+            registerFiles->at(thr)->copyFromIntRegister(target_reg, 0, &register_value[0], reg_width);
+
+            for( uint64_t i = 0; i < load_width; ++i ) {
+                register_value.at(reg_offset + i) = source[i];
+            }
+
+            const uint8_t fill = (load_ins->performSignExtension()
+                && ((register_value.at(reg_offset + load_width - 1) & 0x80) != 0)) ? 0xFF : 0x00;
+
+            for( uint64_t i = reg_offset + load_width; i < reg_width; ++i ) {
+                register_value.at(i) = fill;
+            }
+
+            registerFiles->at(thr)->copyToIntRegister(target_reg, 0, &register_value[0], register_value.size());
+
+            VANADIS_VERB(output, 9, VANADIS_DBG_LSQ_LOAD_FLG,
+                "---> LSQ forward: load 0x%" PRI_ADDR " <- store 0x%" PRI_ADDR " (addr 0x%" PRI_ADDR ", width %" PRIu64 ")\n",
+                load_ins->getInstructionAddress(), store_entry->getInstructionAddress(),
+                load_entry->getLoadAddress(), load_width);
+        }
+
+        /// Send the load to memory out of its queue entry. A refusal -- an
+        /// address the space cannot hold, an address that masks to zero -- sends
+        /// nothing and leaves no request outstanding, so the entry is finished
+        /// rather than left waiting for an answer that will not come.
+        void sendLoadFromEntry(VanadisBasicLoadPendingEntry* load_entry)
+        {
+            VanadisLoadInstruction* load_ins = load_entry->getLoadInstruction();
+
+            load_entry->setState(VanadisBasicLoadPendingEntry::INFLIGHT);
+            issueLoad(load_ins, load_entry->getLoadAddress(), load_entry->getLoadWidth(), load_entry);
+
+            if( UNLIKELY(0 == load_entry->countRequests()) ) {
+                load_entry->setState(VanadisBasicLoadPendingEntry::DONE);
+            }
+        }
+
+        /// One cycle's work for one hardware thread: a fence if one is waiting
+        /// and its conditions are met, then the oldest load that can now go.
+        void attempt_to_issue_speculative(const uint32_t thr)
+        {
+            // A FENCE. In this mode op_q holds nothing else: loads and stores
+            // are resolved where they are pushed. The core will not select
+            // anything younger than a fence it has not executed, so every
+            // resolved load and every resolved store in the queue right now is
+            // OLDER than the fence -- which is what makes these two tests, which
+            // name no ages, the right ones.
+            if( UNLIKELY(! op_q[thr].empty()) ) {
+                VanadisBasicLoadStoreEntry* fence_entry = op_q[thr].front();
+                VanadisFenceInstruction*    fence_ins   = fence_entry->getInstruction()->asFence();
+
+                bool can_execute = true;
+
+                if( fence_ins->createsLoadFence() ) {
+                    can_execute = ! anyLoadOutstanding(thr);
+                }
+
+                if( fence_ins->createsStoreFence() ) {
+                    can_execute = can_execute && (! anyStoreResolved(thr)) && (std_stores_in_flight.size() == 0);
+                }
+
+                if( can_execute ) {
+                    fence_ins->markExecuted();
+                    stat_fences_executed->addData(1);
+                    delete fence_entry;
+                    op_q[thr].pop_front();
+                    op_q_size--;
+                }
+
+                // A load older than the fence may still be waiting on a store,
+                // and the fence is waiting for exactly that load, so the walk
+                // below still runs.
+            }
+
+            if( 0 == waiting_loads_[thr] ) { return; }
+
+            unsigned examined = 0;
+
+            for( auto* load_entry : load_q[thr] ) {
+                if( VanadisBasicLoadPendingEntry::WAITING != load_entry->getState() ) { continue; }
+                if( ++examined > max_waiting_walk ) { break; }
+
+                searchOlderStores(thr, load_entry);
+
+                if( VanadisBasicLoadPendingEntry::WAITING != load_entry->getState() ) {
+                    waiting_loads_[thr]--;
+                    return;             // one load per attempt, as issues_per_cycle says
+                }
+            }
+        }
+
+        /// True while any load of this thread still owes a value.
+        bool anyLoadOutstanding(const uint32_t thr) const
+        {
+            for( auto* entry : load_q[thr] ) {
+                const auto state = entry->getState();
+                if( (VanadisBasicLoadPendingEntry::WAITING == state)
+                 || (VanadisBasicLoadPendingEntry::INFLIGHT == state) ) { return true; }
+            }
+            return false;
+        }
+
+        /// True while any store of this thread has an address and has not yet
+        /// reached memory. Reserved entries are younger than any fence that can
+        /// be asking, so they do not count.
+        bool anyStoreResolved(const uint32_t thr) const
+        {
+            for( auto* entry : stores_pending[thr] ) {
+                if( entry->isResolved() ) { return true; }
+            }
+            return false;
+        }
+
+        void dropFromLoadsPending(VanadisBasicLoadPendingEntry* entry)
+        {
+            for( auto itr = loads_pending.begin(); itr != loads_pending.end(); ++itr ) {
+                if( (*itr) == entry ) { loads_pending.erase(itr); return; }
+            }
+        }
+
+        void removeStoreEntry(const uint32_t thr, VanadisBasicStorePendingEntry* entry)
+        {
+            for( auto itr = stores_pending[thr].begin(); itr != stores_pending[thr].end(); ++itr ) {
+                if( (*itr) == entry ) {
+                    stores_pending[thr].erase(itr);
+                    stores_pending_size--;
+                    delete entry;
+                    return;
+                }
+            }
         }
 
         bool attempt_to_issue(uint64_t cycle, uint16_t attempt_this_cycle, int thr)
@@ -1497,6 +2225,34 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         const uint32_t max_issue_attempts_per_cycle;
 
+        // ---- the speculative queue's state ----------------------------------
+        //
+        // load_q is the load queue: one entry per load from the moment it is
+        // renamed until the moment it retires, oldest at the front. The store
+        // queue is stores_pending, which now also holds the slots of stores
+        // whose addresses are not known yet. next_age_ orders the two against
+        // each other; it is reset when the thread's queues are cleared, which
+        // removes everything an age could be compared against.
+        bool                                                  spec_ = false;
+        bool                                                  forward_ = true;
+        std::string                                           mdp_kind_;
+        std::vector< std::deque<VanadisBasicLoadPendingEntry*> > load_q;
+        std::vector<VanadisInstruction*>                      ordered_ins_;
+        size_t                                                load_q_size = 0;
+        std::vector<uint64_t>                                 next_age_;
+        std::vector<size_t>                                   waiting_loads_;
+        std::vector<VanadisMemDepPredictor*>                  mem_dep_;
+        std::vector<uint64_t>                                 forced_hold_pc_;
+        std::vector<bool>                                     forced_hold_armed_;
+        std::unordered_map<VanadisInstruction*, VanadisBasicLoadPendingEntry*>  reserved_loads_;
+        std::unordered_map<VanadisInstruction*, VanadisBasicStorePendingEntry*> reserved_stores_;
+
+        // How many waiting loads one issue attempt will look at. A load held by
+        // the predictor is looked at again every cycle, and without a bound a
+        // queue full of them would cost the simulator a walk of 192 entries per
+        // attempt to find the one that can move.
+        static const unsigned max_waiting_walk = 32;
+
         uint64_t cache_line_width;
         uint64_t address_mask;
         bool     said_addr_outside_space = false;
@@ -1516,6 +2272,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         Statistic<uint64_t>* stat_split_loads;
         Statistic<uint64_t>* stat_stored_bytes;
         Statistic<uint64_t>* stat_loaded_bytes;
+        Statistic<uint64_t>* stat_mem_loads_speculated;
+        Statistic<uint64_t>* stat_mem_loads_forwarded;
+        Statistic<uint64_t>* stat_mem_violations;
+        Statistic<uint64_t>* stat_mem_replays;
+        Statistic<uint64_t>* stat_mem_predictor_holds;
 };
 
 } // namespace SST
