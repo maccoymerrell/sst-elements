@@ -325,6 +325,54 @@ public:
         { "pause_when_retire_address", "If specified, the simulation will stop when this address is retired.", "0"},
         { "pipeline_trace_file", "If specified, a trace of the pipeline activity will be generated to this file.", ""},
         { "max_cycle", "Maximum number of cycles to execute. The core will halt after this many cycles." , "std::numeric_limits<uint64_t>::max()"},
+        // ---- restoring architectural state from a whole-program image ----
+        //
+        // A sampled run does not start a program at its entry point: it starts it in the
+        // middle, from an image the functional simulator wrote. Everything else about that
+        // image is placed in memory before the clock starts; the general registers cannot
+        // be, because the operating system's start-thread event arrives at time zero and
+        // writes the stack pointer itself. These three parameters are applied on that same
+        // path, immediately after that write, and nowhere else. Left empty -- which is what
+        // every run that is not started from an image leaves them -- they do nothing at all
+        // and this core is byte-for-byte the core it was.
+        { "nmfc_image_int", "32 comma-separated 64-bit hexadecimal values for x0..x31, restored from a whole-program image. Empty means no image and no restore", "" },
+        { "nmfc_image_fp", "32 comma-separated 64-bit hexadecimal bit patterns for f0..f31, restored from a whole-program image. Empty means no image and no restore", "" },
+        { "nmfc_image_fcsr", "The floating-point control and status word from a whole-program image: bits 0-4 the sticky exception flags in RISC-V order (inexact, underflow, overflow, divide-by-zero, invalid) and bits 5-7 the rounding mode in frm encoding. Ignored when nmfc_image_int is empty", "0" },
+        // ---- the progress axis: which retired instructions count as progress ----
+        //
+        // A program that offloads spends host instructions waiting for a result, and how
+        // many it spends is a property of the machine being modelled rather than of the
+        // program. The sampling axis therefore counts only the instructions OUTSIDE that
+        // waiting code, whose number the program alone fixes. The waiting code is one span
+        // of the address space -- the linker collects it into the section `nmfc_wait`,
+        // between the symbols __start_nmfc_wait and __stop_nmfc_wait -- and these two
+        // parameters are that span, given as hexadecimal or decimal addresses. Equal
+        // values, which is the default, are an empty span: nothing is excluded and the
+        // progress count is the count of the program's own instructions.
+        { "nmfc_wait_start", "First address of the program's wait and retry code, the value of __start_nmfc_wait. Equal to nmfc_wait_stop means no wait code and nothing excluded", "0" },
+        { "nmfc_wait_stop", "One past the last address of the program's wait and retry code, the value of __stop_nmfc_wait. Equal to nmfc_wait_start means no wait code and nothing excluded", "0" },
+        // ---- the work axis: the counter the program keeps its own work in ----
+        //
+        // A WORK UNIT is one unit of the program's own useful output, defined by
+        // the workload -- a vertex settled, one sum performed, one insertion or
+        // lookup performed -- and counted by the program itself in one 64-bit
+        // global, `nmfc_work`, incremented at the same unit in both builds of a
+        // workload. It is the coordinate a sampled window is placed on when two
+        // builds are to be compared, because equal instruction counts do not
+        // cover equal work: the offloaded build executes instructions the
+        // pure-host build does not have -- marshalling a batch, polling for it,
+        // retrying a refused offload.
+        //
+        // This core watches the program's COMMITTED stores to that address and
+        // publishes the value stored beside its retire and progress counts. The
+        // address is read out of the binary's own symbol table by the
+        // configuration, never written by hand, for the reason the wait span is:
+        // an address the two simulators could be pointed at differently is not
+        // one coordinate. Zero -- the default -- watches nothing at all and this
+        // core is byte-for-byte the core it was.
+        { "nmfc_work_addr", "Address of the program's work counter, the value of the symbol `nmfc_work`. 0 watches nothing", "0" },
+        { "nmfc_work_width", "Width of that counter in bytes: 1, 2, 4 or 8 (default 8). A narrower counter's remaining bytes keep their starting value", "8" },
+        { "nmfc_work_start", "What the counter already held when this run began: the value a whole-program image was captured with, or 0 for a run started at the program's entry point", "0" },
         { "node_id", "Identifier for the node this core belongs to. Each node in the system needs a unique ID between 0 and (number of nodes) - 1. Used to tag output.", "0"},
         { "core_id", "Identifier for this core. Each core in the system needs a unique ID between 0 and (number of cores) - 1.", 0 },
         { "hardware_threads", "Number of hardware threads in this core", "1" },
@@ -366,6 +414,14 @@ public:
         { "rob_cleared_entries", "Number of micro-ops that are cleared during a pipeline clear", "instructions", 1 },
         { "instructions_issued", "Number of instructions issued", "instructions", 1 },
         { "instructions_retired", "Number of instructions retired", "instructions", 1 },
+        { "instructions_progress",
+          "Number of PROGRESS instructions retired: one per program instruction -- not per "
+          "micro-op -- whose address lies outside [nmfc_wait_start, nmfc_wait_stop)",
+          "instructions", 1 },
+        { "instructions_wait",
+          "Number of program instructions retired inside [nmfc_wait_start, nmfc_wait_stop), the "
+          "wait and retry code. Progress plus wait is every instruction the program executed",
+          "instructions", 1 },
         { "instructions_decoded", "Number of instructions decoded", "instructions", 1 },
         { "branch_mispredicts", "Number of retired branches which were mis-predicted", "instructions", 1 },
         { "branches", "Number of retired branches", "instructions", 1 },
@@ -508,6 +564,25 @@ private:
 
     void resetHwThread(uint32_t thr);
 
+    /// ONE RETIREMENT, CLASSIFIED FOR THE PROGRESS AXIS.
+    ///
+    /// Called at each retire site with the instruction that just retired. Micro-ops that
+    /// are not the last of their program instruction are skipped, so what is counted is
+    /// instructions the program executed and not the pieces this core broke them into; the
+    /// instruction's own address then says which of the two counters it belongs in. An
+    /// empty wait span -- the default -- puts every one of them in the progress count.
+    inline void countProgress(const VanadisInstruction* ins)
+    {
+        if ( !ins->endsMicroOpGroup() ) { return; }
+        const uint64_t addr = ins->getInstructionAddress();
+        if ( (nmfc_wait_stop_ > nmfc_wait_start_) && (addr >= nmfc_wait_start_) && (addr < nmfc_wait_stop_) ) {
+            ins_wait_this_cycle++;
+        }
+        else {
+            ins_progress_this_cycle++;
+        }
+    }
+
     SST::Output* output;
 
     uint16_t core_id;
@@ -600,6 +675,8 @@ private:
     FILE*           pipelineTrace;
 
     Statistic<uint64_t>* stat_ins_retired;
+    Statistic<uint64_t>* stat_ins_progress;
+    Statistic<uint64_t>* stat_ins_wait;
     Statistic<uint64_t>* stat_ins_decoded;
     Statistic<uint64_t>* stat_ins_issued;
     Statistic<uint64_t>* stat_loads_issued;
@@ -615,6 +692,21 @@ private:
 
     uint32_t ins_issued_this_cycle;
     uint32_t ins_retired_this_cycle;
+    /// The progress axis. `ins_progress_this_cycle` counts the program instructions retired
+    /// this cycle whose address is outside the wait span, `ins_wait_this_cycle` those inside
+    /// it; both count one per program instruction, where `ins_retired_this_cycle` counts one
+    /// per micro-op. The span itself is [nmfc_wait_start_, nmfc_wait_stop_), empty when the
+    /// two are equal.
+    uint32_t ins_progress_this_cycle;
+    uint32_t ins_wait_this_cycle;
+    uint64_t nmfc_wait_start_;
+    uint64_t nmfc_wait_stop_;
+    /// The work axis. The address of the program's own work counter, how wide
+    /// it is, and what it held when this run began; the load/store queue watches
+    /// the committed stores to it and this core publishes what it reads.
+    uint64_t nmfc_work_addr_;
+    uint64_t nmfc_work_width_;
+    uint64_t nmfc_work_start_;
     uint32_t ins_decoded_this_cycle;
 
     uint64_t pause_on_retire_address;
@@ -622,6 +714,19 @@ private:
     uint64_t stop_verbose_when_retire_address;
 
     std::vector<VanadisFloatingPointFlags*> fp_flags;
+
+    /// The architectural state a whole-program image restores, parsed once at
+    /// construction and written once, in startThread(). Empty vectors mean the run was
+    /// not started from an image, which is every run that is not a sampled one.
+    std::vector<uint64_t> nmfc_image_int;
+    std::vector<uint64_t> nmfc_image_fp;
+    uint32_t              nmfc_image_fcsr = 0;
+
+    /// Write the image's registers and floating-point status into thread `thr`.
+    /// Called from startThread() after the operating system's stack pointer write, so
+    /// that the image's own stack pointer -- which is the program's -- is the one that
+    /// survives. Does nothing when no image was given.
+    void restoreImageState(int thr);
     SST::Link* os_link;
 
     bool* m_checkpointing;

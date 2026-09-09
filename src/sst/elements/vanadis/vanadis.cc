@@ -23,6 +23,7 @@
 #include "os/resp/vosexitresp.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <sst/core/output.h>
 #include <vector>
 
@@ -56,6 +57,71 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     instPrintBuffer = new char[1024];
     pipelineTrace   = nullptr;
     max_cycle = params.find<uint64_t>("max_cycle", std::numeric_limits<uint64_t>::max());
+
+    // THE WAIT SPAN, the one part of the program whose instruction count belongs to the
+    // machine rather than to the program. Read as text so an address may be written in
+    // hexadecimal, which is how a linker prints one. Equal values are an empty span and are
+    // the default, so a core told neither counts every program instruction as progress.
+    {
+        auto addr = [&](const char* name) {
+            const std::string v = params.find<std::string>(name, "0");
+            return (uint64_t)std::strtoull(v.c_str(), nullptr, 0);
+        };
+        nmfc_wait_start_ = addr("nmfc_wait_start");
+        nmfc_wait_stop_  = addr("nmfc_wait_stop");
+        if ( nmfc_wait_stop_ < nmfc_wait_start_ ) {
+            output->fatal(
+                CALL_INFO, -1,
+                "Error: nmfc_wait_stop (0x%" PRI_ADDR ") is below nmfc_wait_start (0x%" PRI_ADDR
+                "). The two are the ends of one span of the program's own text, in order.\n",
+                nmfc_wait_stop_, nmfc_wait_start_);
+        }
+    }
+    ins_progress_this_cycle = 0;
+    ins_wait_this_cycle     = 0;
+
+    // THE WORK AXIS. The address of the program's own work counter, read as
+    // text so it may be written in hexadecimal, which is how a symbol table
+    // prints one. Zero -- the default -- watches nothing.
+    {
+        const std::string v = params.find<std::string>("nmfc_work_addr", "0");
+        nmfc_work_addr_  = (uint64_t)std::strtoull(v.c_str(), nullptr, 0);
+        nmfc_work_width_ = params.find<uint64_t>("nmfc_work_width", 8);
+        const std::string sv = params.find<std::string>("nmfc_work_start", "0");
+        nmfc_work_start_ = (uint64_t)std::strtoull(sv.c_str(), nullptr, 0);
+        if ( nmfc_work_addr_ != 0 && nmfc_work_width_ != 1 && nmfc_work_width_ != 2
+             && nmfc_work_width_ != 4 && nmfc_work_width_ != 8 ) {
+            output->fatal(
+                CALL_INFO, -1,
+                "Error: nmfc_work_width is %" PRIu64 ". A counter is 1, 2, 4 or 8 bytes wide.\n",
+                nmfc_work_width_);
+        }
+    }
+
+    // THE ARCHITECTURAL STATE OF A PROGRAM ALREADY RUNNING, from a whole-program image.
+    //
+    // Parsed here and applied in startThread(); see restoreImageState(). A list that is
+    // empty -- the default, and what every run not started from an image passes -- leaves
+    // this core exactly as it was. A list that is present but not 32 values long is a
+    // malformed image and is fatal, because a partial register file is a program that
+    // computes something else and says nothing about it.
+    {
+        auto parseRegs = [&](const char* name, std::vector<uint64_t>& into) {
+            const std::string spec = params.find<std::string>(name, "");
+            if ( spec.empty() ) return;
+            size_t pos = 0;
+            while ( pos <= spec.size() ) {
+                const size_t end = std::min(spec.find(',', pos), spec.size());
+                const std::string field = spec.substr(pos, end - pos);
+                if ( !field.empty() ) into.push_back(std::strtoull(field.c_str(), nullptr, 16));
+                if ( end >= spec.size() ) break;
+                pos = end + 1;
+            }
+        };
+        parseRegs("nmfc_image_int", nmfc_image_int);
+        parseRegs("nmfc_image_fp", nmfc_image_fp);
+        nmfc_image_fcsr = params.find<uint32_t>("nmfc_image_fcsr", 0);
+    }
 
     bool found;
     auto nodeId = params.find<int32_t>("node_id", 0, found);
@@ -355,6 +421,10 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     }
 
     lsq->setRegisterFiles(&register_files);
+    // The work counter the queue watches. Given here rather than to the queue's
+    // own parameters so that one core carries one description of the program it
+    // is running: the wait span and the work counter arrive together.
+    lsq->setWorkCounter(nmfc_work_addr_, nmfc_work_width_, nmfc_work_start_);
 
     //////////////////////////////////////////////////////////////////////////////////////
     SubComponentSlotInfo * lists = getSubComponentSlotInfo("rocc");
@@ -466,6 +536,8 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
     // Register statistics ///////////////////////////////////////////////////////
     stat_ins_retired          = registerStatistic<uint64_t>("instructions_retired", "1");
+    stat_ins_progress         = registerStatistic<uint64_t>("instructions_progress", "1");
+    stat_ins_wait             = registerStatistic<uint64_t>("instructions_wait", "1");
     stat_ins_decoded          = registerStatistic<uint64_t>("instructions_decoded", "1");
     stat_ins_issued           = registerStatistic<uint64_t>("instructions_issued", "1");
     stat_loads_issued         = registerStatistic<uint64_t>("loads_issued", "1");
@@ -517,6 +589,14 @@ VANADIS_COMPONENT::startThread(int thr, uint64_t stackStart, uint64_t instructio
 
     thread_decoders[thr]->setStackPointer( issue_isa_tables[thr], register_files[thr], stackStart );
 
+    // The image's registers, if this run was started from one. It goes here, after the
+    // stack-pointer write and before the retire table is synchronised with the issue
+    // table, because this is the one place in the core where architectural registers are
+    // written from outside the instruction stream. The image's x2 is meant to overwrite
+    // the operating system's stack pointer: the image's is the program's own, taken at a
+    // point where the program had already been running.
+    restoreImageState(thr);
+
     // Force retire table to sync with issue table
     retire_isa_tables[thr]->reset(issue_isa_tables[thr]);
 
@@ -530,6 +610,63 @@ VANADIS_COMPONENT::startThread(int thr, uint64_t stackStart, uint64_t instructio
             CALL_INFO, 8, 0, "Utilizing entry point from binary (auto-detected) 0x%" PRI_ADDR "\n",
             thread_decoders[thr]->getInstructionPointer());
     }
+}
+
+void
+VANADIS_COMPONENT::restoreImageState(int thr)
+{
+    if ( nmfc_image_int.empty() && nmfc_image_fp.empty() ) { return; }
+
+    if ( nmfc_image_int.size() != 32 || nmfc_image_fp.size() != 32 ) {
+        output->fatal(
+            CALL_INFO, -1,
+            "Vanadis: a whole-program image was given but carries %zu integer and %zu "
+            "floating-point registers; both must be 32. A partial register file is a "
+            "program that computes something else and does not say so.\n",
+            nmfc_image_int.size(), nmfc_image_fp.size());
+    }
+
+    VanadisRegisterFile* reg_file  = register_files[thr];
+    VanadisISATable*     isa_table = issue_isa_tables[thr];
+
+    // x0 is skipped: it reads as zero by architecture and the image writes it as zero.
+    // The idiom is the core's own checkpoint reader's -- ask the ISA table which physical
+    // register an architectural number maps to, then write that physical register.
+    for ( uint16_t i = 1; i < 32; i++ ) {
+        reg_file->setIntReg<uint64_t>(isa_table->getIntPhysReg(i), nmfc_image_int[i]);
+    }
+    for ( uint16_t i = 0; i < 32; i++ ) {
+        if ( VANADIS_REGISTER_MODE_FP32 == thread_decoders[thr]->getFPRegisterMode() ) {
+            reg_file->setFPReg<uint32_t>(isa_table->getFPPhysReg(i),
+                                         static_cast<uint32_t>(nmfc_image_fp[i]));
+        } else {
+            reg_file->setFPReg<uint64_t>(isa_table->getFPPhysReg(i), nmfc_image_fp[i]);
+        }
+    }
+
+    // The floating-point status is not in the register file. Bits 0-4 of fcsr are the
+    // sticky exception flags in RISC-V order and bits 5-7 are the rounding mode in the
+    // frm encoding, which is the order this enumeration is declared in.
+    VanadisFloatingPointFlags* fpf = fp_flags[thr];
+    fpf->clearInexact(); fpf->clearUnderflow(); fpf->clearOverflow();
+    fpf->clearDivZero(); fpf->clearInvalidOp();
+    if ( nmfc_image_fcsr & 0x01 ) { fpf->setInexact(); }
+    if ( nmfc_image_fcsr & 0x02 ) { fpf->setUnderflow(); }
+    if ( nmfc_image_fcsr & 0x04 ) { fpf->setOverflow(); }
+    if ( nmfc_image_fcsr & 0x08 ) { fpf->setDivZero(); }
+    if ( nmfc_image_fcsr & 0x10 ) { fpf->setInvalidOp(); }
+    switch ( (nmfc_image_fcsr >> 5) & 0x7 ) {
+    case 0: fpf->setRoundingMode(VanadisFPRoundingMode::ROUND_NEAREST); break;
+    case 1: fpf->setRoundingMode(VanadisFPRoundingMode::ROUND_TO_ZERO); break;
+    case 2: fpf->setRoundingMode(VanadisFPRoundingMode::ROUND_DOWN); break;
+    case 3: fpf->setRoundingMode(VanadisFPRoundingMode::ROUND_UP); break;
+    case 4: fpf->setRoundingMode(VanadisFPRoundingMode::ROUND_NEAREST_TO_MAX); break;
+    default: break;   // 7 is "use the instruction's own field"; nothing to set here
+    }
+
+    output->verbose(CALL_INFO, 2, 0,
+        "Vanadis: restored 32 integer and 32 floating-point registers and fcsr 0x%" PRIx32
+        " from a whole-program image on thread %d\n", nmfc_image_fcsr, thr);
 }
 
 void
@@ -1130,6 +1267,12 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
         // accelerator reads inside tick() includes the cycle it is in. See
         // VanadisRoCCInterface::host_insns_retired.
         roccs_[i]->host_insns_retired += ins_retired_this_cycle;
+        roccs_[i]->host_insns_progress += ins_progress_this_cycle;
+        roccs_[i]->host_insns_wait     += ins_wait_this_cycle;
+        // THE WORK COUNTER, published the same way and in the same place. It is
+        // the value the program's committed stores have left in it, not a
+        // difference, so it is assigned and not added to.
+        roccs_[i]->host_work            = lsq->workCounter();
         RoCCResponse* resp;
         if (!(roccs_[i]->isBusy()) && (resp = roccs_[i]->respond())) {
             VanadisInstruction* ins = rocc_queues_[i].front();
@@ -1406,6 +1549,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
             #endif
 
             ins_retired_this_cycle++;
+            countProgress(rob_front);
 
             if ( perform_delay_cleanup )
             {
@@ -1440,6 +1584,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
 			    }
                 #endif
                 ins_retired_this_cycle++;
+                countProgress(delay_ins);
 
                 processWritebacks();
                 delete delay_ins;
@@ -1730,9 +1875,11 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     #endif
 
     stat_cycles->addData(1);
-    ins_issued_this_cycle  = 0;
-    ins_retired_this_cycle = 0;
-    ins_decoded_this_cycle = 0;
+    ins_issued_this_cycle   = 0;
+    ins_retired_this_cycle  = 0;
+    ins_decoded_this_cycle  = 0;
+    ins_progress_this_cycle = 0;
+    ins_wait_this_cycle     = 0;
 
     // Results that landed BETWEEN two cycles -- a cache response, an
     // emulated-OS response -- wake their consumers before anything else
@@ -1839,6 +1986,10 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
 
     // Record how many instructions we retired this cycle
     stat_ins_retired->addData(ins_retired_this_cycle);
+    // ...and how many of them were the program's own instructions, split by whether they
+    // were inside the wait code or outside it. See countProgress().
+    stat_ins_progress->addData(ins_progress_this_cycle);
+    stat_ins_wait->addData(ins_wait_this_cycle);
 
     // Execute
     // //////////////////////////////////////////////////////////////////////////

@@ -87,7 +87,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "stores_in_flight", "Count the number of stores which are in-flight", "operations", 1},
                                     { "store_buffer_entries", "Count the number of stores held in the store buffer", "operations", 1},
                                     { "split_stores", "Count the number of stores which are fractured due to cache boundaries", "operations", 1},
-                                    { "split_loads", "Count the number of loads which are fractured due to cache boundaries", "operations", 1})
+                                    { "split_loads", "Count the number of loads which are fractured due to cache boundaries", "operations", 1},
+                                    { "addr_outside_space", "Count the accesses whose address does not fit address_mask and were therefore faulted rather than sent", "operations", 1})
 
 
         VanadisBasicLoadStoreQueue(ComponentId_t id, Params& params, int coreid, int hwthreads) : VanadisLoadStoreQueue(id, params, coreid, hwthreads),
@@ -128,6 +129,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_stores_pending = registerStatistic<uint64_t>("stores_in_flight", "1");
             stat_loads_pending = registerStatistic<uint64_t>("loads_in_flight", "1");
             stat_op_q_size = registerStatistic<uint64_t>("operations_pending");
+            stat_addr_outside_space = registerStatistic<uint64_t>("addr_outside_space", "1");
         }
 
 
@@ -741,6 +743,40 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             }
             #endif
 
+            // The same refusal on the store side, and here it is never
+            // speculative: a store issues only from the head of the reorder
+            // buffer, so an address outside the space is one the program really
+            // computes. Refusing to send it is what keeps a masked address from
+            // being written to -- the load side dies loudly on a masked address
+            // and the store side would not, it would write the program's bytes
+            // somewhere else and carry on.
+            if( UNLIKELY(! addressFitsSpace(store_address, store_width)) ) {
+                noteAddressOutsideSpace("store", store_ins->getInstructionAddress(), store_address, store_width);
+                store_ins->flagError();
+                // Answering false is what the caller reads as "not issued": it
+                // marks the entry dispatched itself, so the queue does not try
+                // this store again while the core stops on it.
+                return false;
+            }
+
+            // THE WORK COUNTER. This store is committed -- it issues only from
+            // the head of the reorder buffer -- so if it touches the counter the
+            // program keeps its own work in, its bytes are the counter's new
+            // architectural value and are published to the core here. Only a
+            // plain store is counted: a store-conditional may fail, and a
+            // counter written with one would be published before the machine
+            // knew whether it had happened.
+            if( UNLIKELY(storeTouchesWork(store_address, store_width))
+                && (store_ins->getTransactionType() == MEM_TRANSACTION_NONE) ) {
+                std::vector<uint8_t> seen(store_width);
+                uint16_t work_thread, work_reg;
+                getStoreTarget(store_entry, store_ins, &work_thread, &work_reg);
+                registerFiles->at(work_thread)->copyFromRegister(
+                    work_reg, store_ins->getRegisterOffset(), &seen[0], store_width,
+                    store_ins->getValueRegisterType() == STORE_FP_REGISTER);
+                noteWorkStore(store_address, &seen[0], store_width);
+            }
+
             const bool needs_split = operationStraddlesCacheLine(store_address, store_width);
             if(output->getVerboseLevel() >= 8)
             {
@@ -899,6 +935,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 printf("%s() ins_addr=%#" PRIx64 " load_address=%#" PRIx64 " \n",__func__,load_ins->getInstructionAddress(), load_address);
             }
             #endif
+            // An address the address space cannot hold is a fault, not a
+            // request. See addressFitsSpace(). Refused here, before a pending
+            // entry exists, so there is nothing to allocate and nothing to
+            // unwind.
+            if( UNLIKELY(! addressFitsSpace(load_address, load_width)) ) {
+                noteAddressOutsideSpace("load", load_ins->getInstructionAddress(), load_address, load_width);
+                load_ins->flagError();
+                return;
+            }
+
             // do we need to perform a split load (which loads from two cache lines)?
             const bool needs_split = operationStraddlesCacheLine(load_address, load_width);
 
@@ -1310,6 +1356,71 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         }
 
+        // AN ACCESS THAT DOES NOT FIT THE ADDRESS SPACE THIS CORE IS CONFIGURED FOR.
+        //
+        // `address_mask` is this core's declaration of how wide an address is:
+        // a machine whose guests live below 4 GiB is given 0xFFFFFFFF, and the
+        // request this queue builds carries `address & address_mask` while the
+        // queue's own pending entry keeps the address the instruction computed.
+        // For every access the address space can hold those two are the same
+        // number and the mask does nothing.
+        //
+        // For one it cannot hold they are different numbers, and the difference
+        // is not recoverable later: the response comes back carrying the masked
+        // address, the read-response handler subtracts the entry's unmasked one
+        // to find where in the register the bytes belong, the subtraction
+        // underflows to about 2^64, and the run dies with a message about a
+        // register rather than about an address.
+        //
+        // Such an access is a fault, not a request. An out-of-order core runs
+        // instructions from a branch it has predicted and may be wrong about,
+        // so it computes addresses from register values that belong to another
+        // iteration or to no iteration at all -- an index that is a not-visited
+        // sentinel, a pointer read one element past an array -- and a load with
+        // one of those is normal, is squashed when the misprediction is
+        // discovered, and must not decide the outcome of the simulation. A real
+        // machine answers it with a translation fault the squash discards. This
+        // one refuses to send it and flags the instruction, which has exactly
+        // that shape: nothing happens if the instruction is squashed, and the
+        // core stops on it, naming it, if it ever reaches the head of the
+        // reorder buffer and is therefore an access the program really makes.
+        //
+        // The check is on both ends of the access, because an access may begin
+        // inside the space and end outside it.
+        bool addressFitsSpace(uint64_t address, uint64_t width) const
+        {
+            if( 0 == width ) { return true; }
+
+            const uint64_t last = address + width - 1;
+
+            // The access wraps the top of the 64-bit space; no address space
+            // holds it whatever the mask is.
+            if( last < address ) { return false; }
+
+            return ((address & address_mask) == address) && ((last & address_mask) == last);
+        }
+
+        // Said once per core per run, because a program that has one of these
+        // usually has thousands and they are all the same event. The count is
+        // the durable record; this line is so that a reader of the log knows to
+        // go and look at it.
+        void noteAddressOutsideSpace(const char* op, uint64_t ins_addr, uint64_t address, uint64_t width)
+        {
+            stat_addr_outside_space->addData(1);
+
+            if( ! said_addr_outside_space ) {
+                said_addr_outside_space = true;
+                output->verbose(CALL_INFO, 0, 0,
+                    "note: a %s at 0x%" PRI_ADDR " (width %" PRIu64 ") from instruction 0x%" PRI_ADDR
+                    " lies outside the address space this core is configured for (address_mask 0x%"
+                    PRI_ADDR "). It is not sent to memory and the instruction is flagged; if it is a"
+                    " speculated instruction the squash discards it, and if it retires the core stops"
+                    " on it. Further occurrences are counted in the addr_outside_space statistic and"
+                    " not printed.\n",
+                    op, address, width, ins_addr, address_mask);
+            }
+        }
+
         bool operationStraddlesCacheLine(uint64_t address, uint64_t width) const
         {
             const uint64_t cache_line_left  = (address / cache_line_width);
@@ -1388,11 +1499,13 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         uint64_t cache_line_width;
         uint64_t address_mask;
+        bool     said_addr_outside_space = false;
 
         Statistic<uint64_t>* stat_store_buffer_entries;
         Statistic<uint64_t>* stat_op_q_size;
         Statistic<uint64_t>* stat_stores_pending;
         Statistic<uint64_t>* stat_loads_pending;
+        Statistic<uint64_t>* stat_addr_outside_space;
         Statistic<uint64_t>* stat_stores_issued;
         Statistic<uint64_t>* stat_loads_issued;
         Statistic<uint64_t>* stat_fences_issued;

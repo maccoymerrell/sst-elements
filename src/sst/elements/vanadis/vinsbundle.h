@@ -42,8 +42,17 @@ public:
 
     uint32_t getInstructionCount() const { return inst_bundle.size(); }
 
+    // THE BUNDLE KEEPS ITS OWN LAST MICRO-OP MARKED.
+    //
+    // One instruction of the program becomes one bundle, of one micro-op or of
+    // several; the last micro-op in it is the one whose retirement means that
+    // instruction has finished. Maintaining the flag here rather than in each
+    // decoder means it holds for every decoder and for every instruction,
+    // including the ones a decoder builds out of several pieces.
     void addInstruction(VanadisInstruction* newIns) {
+        if ( !inst_bundle.empty() ) { inst_bundle.back()->clearEndOfMicroOpGroup(); }
         inst_bundle.push_back(newIns->clone());
+        inst_bundle.back()->markEndOfMicroOpGroup();
     }
 
     VanadisInstruction* getInstructionByIndex(const uint32_t index) {
