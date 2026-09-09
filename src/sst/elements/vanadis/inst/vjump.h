@@ -36,6 +36,10 @@ public:
     {
 
         takenAddress = pc;
+
+        // An unconditional jump to an address the decode already knows.
+        setBranchClass(VanadisBranchClass::DIRECT_JUMP);
+        setStaticTarget(pc);
     }
 
     VanadisJumpInstruction* clone() override { return new VanadisJumpInstruction(*this); }

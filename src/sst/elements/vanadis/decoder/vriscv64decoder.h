@@ -178,7 +178,46 @@ public:
                             VanadisSpeculatedInstruction* next_spec_ins =
                                 dynamic_cast<VanadisSpeculatedInstruction*>(next_ins);
 
-                            if ( branch_predictor->contains(ip) ) {
+                            if ( branch_predictor->hasDirectionPrediction() ) {
+                                // The unit predicts the taken/not-taken bit as
+                                // well as the address. Everything it needs is
+                                // already in hand: this bundle was decoded on
+                                // an earlier visit to this address, so the
+                                // branch's class and, for a direct branch, its
+                                // target are known before the prediction.
+                                const uint64_t fallthrough = ip + bundle->pcIncrement();
+
+                                VanadisBranchCheckpoint ckpt;
+
+                                const bool taken = branch_predictor->predictDirection(
+                                    ip, next_spec_ins->getBranchClass(), next_spec_ins->getStaticTarget(),
+                                    next_spec_ins->hasStaticTarget(), fallthrough, branch_predictor->contains(ip),
+                                    &ckpt);
+
+                                const uint64_t predicted_address =
+                                    taken ? branch_predictor->predictTarget(
+                                                ip, next_spec_ins->getBranchClass(),
+                                                next_spec_ins->getStaticTarget(), next_spec_ins->hasStaticTarget(),
+                                                fallthrough, &ckpt)
+                                          : fallthrough;
+
+                                // Written before the micro-op is copied into
+                                // the reorder buffer, so the copy carries it.
+                                next_spec_ins->setBranchCheckpoint(ckpt);
+                                next_spec_ins->setSpeculatedAddress(predicted_address);
+
+                                if(output_->getVerboseLevel() >= 16) {
+                                    output_->verbose(
+                                        CALL_INFO, 16, 0,
+                                        "----> contains a branch: 0x%" PRI_ADDR " / direction: %s / "
+                                        "predicted: 0x%" PRI_ADDR "\n",
+                                        ip, taken ? "taken" : "not-taken", predicted_address);
+                                }
+
+                                ip                = predicted_address;
+                                bundle_has_branch = true;
+                            }
+                            else if ( branch_predictor->contains(ip) ) {
                                 // We have an address predicton from the branching unit
                                 const uint64_t predicted_address = branch_predictor->predictAddress(ip);
                                 next_spec_ins->setSpeculatedAddress(predicted_address);

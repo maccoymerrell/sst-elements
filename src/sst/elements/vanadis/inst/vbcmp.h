@@ -36,6 +36,11 @@ public:
     {
         isa_int_regs_in[0] = src_1;
         isa_int_regs_in[1] = src_2;
+
+        // A conditional branch: taken to an offset from its own address, which
+        // the decode already knows, or not taken to the next instruction.
+        setBranchClass(VanadisBranchClass::CONDITIONAL);
+        setStaticTarget(static_cast<uint64_t>(static_cast<int64_t>(addr) + offst));
     }
 
     VanadisBranchRegCompareInstruction* clone() override { return new VanadisBranchRegCompareInstruction(*this); }
@@ -95,6 +100,8 @@ public:
     {
         *compare_result = registerCompare<compare_type, register_format>(
             regFile, this, output, phys_int_regs_in_0, phys_int_regs_in_1);
+
+        setResolvedTaken(*compare_result);
 
         if ( *compare_result ) {
             takenAddress = (uint64_t)(((int64_t)getInstructionAddress()) + offset);

@@ -18,6 +18,7 @@
 
 #include "inst/vdelaytype.h"
 #include "inst/vinst.h"
+#include "vbranch/vbranchcheckpoint.h"
 
 #define VANADIS_SPECULATE_JUMP_ADDR_ADD 4
 
@@ -51,6 +52,37 @@ public:
         takenAddress = UINT64_MAX;
     }
 
+    // What kind of branch this is. Set once by the constructor of the
+    // micro-op, because that is where the register numbers and the immediate
+    // that distinguish a call from a jump from a return are still in hand.
+    VanadisBranchClass getBranchClass() const { return branch_class; }
+    void               setBranchClass(const VanadisBranchClass c) { branch_class = c; }
+
+    // The taken target the decode already knows, for a branch whose target is
+    // an immediate offset from its own address. Not known for a branch through
+    // a register.
+    bool     hasStaticTarget() const { return has_static_target; }
+    uint64_t getStaticTarget() const { return static_target; }
+
+    void setStaticTarget(const uint64_t t)
+    {
+        static_target     = t;
+        has_static_target = true;
+    }
+
+    // The direction the execution actually took, written by the micro-op that
+    // resolves the branch. It is recorded rather than recovered from the next
+    // address, because a taken branch to the fall-through address is a legal
+    // encoding and comparing addresses would call it not-taken.
+    bool resolvedTaken() const { return resolved_taken; }
+    void setResolvedTaken(const bool t) { resolved_taken = t; }
+
+    // The predictor state this branch has to be able to put back. Written by
+    // the decoder before the micro-op is copied into the reorder buffer, so
+    // the copy in the reorder buffer carries it.
+    const VanadisBranchCheckpoint& getBranchCheckpoint() const { return branch_ckpt; }
+    void setBranchCheckpoint(const VanadisBranchCheckpoint& c) { branch_ckpt = c; }
+
     virtual uint64_t getSpeculatedAddress() const { return speculatedAddress; }
     virtual void     setSpeculatedAddress(const uint64_t spec_ad) { speculatedAddress = spec_ad; }
     virtual uint64_t getTakenAddress() const { return takenAddress; }
@@ -81,6 +113,11 @@ protected:
     }
 
     VanadisDelaySlotRequirement delayType;
+    VanadisBranchClass          branch_class      = VanadisBranchClass::CONDITIONAL;
+    bool                        has_static_target = false;
+    bool                        resolved_taken    = true;
+    uint64_t                    static_target     = 0;
+    VanadisBranchCheckpoint     branch_ckpt;
     uint64_t                    speculatedAddress;
     uint64_t                    takenAddress;
     uint64_t                    ins_width;

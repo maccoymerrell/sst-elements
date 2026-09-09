@@ -32,6 +32,13 @@ public:
     {
 
         isa_int_regs_in[0] = jump_to_reg;
+
+        // A jump through a register, with no link register written: a return
+        // when the register it jumps through is a link register, otherwise a
+        // plain indirect jump. The target is not known until it executes.
+        setBranchClass(
+            ((1 == jump_to_reg) || (5 == jump_to_reg)) ? VanadisBranchClass::RETURN
+                                                       : VanadisBranchClass::INDIRECT_JUMP);
     }
 
     VanadisJumpRegInstruction* clone() { return new VanadisJumpRegInstruction(*this); }

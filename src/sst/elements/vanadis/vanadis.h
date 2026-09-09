@@ -324,6 +324,10 @@ public:
                                         "address is retired, set verbose to 0", ""},
         { "pause_when_retire_address", "If specified, the simulation will stop when this address is retired.", "0"},
         { "pipeline_trace_file", "If specified, a trace of the pipeline activity will be generated to this file.", ""},
+        { "branch_trace_file", "If specified, one 24-byte record per retired branch (address, target, class, "
+                               "direction) is written to this file, in program order. Nothing the core computes "
+                               "depends on it.", ""},
+        { "branch_trace_records", "Stop writing the branch trace after this many records. 0 writes all of them.", "0"},
         { "max_cycle", "Maximum number of cycles to execute. The core will halt after this many cycles." , "std::numeric_limits<uint64_t>::max()"},
         // ---- restoring architectural state from a whole-program image ----
         //
@@ -462,7 +466,15 @@ public:
     void handleIncomingInstCacheEvent(StandardMem::Request* ev);
     void recvOSEvent(SST::Event* ev);
 
-    void handleMisspeculate(const uint32_t hw_thr, const uint64_t new_ip);
+    // `repair_predictor` is true everywhere except the branch-misprediction
+    // path, which has already put the branch predictor's speculative history
+    // back from the mispredicting branch's own checkpoint. Every other caller
+    // is a redirect that throws away everything unretired for a reason that is
+    // not a branch -- a thread starting, or resuming after a system call or a
+    // fault -- and for those the architected history is the right one.
+    void handleMisspeculate(const uint32_t hw_thr, const uint64_t new_ip, const bool repair_predictor = true);
+
+    void writeBranchTrace(VanadisSpeculatedInstruction* spec_ins, const bool taken, const uint64_t target);
     void clearROBMisspeculate(const uint32_t hw_thr);
 
     void clearFuncUnit(const uint32_t hw_thr, std::vector<VanadisFunctionalUnit*>& unit);
@@ -673,6 +685,14 @@ private:
     TimeConverter           clock_tc_;
     Clock::HandlerBase*     clock_handler_;
     FILE*           pipelineTrace;
+
+    // The branch trace: one fixed-width record per retired branch, which is
+    // the architected, in-order branch stream. Written only when
+    // `branch_trace_file` names a file, and read only by the predictor's
+    // standalone tests.
+    FILE*           branchTrace;
+    uint64_t        branchTraceLimit;
+    uint64_t        branchTraceCount;
 
     Statistic<uint64_t>* stat_ins_retired;
     Statistic<uint64_t>* stat_ins_progress;

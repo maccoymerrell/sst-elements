@@ -37,6 +37,13 @@ public:
 
         isa_int_regs_out[0] = link_reg;
         takenAddress        = pc;
+
+        // A jump that writes a link register is a call when the link register
+        // is one of the two the calling convention returns through.
+        setBranchClass(
+            ((1 == link_reg) || (5 == link_reg)) ? VanadisBranchClass::DIRECT_CALL
+                                                 : VanadisBranchClass::DIRECT_JUMP);
+        setStaticTarget(pc);
     }
 
     VanadisJumpLinkInstruction* clone() override { return new VanadisJumpLinkInstruction(*this); }

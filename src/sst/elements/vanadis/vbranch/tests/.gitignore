@@ -1,0 +1,7 @@
+# Built by this directory's Makefile.
+refdrive
+refdrive_hp
+portdrive
+out/
+# Unpacked from host_bfs.btrace.gz.
+host_bfs.btrace

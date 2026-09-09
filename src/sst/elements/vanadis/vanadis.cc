@@ -56,6 +56,26 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
     instPrintBuffer = new char[1024];
     pipelineTrace   = nullptr;
+
+    // THE BRANCH TRACE. One fixed-width record per retired branch, in program
+    // order, which is the stream a branch predictor sees when it is driven
+    // from a trace rather than from a machine. Off unless a file is named, and
+    // read-only with respect to the simulated machine: nothing the core does
+    // depends on whether it is on.
+    branchTrace      = nullptr;
+    branchTraceCount = 0;
+    branchTraceLimit = params.find<uint64_t>("branch_trace_records", 0);
+    {
+        const std::string branch_trace_file = params.find<std::string>("branch_trace_file", "");
+        if ( !branch_trace_file.empty() ) {
+            branchTrace = fopen(branch_trace_file.c_str(), "wb");
+            if ( nullptr == branchTrace ) {
+                fprintf(stderr, "vanadis: unable to open branch trace file %s for writing\n",
+                    branch_trace_file.c_str());
+                exit(1);
+            }
+        }
+    }
     max_cycle = params.find<uint64_t>("max_cycle", std::numeric_limits<uint64_t>::max());
 
     // THE WAIT SPAN, the one part of the program whose instruction count belongs to the
@@ -301,6 +321,11 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
             thread_decoders[i]->countISAFPReg()));
 
         thread_decoders[i]->setThreadROB(rob[i]);
+
+        // The predictor keeps one checkpoint per branch it has predicted and
+        // not yet retired. A branch holds one only while it holds a
+        // reorder-buffer entry, so a ring of this depth can never fill.
+        thread_decoders[i]->getBranchPredictor()->setMaxInFlightBranches(rob_count);
 
         // Reserve ISA registers.
         //
@@ -569,6 +594,7 @@ VANADIS_COMPONENT::~VANADIS_COMPONENT()
     }
 
     if ( pipelineTrace != nullptr ) { fclose(pipelineTrace); }
+    if ( branchTrace != nullptr ) { fclose(branchTrace); }
 
 	for( VanadisFloatingPointFlags* next_fp_flags : fp_flags ) {
 		delete next_fp_flags;
@@ -1454,6 +1480,21 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 }
                 }
                 #endif
+                // The direction the execution took, recorded by the micro-op
+                // that resolved it rather than recovered by comparing
+                // addresses, because a taken branch to the fall-through
+                // address is a legal encoding.
+                const bool branch_taken = spec_ins->resolvedTaken();
+
+                if ( UNLIKELY(nullptr != branchTrace) ) { writeBranchTrace(spec_ins, branch_taken, pipeline_reset_addr); }
+
+                // Retire is the only place the core knows how a branch turned
+                // out, and it is program order, so it is where the predictor's
+                // tables are trained and where its architected history moves.
+                thr_decoder->getBranchPredictor()->update(
+                    spec_ins->getInstructionAddress(), spec_ins->getBranchClass(), branch_taken, pipeline_reset_addr,
+                    spec_ins->getBranchCheckpoint());
+
                 thr_decoder->getBranchPredictor()->push(
                 spec_ins->getInstructionAddress(), pipeline_reset_addr);
 
@@ -1628,7 +1669,22 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                         CALL_INFO, 8, 0, "----> perform a pipeline clear thread %" PRIu32 ", reset to address: 0x%" PRI_ADDR "\n",
                         ins_thread, pipeline_reset_addr);
                 #endif
-                handleMisspeculate(ins_thread, pipeline_reset_addr);
+                // Put the predictor's speculative history back to what this
+                // branch found, then replay this branch with the direction and
+                // target it actually took. The reorder-buffer entry is still
+                // alive here, which is what carries the checkpoint.
+                VanadisSpeculatedInstruction* mispredicted = rob_front->asSpeculated();
+
+                if ( nullptr != mispredicted ) {
+                    thr_decoder->getBranchPredictor()->repair(
+                        mispredicted->getBranchCheckpoint(), mispredicted->resolvedTaken(), pipeline_reset_addr);
+                }
+
+                // If there was no checkpoint to repair from, fall back to
+                // discarding everything unretired, so the predictor is never
+                // left carrying speculative state for instructions that no
+                // longer exist.
+                handleMisspeculate(ins_thread, pipeline_reset_addr, nullptr == mispredicted);
                 stat_branch_mispredicts->addData(1);
             }
 
@@ -2559,7 +2615,39 @@ VANADIS_COMPONENT::handleIncomingInstCacheEvent(StandardMem::Request* ev)
 }
 
 void
-VANADIS_COMPONENT::handleMisspeculate(const uint32_t hw_thr, const uint64_t new_ip)
+VANADIS_COMPONENT::writeBranchTrace(VanadisSpeculatedInstruction* spec_ins, const bool taken, const uint64_t target)
+{
+    if ( (branchTraceLimit > 0) && (branchTraceCount >= branchTraceLimit) ) { return; }
+
+    // pc, target, class, direction -- 24 bytes, little-endian, the order the
+    // standalone predictor tests read them in.
+    struct {
+        uint64_t pc;
+        uint64_t target;
+        uint8_t  cls;
+        uint8_t  taken;
+        uint8_t  pad[6];
+    } record;
+
+    record.pc = spec_ins->getInstructionAddress();
+
+    // The target the predictor's history is advanced with: the branch's own
+    // taken target, which for a conditional branch the decode knows whether it
+    // was taken or not, and the address it went to for a branch through a
+    // register.
+    record.target = spec_ins->hasStaticTarget() ? spec_ins->getStaticTarget() : target;
+    record.cls    = static_cast<uint8_t>(spec_ins->getBranchClass());
+    record.taken  = taken ? 1 : 0;
+    for ( int i = 0; i < 6; ++i ) {
+        record.pad[i] = 0;
+    }
+
+    fwrite(&record, sizeof(record), 1, branchTrace);
+    branchTraceCount++;
+}
+
+void
+VANADIS_COMPONENT::handleMisspeculate(const uint32_t hw_thr, const uint64_t new_ip, const bool repair_predictor)
 {
     #ifdef VANADIS_BUILD_DEBUG
     // if(output->getVerboseLevel() >= 8)
@@ -2580,6 +2668,12 @@ VANADIS_COMPONENT::handleMisspeculate(const uint32_t hw_thr, const uint64_t new_
     // Reset the ISA table to get correct ISA to physical mappings
     issue_isa_tables[hw_thr]->reset(retire_isa_tables[hw_thr]);
     thread_decoders[hw_thr]->setInstructionPointerAfterMisspeculate(new_ip);
+
+    if ( repair_predictor ) {
+        // Nothing unretired survives this, so the speculative history the
+        // predictor is carrying has to become the architected one.
+        thread_decoders[hw_thr]->getBranchPredictor()->repairToCommit();
+    }
 
     #ifdef VANADIS_BUILD_DEBUG
     // if(output->getVerboseLevel() >= 8)

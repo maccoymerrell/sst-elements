@@ -38,6 +38,9 @@ public:
     {
         isa_int_regs_in[0]  = src_1;
         isa_int_regs_out[0] = link_reg;
+
+        setBranchClass(VanadisBranchClass::CONDITIONAL);
+        setStaticTarget(static_cast<uint64_t>(static_cast<int64_t>(addr) + offst));
     }
 
     VanadisBranchRegCompareImmLinkInstruction* clone() override
@@ -88,6 +91,7 @@ public:
     {
         *compare_result = registerCompareImm<compareType, register_format>(regFile, this, output, phys_int_regs_in_0, imm_value);
         if ( *compare_result ) {
+            setResolvedTaken(true);
             takenAddress = (uint64_t)(((int64_t)getInstructionAddress()) + offset);
 
             // Update the link address
@@ -98,6 +102,7 @@ public:
 
         }
         else {
+            setResolvedTaken(false);
             takenAddress = calculateStandardNotTakenAddress();
         }
     }

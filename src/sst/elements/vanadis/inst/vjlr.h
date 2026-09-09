@@ -39,6 +39,16 @@ public:
         isa_int_regs_in[0]  = jumpToAddrReg;
         isa_int_regs_out[0] = returnAddrReg;
         imm = imm_jump;
+
+        // A jump through a register that also writes a link register. Writing
+        // one of the two link registers makes it a call; writing none of them
+        // while jumping through one, with no displacement, makes it a return.
+        const bool links   = (1 == returnAddrReg) || (5 == returnAddrReg);
+        const bool through = (1 == jumpToAddrReg) || (5 == jumpToAddrReg);
+
+        if ( links ) { setBranchClass(VanadisBranchClass::INDIRECT_CALL); }
+        else if ( through && (0 == imm_jump) ) { setBranchClass(VanadisBranchClass::RETURN); }
+        else { setBranchClass(VanadisBranchClass::INDIRECT_JUMP); }
     }
 
     VanadisJumpRegLinkInstruction* clone() { return new VanadisJumpRegLinkInstruction(*this); }

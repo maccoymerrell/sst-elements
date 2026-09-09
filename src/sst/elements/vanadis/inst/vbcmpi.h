@@ -36,6 +36,9 @@ public:
         offset(offst)
     {
         isa_int_regs_in[0] = src_1;
+
+        setBranchClass(VanadisBranchClass::CONDITIONAL);
+        setStaticTarget(static_cast<uint64_t>(static_cast<int64_t>(addr) + offst));
     }
 
     VanadisBranchRegCompareImmInstruction* clone() override { return new VanadisBranchRegCompareImmInstruction(*this); }
@@ -78,10 +81,12 @@ public:
             const int64_t instruction_address = getInstructionAddress();
             const int64_t ins_addr_and_offset = instruction_address + offset;
 
+            setResolvedTaken(true);
             takenAddress = static_cast<uint64_t>(ins_addr_and_offset);
 
         }
         else {
+            setResolvedTaken(false);
             takenAddress = calculateStandardNotTakenAddress();
         }
     }

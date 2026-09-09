@@ -34,6 +34,9 @@ public:
         offset(offst)
     {
         isa_fp_regs_in[0] = cond_reg;
+
+        setBranchClass(VanadisBranchClass::CONDITIONAL);
+        setStaticTarget(static_cast<uint64_t>(static_cast<int64_t>(addr) + offst));
     }
 
     VanadisBranchFPInstruction* clone() override { return new VanadisBranchFPInstruction(*this); }
@@ -73,9 +76,11 @@ public:
         *compare_result = ((fp_cond_val & 0x800000) == (branch_on_true ? 0x800000 : 0));
 
         if ( *compare_result ) {
+            setResolvedTaken(true);
             takenAddress = (uint64_t)(((int64_t)getInstructionAddress()) + offset);
         }
         else {
+            setResolvedTaken(false);
             takenAddress = calculateStandardNotTakenAddress();
         }
     }

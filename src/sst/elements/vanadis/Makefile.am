@@ -126,6 +126,14 @@ util/vtypename.h \
 vanadis.h \
 vanadisDbgFlags.h \
 vbranch/vbranchbasic.h \
+vbranch/vbranchbtb.h \
+vbranch/vbranchcheckpoint.h \
+vbranch/vbranchperceptron.h \
+vbranch/vbranchperceptron.cc \
+vbranch/vbranchspeccore.h \
+vbranch/vbranchspecunit.h \
+vbranch/vbranchtagescl.h \
+vbranch/vbranchtagescl.cc \
 vbranch/vbranchunit.h \
 velf/velfinfo.h \
 vfpflags.h \
