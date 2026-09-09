@@ -76,14 +76,53 @@ enum VanadisSchedClass {
     VSC_ROCC      = 6,
     VSC_SYSCALL   = 7,
     VSC_IMMEDIATE = 8,
-    VSC_COUNT     = 9
+    VSC_INT_MUL   = 9,
+    VSC_COUNT     = 10
 };
+
+// THE ISSUE QUEUES, WHICH ARE NOT THE SAME THING AS THE UNIT CLASSES.
+//
+// A unit class is a group of units contended for in the same cycle. An issue
+// queue is a STRUCTURE with a SIZE: dispatch puts an instruction into one and
+// stalls when it is full, and the entry is given back when the instruction
+// issues. Published cores have four of them worth naming -- integer, floating
+// point, memory and branch -- and several unit classes share each: integer
+// arithmetic, multiply and divide all wait in the integer queue.
+//
+// The remaining classes (a coprocessor instruction, a system call, and the
+// instructions that complete at issue and take no unit at all) are given no
+// queue: each of them is selectable only under a condition far tighter than any
+// capacity, so a bound on them would never be the thing that stalled dispatch.
+enum VanadisSchedQueue {
+    VSQ_INTEGER = 0,
+    VSQ_FP      = 1,
+    VSQ_MEMORY  = 2,
+    VSQ_BRANCH  = 3,
+    VSQ_NONE    = 4,
+    VSQ_COUNT   = 5
+};
+
+inline uint8_t
+vanadisSchedQueueOf(const uint8_t cls)
+{
+    switch ( cls ) {
+    case VSC_INT_ARITH:
+    case VSC_INT_DIV:
+    case VSC_INT_MUL:  return VSQ_INTEGER;
+    case VSC_FP_ARITH:
+    case VSC_FP_DIV:   return VSQ_FP;
+    case VSC_MEMORY:   return VSQ_MEMORY;
+    case VSC_BRANCH:   return VSQ_BRANCH;
+    default:           return VSQ_NONE;
+    }
+}
 
 inline uint8_t
 vanadisSchedClassOf(const VanadisFunctionalUnitType t)
 {
     switch ( t ) {
     case INST_INT_ARITH: return VSC_INT_ARITH;
+    case INST_INT_MUL:   return VSC_INT_MUL;
     case INST_INT_DIV:   return VSC_INT_DIV;
     case INST_FP_ARITH:  return VSC_FP_ARITH;
     case INST_FP_DIV:    return VSC_FP_DIV;
@@ -180,8 +219,10 @@ public:
 
     VanadisIssueScheduler() :
         rob_slots_(0), words_(0), nonempty_(0), blocked_(0), renamed_count_(0),
-        coproc_dispatched_(0), coproc_executed_(0), syscall_barrier_(false)
-    {}
+        coproc_dispatched_(0), coproc_executed_(0), syscall_barrier_(false), bounded_(false)
+    {
+        for ( int q = 0; q < VSQ_COUNT; ++q ) { q_occ_[q] = 0; q_limit_[q] = 0; }
+    }
 
     void configure(const uint32_t rob_slots, const uint16_t int_phys, const uint16_t fp_phys)
     {
@@ -206,6 +247,8 @@ public:
         std::fill(int_waiter_.begin(), int_waiter_.end(), NO_SLOT);
         std::fill(fp_waiter_.begin(), fp_waiter_.end(), NO_SLOT);
 
+        for ( int q = 0; q < VSQ_COUNT; ++q ) { q_occ_[q] = 0; }
+
         nonempty_          = 0;
         blocked_           = 0;
         renamed_count_     = 0;
@@ -214,6 +257,40 @@ public:
         syscall_barrier_   = false;
         mem_order_.clear();
     }
+
+    // THE ISSUE QUEUES. An instruction takes an entry of its queue when it is
+    // dispatched and gives it back when it issues; dispatch stops while the
+    // queue it needs is full. `bounded_` false leaves every queue unbounded,
+    // which is the machine as it was: the scheduling window was the whole
+    // reorder buffer and nothing but the buffer's own size limited it.
+    void setQueueLimits(const bool bounded, const uint32_t integer, const uint32_t fp,
+                        const uint32_t memory, const uint32_t branch)
+    {
+        bounded_          = bounded;
+        q_limit_[VSQ_INTEGER] = integer;
+        q_limit_[VSQ_FP]      = fp;
+        q_limit_[VSQ_MEMORY]  = memory;
+        q_limit_[VSQ_BRANCH]  = branch;
+        q_limit_[VSQ_NONE]    = 0;
+    }
+
+    bool queueFull(const uint8_t queue) const
+    {
+        if ( !bounded_ || (VSQ_NONE == queue) ) { return false; }
+        return q_occ_[queue] >= q_limit_[queue];
+    }
+
+    void takeQueue(const uint8_t queue)
+    {
+        if ( VSQ_NONE != queue ) { q_occ_[queue]++; }
+    }
+
+    void releaseQueue(const uint8_t queue)
+    {
+        if ( (VSQ_NONE != queue) && (q_occ_[queue] > 0) ) { q_occ_[queue]--; }
+    }
+
+    uint32_t queueOccupancy(const uint8_t queue) const { return q_occ_[queue]; }
 
     void markReady(const uint8_t cls, const uint16_t slot)
     {
@@ -279,6 +356,10 @@ public:
     uint32_t coproc_executed_;
 
     bool     syscall_barrier_;
+
+    bool     bounded_;
+    uint32_t q_occ_[VSQ_COUNT];
+    uint32_t q_limit_[VSQ_COUNT];
 
 private:
     // The first set bit in [from, to), or -1.
@@ -435,6 +516,14 @@ public:
         { "physical_fp_registers", "Number of physical floating point registers per hardware thread", "128" },
         { "integer_arith_units", "Number of integer arithemetic units", "2" },
         { "integer_arith_cycles", "Cycles per instruction for integer arithmetic", "2" },
+        { "integer_mul_units", "Number of integer multiply units. Zen 4 multiplies on one of its four integer pipes.", "1" },
+        { "integer_mul_cycles", "Cycles per 64-bit integer multiply. Zen 4: 3, fully pipelined; Neoverse V2: 2 for MUL, 3 for SMULH.", "3" },
+        { "integer_mul_unit_enable", "1 gives multiply a unit class of its own with the count and latency above. 0 routes multiplies to the integer arithmetic units at the integer arithmetic latency, which is what this core did before the class existed.", "1" },
+        { "scheduler_bounded", "1 gives each class of instruction a bounded issue queue: dispatch stalls when the queue an instruction needs is full, and the entry is given back when it issues. 0 leaves the scheduling window equal to the whole reorder buffer, which is what this core did before.", "1" },
+        { "int_issue_queue_entries", "Entries in the integer issue queue (integer arithmetic, multiply and divide). Golden Cove's math scheduler holds 97; Zen 4's four integer schedulers hold 24 each.", "97" },
+        { "fp_issue_queue_entries", "Entries in the floating-point issue queue. Zen 4's floating-point scheduler is 2 x 32 macro-ops.", "64" },
+        { "mem_issue_queue_entries", "Entries in the memory issue queue. Golden Cove's load and store schedulers hold 70 and 38.", "108" },
+        { "branch_issue_queue_entries", "Entries in the branch issue queue. No reference core publishes a scheduler dedicated to branches -- on both x86 references branches are scheduled from the integer scheduler -- so the default is the integer queue's size.", "97" },
         { "integer_div_units", "Number of integer division units", "1" },
         { "integer_div_cycles", "Cycles per instruction for integer division", "4" },
         { "fp_arith_units", "Number of floating point arithmetic units", "2" },
@@ -464,6 +553,11 @@ public:
           "components",
           "cycles", 1 },
         { "rob_slots_in_use", "Number of micro-ops in the ROB each cycle", "instructions", 1 },
+        { "sched_full_int", "Cycles dispatch stalled because the integer issue queue was full", "cycles", 1 },
+        { "sched_full_fp", "Cycles dispatch stalled because the floating-point issue queue was full", "cycles", 1 },
+        { "sched_full_mem", "Cycles dispatch stalled because the memory issue queue was full", "cycles", 1 },
+        { "sched_full_branch", "Cycles dispatch stalled because the branch issue queue was full", "cycles", 1 },
+        { "agu_stalls", "Cycles a memory instruction was ready but no address-generation unit or port of its kind was free", "cycles", 1 },
         { "rob_cleared_entries", "Number of micro-ops that are cleared during a pipeline clear", "instructions", 1 },
         { "instructions_issued", "Number of instructions issued", "instructions", 1 },
         { "instructions_retired", "Number of instructions retired", "instructions", 1 },
@@ -599,6 +693,14 @@ private:
     int  performRetire(int rob_num, VanadisCircularQueue<VanadisInstruction*>* rob, const uint64_t cycle);
     int  allocateFunctionalUnit(VanadisInstruction* ins);
     bool mapInstructiontoFunctionalUnit(VanadisInstruction* ins, std::vector<VanadisFunctionalUnit*>& functional_units);
+
+    /// Whether a load or a store may be handed to the load/store queue this
+    /// cycle: an address-generation unit and a port of its kind are free, and
+    /// nothing whose order matters is between the two.
+    bool memoryOperationMayGo(VanadisInstruction* ins, const bool is_store);
+
+    /// Hand it over, through address generation when that is modelled.
+    void handOverMemoryOperation(VanadisInstruction* ins);
     void printRob(int rob_num, VanadisCircularQueue<VanadisInstruction*>* rob);
 
     bool checkVerboseAddr( uint64_t addr ) {
@@ -667,6 +769,7 @@ private:
 
 
     std::vector<VanadisFunctionalUnit*> fu_int_arith;
+    std::vector<VanadisFunctionalUnit*> fu_int_mul;
     std::vector<VanadisFunctionalUnit*> fu_int_div;
     std::vector<VanadisFunctionalUnit*> fu_branch;
     std::vector<VanadisFunctionalUnit*> fu_fp_arith;
@@ -698,6 +801,13 @@ private:
     // holds is dead -- so the bits start set and are cleared only when a
     // register is popped to hold a value that has not been computed yet.
     std::vector<VanadisIssueScheduler> sched;
+
+    /// Whether multiply has a unit class of its own. When it does not, a
+    /// multiply is scheduled and executed exactly as an integer addition is.
+    bool mul_unit_enabled_;
+
+    Statistic<uint64_t>* stat_sched_full[VSQ_COUNT];
+    Statistic<uint64_t>* stat_agu_stalls;
     std::vector<uint64_t>              int_phys_ready;
     std::vector<uint64_t>              fp_phys_ready;
 

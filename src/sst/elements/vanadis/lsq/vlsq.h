@@ -23,6 +23,7 @@
 #include "inst/vfence.h"
 #include "inst/vload.h"
 #include "inst/vstore.h"
+#include "vtlb.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -179,6 +180,46 @@ public:
     virtual void commit(VanadisInstruction* ins) {}
     virtual void noteReplay(VanadisInstruction* ins) {}
     virtual void resetPredictors(const uint32_t thread) {}
+
+    // ---- ADDRESS GENERATION, MEMORY PORTS AND TRANSLATION ------------------
+    //
+    // A memory instruction does not step straight from the scheduler into this
+    // queue in a real core: an address-generation unit computes its effective
+    // address first, which occupies one of a small number of such units for a
+    // cycle, and the operation then enters the memory pipeline through a load
+    // port or a store port, of which there are separately a few. A queue that
+    // models none of this answers false to aguEnabled() and the core hands it
+    // instructions exactly as it always did.
+    //
+    // aguEnabled()       whether this queue models address generation at all.
+    // aguAvailable()     an address-generation unit AND a port of the right
+    //                    kind are free this cycle.
+    // aguPipeEmpty()     nothing is between address generation and the queue.
+    //                    An ordering instruction -- a fence, a load-linked, a
+    //                    store-conditional, a locked access -- is handed over
+    //                    only when this is true, and nothing is handed over
+    //                    while an ordering instruction is in there, which is
+    //                    what keeps a one-cycle pipeline from reordering the
+    //                    instructions whose whole purpose is their order.
+    // pushViaAGU()       hand the instruction to address generation. It reaches
+    //                    the queue proper a configured number of cycles later,
+    //                    and not until its translation is in hand.
+    virtual bool aguEnabled() const { return false; }
+    virtual bool aguAvailable(const bool is_store) const { return true; }
+    virtual bool aguPipeEmpty() const { return true; }
+    virtual bool aguOrderedInPipe() const { return false; }
+    virtual void pushViaAGU(VanadisInstruction* ins, const uint64_t cycle) {}
+
+    /// A thread's window has been thrown away and its instructions are about to
+    /// be deleted, so nothing in address generation may still point at one.
+    /// Called wherever the reorder buffer is emptied, including the paths that
+    /// do not otherwise touch this queue.
+    virtual void dropAGUByThreadID(const uint32_t thread) {}
+
+    /// The host's translation path, or nullptr when this queue has none. It is
+    /// shared: the instruction side asks the same unit, because the second-level
+    /// buffer and the walkers are shared structures on every reference core.
+    virtual VanadisTLBUnit* tlb() { return nullptr; }
 
     virtual void tick(uint64_t cycle) = 0;
     virtual void clearLSQByThreadID(const uint32_t thread) = 0;

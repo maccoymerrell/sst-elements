@@ -411,9 +411,20 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
             rob_count, (uint32_t)VanadisIssueScheduler::NO_SLOT - 1);
     }
 
+    // THE ISSUE QUEUES ARE BOUNDED. Published cores hold roughly a hundred
+    // instructions per scheduler, not a reorder buffer's worth: the window this
+    // stage selects out of is a structure with a size, and dispatch stops when
+    // the one an instruction needs is full.
+    const bool     sched_bounded   = params.find<bool>("scheduler_bounded", true);
+    const uint32_t int_queue       = params.find<uint32_t>("int_issue_queue_entries", 97);
+    const uint32_t fp_queue        = params.find<uint32_t>("fp_issue_queue_entries", 64);
+    const uint32_t mem_queue       = params.find<uint32_t>("mem_issue_queue_entries", 108);
+    const uint32_t branch_queue    = params.find<uint32_t>("branch_issue_queue_entries", 97);
+
     sched.resize(hw_threads);
     for ( uint32_t i = 0; i < hw_threads; ++i ) {
         sched[i].configure(rob_count, int_reg_count, fp_reg_count);
+        sched[i].setQueueLimits(sched_bounded, int_queue, fp_queue, mem_queue, branch_queue);
     }
     writeback_q.reserve(64);
 
@@ -446,6 +457,13 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     }
 
     lsq->setRegisterFiles(&register_files);
+
+    // The instruction side asks the same translation path the data side does:
+    // the second-level buffer and the walkers are shared structures on every
+    // reference core, so there is one of each here too.
+    for ( uint32_t i = 0; i < thread_decoders.size(); ++i ) {
+        thread_decoders[i]->getInstructionLoader()->setTLB(lsq->tlb());
+    }
     // The work counter the queue watches. Given here rather than to the queue's
     // own parameters so that one core carries one description of the program it
     // is running: the wait span and the work counter arrive together.
@@ -474,6 +492,25 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
 
     for ( uint16_t i = 0; i < int_arith_units; ++i ) {
         fu_int_arith.push_back(new VanadisFunctionalUnit(fu_id++, INST_INT_ARITH, int_arith_cycles));
+    }
+
+    // INTEGER MULTIPLY IS NOT AN ADDITION. Until this class existed a multiply
+    // was routed to the integer arithmetic units and cost their latency -- one
+    // cycle on this configuration, against the three AMD documents for Zen 4.
+    // With the class turned off the routing is exactly what it was.
+    mul_unit_enabled_ = params.find<bool>("integer_mul_unit_enable", true);
+
+    const uint16_t int_mul_units  = params.find<uint16_t>("integer_mul_units", 1);
+    const uint16_t int_mul_cycles = params.find<uint16_t>("integer_mul_cycles", 3);
+
+    if ( mul_unit_enabled_ ) {
+        output->verbose(
+            CALL_INFO, 2, 0, "Creating %" PRIu16 " integer multiply units, latency = %" PRIu16 "...\n", int_mul_units,
+            int_mul_cycles);
+
+        for ( uint16_t i = 0; i < int_mul_units; ++i ) {
+            fu_int_mul.push_back(new VanadisFunctionalUnit(fu_id++, INST_INT_MUL, int_mul_cycles));
+        }
     }
 
     const uint16_t int_div_units  = params.find<uint16_t>("integer_div_units", 1);
@@ -571,6 +608,12 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     stat_branches             = registerStatistic<uint64_t>("branches", "1");
     stat_cycles               = registerStatistic<uint64_t>("cycles", "1");
     stat_rob_entries          = registerStatistic<uint64_t>("rob_slots_in_use", "1");
+    stat_sched_full[VSQ_INTEGER] = registerStatistic<uint64_t>("sched_full_int", "1");
+    stat_sched_full[VSQ_FP]      = registerStatistic<uint64_t>("sched_full_fp", "1");
+    stat_sched_full[VSQ_MEMORY]  = registerStatistic<uint64_t>("sched_full_mem", "1");
+    stat_sched_full[VSQ_BRANCH]  = registerStatistic<uint64_t>("sched_full_branch", "1");
+    stat_sched_full[VSQ_NONE]    = nullptr;
+    stat_agu_stalls              = registerStatistic<uint64_t>("agu_stalls", "1");
     stat_rob_cleared_entries  = registerStatistic<uint64_t>("rob_cleared_entries", "1");
     stat_syscall_cycles       = registerStatistic<uint64_t>("syscall-cycles", "1");
     stat_int_phys_regs_in_use = registerStatistic<uint64_t>("phys_int_reg_in_use", "1");
@@ -1203,6 +1246,7 @@ VANADIS_COMPONENT::selectAndIssue(const uint32_t hw_thr)
         }
 
         s.clearReady(best_cls, best);
+        s.releaseQueue(vanadisSchedQueueOf(best_cls));
 
         if ( VSC_MEMORY == best_cls ) {
             // The entry is marked rather than removed, because the one selected
@@ -1260,6 +1304,18 @@ VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
 
     const VanadisFunctionalUnitType ins_type = ins->getInstFuncType();
 
+    // THE ISSUE QUEUE THIS INSTRUCTION WILL WAIT IN. Dispatch is in program
+    // order, so a full queue stops the whole stage and not merely this
+    // instruction -- which is what a real dispatch stall is.
+    uint8_t       ins_cls   = vanadisSchedClassOf(ins_type);
+    if ( (VSC_INT_MUL == ins_cls) && !mul_unit_enabled_ ) { ins_cls = VSC_INT_ARITH; }
+    const uint8_t ins_queue = vanadisSchedQueueOf(ins_cls);
+
+    if ( UNLIKELY(s.queueFull(ins_queue)) ) {
+        stat_sched_full[ins_queue]->addData(1);
+        return false;
+    }
+
     // THE LOAD/STORE QUEUE SLOT IS TAKEN HERE when the queue is a speculative
     // one, so the room for it has to be found here too. A load can only be told
     // to wait for an older store whose address is unknown if that store already
@@ -1290,7 +1346,9 @@ VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
     ins->markRenamed();
 
     const uint16_t uslot = static_cast<uint16_t>(slot);
-    const uint8_t  cls   = vanadisSchedClassOf(ins_type);
+    const uint8_t  cls   = ins_cls;
+
+    s.takeQueue(ins_queue);
 
     s.slot_class_[uslot] = cls;
     s.wait_next_[uslot]  = VanadisIssueScheduler::NO_SLOT;
@@ -1341,6 +1399,10 @@ VANADIS_COMPONENT::dropSchedulerState(const uint32_t hw_thr)
         writeback_q.resize(keep);
     }
 
+    // Address generation holds raw pointers to instructions of this thread too,
+    // and this is the one place every path that empties the buffer goes through.
+    if ( nullptr != lsq ) { lsq->dropAGUByThreadID(hw_thr); }
+
     sched[hw_thr].clear();
 }
 
@@ -1360,6 +1422,10 @@ VANADIS_COMPONENT::performExecute(const uint64_t cycle)
         if(verbose_level >= 16)
             next_fu->print(output);
         #endif
+    }
+
+    for ( VanadisFunctionalUnit* next_fu : fu_int_mul ) {
+        next_fu->tick(cycle, output, register_files);
     }
 
     for ( VanadisFunctionalUnit* next_fu : fu_int_div ) {
@@ -1964,6 +2030,36 @@ VANADIS_COMPONENT::mapInstructiontoFunctionalUnit(
     return allocated;
 }
 
+// ADDRESS GENERATION IS A RESOURCE. A load or a store may be handed to the
+// load/store queue only when an address-generation unit and a port of its own
+// kind are free this cycle, and only when nothing whose order matters is still
+// in the one-cycle pipeline between the two.
+bool
+VANADIS_COMPONENT::memoryOperationMayGo(VanadisInstruction* ins, const bool is_store)
+{
+    if ( !lsq->aguEnabled() ) { return true; }
+
+    // Nothing may pass an ordering instruction that has not reached the queue,
+    // and an ordering instruction goes only when everything older has.
+    if ( lsq->aguOrderedInPipe() ) { return false; }
+    if ( vanadisMemOpIsOrdered(ins) && !lsq->aguPipeEmpty() ) { return false; }
+
+    if ( !lsq->aguAvailable(is_store) ) {
+        stat_agu_stalls->addData(1);
+        return false;
+    }
+
+    return true;
+}
+
+void
+VANADIS_COMPONENT::handOverMemoryOperation(VanadisInstruction* ins)
+{
+    if ( lsq->aguEnabled() ) { lsq->pushViaAGU(ins, current_cycle); }
+    else if ( INST_STORE == ins->getInstFuncType() ) { lsq->push(ins->asStore()); }
+    else { lsq->push(ins->asLoad()); }
+}
+
 int
 VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
 {
@@ -1972,6 +2068,12 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
     switch ( ins->getInstFuncType() ) {
     case INST_INT_ARITH:
         allocated_fu = mapInstructiontoFunctionalUnit(ins, fu_int_arith);
+        break;
+
+    case INST_INT_MUL:
+        // With the multiply class turned off a multiply takes an integer
+        // arithmetic unit and its latency, which is where it always went.
+        allocated_fu = mapInstructiontoFunctionalUnit(ins, mul_unit_enabled_ ? fu_int_mul : fu_int_arith);
         break;
 
     case INST_ROCC0:
@@ -2003,16 +2105,18 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
         // The speculative queue took this load's slot when it was renamed, so
         // there is nothing left to ask for here.
         if ( lsq->speculative() || !lsq->loadFull() ) {
+            if ( !memoryOperationMayGo(ins, false) ) { break; }
             stat_loads_issued->addData(1);
-            lsq->push(ins->asLoad());
+            handOverMemoryOperation(ins);
             allocated_fu = true;
         }
         break;
 
     case INST_STORE:
         if ( lsq->speculative() || !lsq->storeFull() ) {
+            if ( !memoryOperationMayGo(ins, true) ) { break; }
             stat_stores_issued->addData(1);
-            lsq->push(ins->asStore());
+            handOverMemoryOperation(ins);
             allocated_fu = true;
         }
         break;
@@ -2050,12 +2154,16 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
                 ins->getInstructionAddress(), ins->getHWThread());
         }
 
+        // A fence needs no address generated, but it does need everything
+        // older to have left address generation first.
+        if ( lsq->aguEnabled() && !lsq->aguPipeEmpty() ) { break; }
+
         lsq->push(fence_ins);
         allocated_fu = true;
     } break;
 
     case INST_SYSCALL:
-        if ( lsq->storeBufferSize() == 0 && lsq->loadSize() == 0 ) {
+        if ( lsq->storeBufferSize() == 0 && lsq->loadSize() == 0 && lsq->aguPipeEmpty() ) {
             allocated_fu = true;
         }
         break;
@@ -2812,6 +2920,7 @@ VANADIS_COMPONENT::handleMisspeculate(const uint32_t hw_thr, const uint64_t new_
     }
     #endif
     clearFuncUnit(hw_thr, fu_int_arith);
+    clearFuncUnit(hw_thr, fu_int_mul);
     clearFuncUnit(hw_thr, fu_int_div);
     clearFuncUnit(hw_thr, fu_fp_arith);
     clearFuncUnit(hw_thr, fu_fp_div);

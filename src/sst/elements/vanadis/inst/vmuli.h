@@ -39,7 +39,7 @@ public:
 
     VanadisMultiplyImmInstruction* clone() override { return new VanadisMultiplyImmInstruction(*this); }
 
-    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_ARITH; }
+    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_MUL; }
     const char*               getInstCode() const override { return "MULI"; }
 
     void printToBuffer(char* buffer, size_t buffer_size) override

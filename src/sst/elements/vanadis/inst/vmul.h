@@ -38,7 +38,7 @@ public:
 
     VanadisMultiplyInstruction* clone() override { return new VanadisMultiplyInstruction(*this); }
 
-    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_ARITH; }
+    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_MUL; }
     const char*               getInstCode() const override
 	 {
 			if(sizeof(gpr_format) == 8) {

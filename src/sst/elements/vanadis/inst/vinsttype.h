@@ -35,7 +35,12 @@ enum VanadisFunctionalUnitType {
     INST_ROCC0,
     INST_ROCC1,
     INST_ROCC2,
-    INST_ROCC3
+    INST_ROCC3,
+    // INTEGER MULTIPLY IS NOT AN ADDITION. It is appended here, after every
+    // existing enumerator, because the coprocessor classes are subtracted from
+    // one another to obtain an interface index and inserting anything ahead of
+    // them would renumber that.
+    INST_INT_MUL
 };
 
 inline const char*
@@ -46,6 +51,8 @@ funcTypeToString(VanadisFunctionalUnitType unit_type)
         return "INT_ARITH";
     case INST_INT_DIV:
         return "INT_DIV";
+    case INST_INT_MUL:
+        return "INT_MUL";
     case INST_FP_ARITH:
         return "FP_ARITH";
     case INST_FP_DIV:

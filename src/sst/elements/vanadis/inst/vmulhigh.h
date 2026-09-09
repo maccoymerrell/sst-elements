@@ -40,7 +40,7 @@ public:
 
     VanadisMultiplyHighInstruction* clone() override { return new VanadisMultiplyHighInstruction(*this); }
 
-    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_ARITH; }
+    VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_MUL; }
 
     const char*               getInstCode() const override
     {

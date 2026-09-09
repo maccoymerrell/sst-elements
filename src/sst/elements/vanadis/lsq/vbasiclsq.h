@@ -112,7 +112,26 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: counter (a two-bit counter per load address), store_pc (the store that last made this load flush), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "counter"},
                 { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
                 { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
-                { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"}
+                { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"},
+                { "agu_enable", "1 models address generation: a memory operation takes an address-generation unit and a load or store port before it reaches this queue, and it reaches it agu_cycles later. 0 is the machine as it was, in which a memory operation stepped from the scheduler straight into the queue.", "1"},
+                { "agu_units", "Address-generation units. Zen 4 has three; Golden Cove generates addresses for three loads and two stores per cycle.", "3"},
+                { "agu_cycles", "Cycles address generation takes before the operation reaches the queue.", "1"},
+                { "load_ports", "Loads that may enter the memory pipeline per cycle. Golden Cove: three.", "3"},
+                { "store_ports", "Stores that may enter the memory pipeline per cycle. Golden Cove: two; Zen 4: at most two of its three memory operations may be stores.", "2"},
+                { "tlb_enable", "1 charges for address translation: a first-level buffer on each side, a shared second level, and a hardware walker whose cost is its page-table reads through the cache hierarchy. 0 leaves translation free, as it was.", "1"},
+                { "tlb_l1i_entries", "First-level instruction TLB entries. Neoverse V2: 48.", "48"},
+                { "tlb_l1i_ways", "First-level instruction TLB associativity. 0 or the entry count means fully associative.", "48"},
+                { "tlb_l1d_entries", "First-level data TLB entries. Neoverse V2: 48, fully associative.", "48"},
+                { "tlb_l1d_ways", "First-level data TLB associativity.", "48"},
+                { "tlb_l2_entries", "Shared second-level TLB entries. Neoverse V2: 2048.", "2048"},
+                { "tlb_l2_ways", "Shared second-level TLB associativity. Neoverse V2: 8-way.", "8"},
+                { "tlb_l1_hit_cycles", "Cycles a first-level TLB hit adds. Zero: the lookup is inside the first-level cache access already charged for.", "0"},
+                { "tlb_l2_hit_cycles", "Cycles a second-level TLB access adds. Neoverse V2: 5.", "5"},
+                { "tlb_walk_levels", "Memory accesses one page-table walk makes. RISC-V Sv39 with 4 KiB pages: three.", "3"},
+                { "tlb_walkers", "Page-table walks that may be outstanding at once.", "2"},
+                { "tlb_page_size", "Page size the translation covers.", "4096"},
+                { "tlb_page_table_root", "Physical address of the modelled page table's root page. The walker reads real addresses here so that its accesses cost what they cost; nothing reads their contents.", "4026531840"},
+                { "tlb_arena_pages", "Pages the modelled page table is wrapped into, so a walk can never address outside physical memory.", "4096"}
             )
 
         SST_ELI_DOCUMENT_STATISTICS({ "bytes_read", "Count all the bytes read for data operations", "bytes", 1 },
@@ -134,7 +153,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "mem_loads_forwarded", "Count the loads answered out of an older store's bytes, with no request sent to memory", "operations", 1},
                                     { "mem_violations", "Count the loads an older store resolved onto after they had already read", "operations", 1},
                                     { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
-                                    { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1})
+                                    { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1},
+                                    { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},
+                                    { "tlb_l1d_hits", "Count the data accesses whose translation was in the first-level data TLB", "operations", 1},
+                                    { "tlb_l1d_misses", "Count the data accesses whose translation was not", "operations", 1},
+                                    { "tlb_l1i_hits", "Count the instruction fetches whose translation was in the first-level instruction TLB", "operations", 1},
+                                    { "tlb_l1i_misses", "Count the instruction fetches whose translation was not", "operations", 1},
+                                    { "tlb_l2_hits", "Count the translations found in the shared second-level TLB", "operations", 1},
+                                    { "tlb_l2_misses", "Count the translations that were not, and had to be walked", "operations", 1},
+                                    { "tlb_walks", "Count the page-table walks performed", "operations", 1},
+                                    { "tlb_walk_reads", "Count the memory reads those walks made through the cache hierarchy", "operations", 1})
 
 
         VanadisBasicLoadStoreQueue(ComponentId_t id, Params& params, int coreid, int hwthreads) : VanadisLoadStoreQueue(id, params, coreid, hwthreads),
@@ -182,6 +210,41 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_mem_violations       = registerStatistic<uint64_t>("mem_violations", "1");
             stat_mem_replays          = registerStatistic<uint64_t>("mem_replays", "1");
             stat_mem_predictor_holds  = registerStatistic<uint64_t>("mem_predictor_holds", "1");
+
+            stat_tlb_l1d_hits    = registerStatistic<uint64_t>("tlb_l1d_hits", "1");
+            stat_tlb_l1d_misses  = registerStatistic<uint64_t>("tlb_l1d_misses", "1");
+            stat_tlb_l1i_hits    = registerStatistic<uint64_t>("tlb_l1i_hits", "1");
+            stat_tlb_l1i_misses  = registerStatistic<uint64_t>("tlb_l1i_misses", "1");
+            stat_tlb_l2_hits     = registerStatistic<uint64_t>("tlb_l2_hits", "1");
+            stat_tlb_l2_misses   = registerStatistic<uint64_t>("tlb_l2_misses", "1");
+            stat_tlb_walks       = registerStatistic<uint64_t>("tlb_walks", "1");
+            stat_tlb_walk_reads  = registerStatistic<uint64_t>("tlb_walk_reads", "1");
+
+            // ADDRESS GENERATION AND THE MEMORY PORTS.
+            agu_enabled_  = params.find<bool>("agu_enable", true);
+            agu_units_    = params.find<uint16_t>("agu_units", 3);
+            agu_cycles_   = params.find<uint16_t>("agu_cycles", 1);
+            load_ports_   = params.find<uint16_t>("load_ports", 3);
+            store_ports_  = params.find<uint16_t>("store_ports", 2);
+            agu_avail_        = agu_units_;
+            load_port_avail_  = load_ports_;
+            store_port_avail_ = store_ports_;
+
+            // TRANSLATION. The walker sends its reads on this queue's own
+            // interface, because a hardware walker's accesses go through the
+            // data side of the cache hierarchy exactly as a load's do.
+            tlb_.configure(
+                params.find<bool>("tlb_enable", true),
+                params.find<uint32_t>("tlb_l1i_entries", 48), params.find<uint32_t>("tlb_l1i_ways", 48),
+                params.find<uint32_t>("tlb_l1d_entries", 48), params.find<uint32_t>("tlb_l1d_ways", 48),
+                params.find<uint32_t>("tlb_l2_entries", 2048), params.find<uint32_t>("tlb_l2_ways", 8),
+                params.find<uint16_t>("tlb_l1_hit_cycles", 0), params.find<uint16_t>("tlb_l2_hit_cycles", 5),
+                params.find<uint16_t>("tlb_walk_levels", 3), params.find<uint16_t>("tlb_walkers", 2),
+                params.find<uint64_t>("tlb_page_size", 4096),
+                params.find<uint64_t>("tlb_page_table_root", 0xF0000000ULL),
+                params.find<uint64_t>("tlb_arena_pages", 4096));
+            tlb_.setInterface(memInterface);
+            tlb_.setOutput(output);
 
             // SPECULATION IS THE DEFAULT, and turning it off restores the queue
             // this one grew out of: one in-order queue per hardware thread, a
@@ -248,6 +311,60 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         }
 
         bool speculative() const override { return spec_; }
+
+        // ---- ADDRESS GENERATION AND THE MEMORY PORTS ------------------------
+        bool aguEnabled() const override { return agu_enabled_; }
+
+        bool aguAvailable(const bool is_store) const override
+        {
+            if ( !agu_enabled_ ) { return true; }
+            if ( 0 == agu_avail_ ) { return false; }
+            return is_store ? (store_port_avail_ > 0) : (load_port_avail_ > 0);
+        }
+
+        bool aguPipeEmpty() const override { return agu_pipe_.empty(); }
+
+        bool aguOrderedInPipe() const override { return agu_ordered_in_pipe_; }
+
+        /// Take an address-generation unit and a port, and put the instruction
+        /// into the one-cycle pipeline between them and this queue.
+        void pushViaAGU(VanadisInstruction* ins, const uint64_t cycle) override
+        {
+            if ( !agu_enabled_ ) { pushResolved(ins); return; }
+
+            AGUEntry e;
+            e.ins         = ins;
+            e.is_store    = (INST_STORE == ins->getInstFuncType());
+            e.is_fence    = (INST_FENCE == ins->getInstFuncType());
+            e.ordered     = e.is_fence || isOrderedMemOp(ins);
+            e.ready_cycle = cycle + agu_cycles_;
+
+            if ( agu_avail_ > 0 ) { agu_avail_--; }
+            if ( !e.is_fence ) {
+                if ( e.is_store ) { if ( store_port_avail_ > 0 ) { store_port_avail_--; } }
+                else              { if ( load_port_avail_ > 0 )  { load_port_avail_--; } }
+            }
+
+            if ( e.ordered ) { agu_ordered_in_pipe_ = true; }
+            agu_pipe_.push_back(e);
+        }
+
+        VanadisTLBUnit* tlb() override { return &tlb_; }
+
+        void dropAGUByThreadID(const uint32_t thread) override
+        {
+            if ( agu_pipe_.empty() ) { return; }
+
+            size_t keep = 0;
+            bool   still_ordered = false;
+            for ( size_t i = 0; i < agu_pipe_.size(); ++i ) {
+                if ( agu_pipe_[i].ins->getHWThread() == thread ) { continue; }
+                if ( agu_pipe_[i].ordered ) { still_ordered = true; }
+                agu_pipe_[keep++] = agu_pipe_[i];
+            }
+            agu_pipe_.resize(keep);
+            agu_ordered_in_pipe_ = still_ordered;
+        }
 
         // WHERE THE BACK-PRESSURE IS APPLIED. In the speculative queue a slot is
         // taken when the instruction is renamed, so these answer the core at
@@ -425,6 +542,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // first deleted and then removed from the queue, otherwise entry
             // is left alone
 
+            // A thread's instructions in address generation go away with the
+            // rest of its window; the reorder buffer deletes the instructions
+            // themselves, so nothing here may keep a pointer to one.
+            dropAGUByThreadID(thread);
+
             op_q_size -= op_q[thread].size();
             for(auto op_q_itr = op_q[thread].begin(); op_q_itr != op_q[thread].end(); ) {
                 delete (*op_q_itr);
@@ -542,6 +664,16 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 }
             }
 
+            // A NEW CYCLE'S ADDRESS-GENERATION UNITS AND PORTS. This runs once
+            // per core cycle, before the issue stage of the same cycle, so the
+            // budget an instruction asks for at issue is this cycle's.
+            tlb_.tick(cycle);
+            drainAGU(cycle);
+            publishTLBStats();
+            agu_avail_        = agu_units_;
+            load_port_avail_  = load_ports_;
+            store_port_avail_ = store_ports_;
+
             stat_op_q_size->addData(spec_ ? (load_q_size + stores_pending_size) : op_q_size);
             stat_loads_pending->addData(loads_pending.size());
             stat_stores_pending->addData(std_stores_in_flight.size());
@@ -560,15 +692,64 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 op_q_index = (op_q_index + 1) % hw_threads;
             }
 
-            // attempt to issue any front of ROB stores into memory system
-            for (int i = 0; i < hw_threads; i++) {
-                bool issued = issueStoreFront(stores_pending_index);
-                stores_pending_index = (stores_pending_index + 1) % hw_threads;
-                if (issued) break; // one per cycle TODO: parameterize
+            // Attempt to issue any front-of-reorder-buffer stores into the
+            // memory system. Without the port model this is one per cycle, as
+            // it always was; with it, as many as there are store ports.
+            const uint32_t store_front_budget = agu_enabled_ ? store_ports_ : 1;
+            for (uint32_t issued_count = 0; issued_count < store_front_budget; ++issued_count) {
+                bool any = false;
+                for (int i = 0; i < hw_threads; i++) {
+                    bool issued = issueStoreFront(stores_pending_index);
+                    stores_pending_index = (stores_pending_index + 1) % hw_threads;
+                    if (issued) { any = true; break; }
+                }
+                if (!any) break;
             }
         }
 
     protected:
+
+        /// ONE MEMORY INSTRUCTION IN THE PIPELINE BETWEEN ADDRESS GENERATION
+        /// AND THE QUEUE. It has taken its unit and its port; it is waiting for
+        /// the cycle those cost and for its translation.
+        struct AGUEntry {
+            VanadisInstruction* ins;
+            bool                is_store;
+            bool                is_fence;
+            bool                ordered;
+            uint64_t            ready_cycle;
+        };
+
+        std::vector<AGUEntry> agu_pipe_;
+        bool                  agu_enabled_ = false;
+        bool                  agu_ordered_in_pipe_ = false;
+        uint16_t              agu_units_ = 3;
+        uint16_t              agu_cycles_ = 1;
+        uint16_t              load_ports_ = 3;
+        uint16_t              store_ports_ = 2;
+        uint16_t              agu_avail_ = 3;
+        uint16_t              load_port_avail_ = 3;
+        uint16_t              store_port_avail_ = 2;
+
+        VanadisTLBUnit tlb_;
+
+        uint64_t tlb_pub_l1d_hits_ = 0;
+        uint64_t tlb_pub_l1d_misses_ = 0;
+        uint64_t tlb_pub_l1i_hits_ = 0;
+        uint64_t tlb_pub_l1i_misses_ = 0;
+        uint64_t tlb_pub_l2_hits_ = 0;
+        uint64_t tlb_pub_l2_misses_ = 0;
+        uint64_t tlb_pub_walks_ = 0;
+        uint64_t tlb_pub_walk_reads_ = 0;
+
+        Statistic<uint64_t>* stat_tlb_l1d_hits;
+        Statistic<uint64_t>* stat_tlb_l1d_misses;
+        Statistic<uint64_t>* stat_tlb_l1i_hits;
+        Statistic<uint64_t>* stat_tlb_l1i_misses;
+        Statistic<uint64_t>* stat_tlb_l2_hits;
+        Statistic<uint64_t>* stat_tlb_l2_misses;
+        Statistic<uint64_t>* stat_tlb_walks;
+        Statistic<uint64_t>* stat_tlb_walk_reads;
 
         class StandardMemHandlers : public Interfaces::StandardMem::RequestHandler
         {
@@ -933,8 +1114,128 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             assert(ev != nullptr);
             assert(std_mem_handlers != nullptr);
 
+            // A PAGE-TABLE READ IS NOT A LOAD. The walker's reads travel the
+            // same wires as this queue's, so they come back here; they belong
+            // to no instruction and must not be looked for among the loads.
+            if ( tlb_.handleResponse(ev->getID()) ) { delete ev; return; }
+
             ev->handle(std_mem_handlers);
             VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "completed pass off to incoming handlers\n");
+        }
+
+        /// A memory operation whose position in the stream is part of what it
+        /// means: a fence, a load-linked, a store-conditional, a locked access.
+        static bool isOrderedMemOp(VanadisInstruction* ins)
+        {
+            switch ( ins->getInstFuncType() ) {
+            case INST_FENCE: return true;
+            case INST_LOAD:
+            {
+                VanadisLoadInstruction* l = ins->asLoad();
+                return (nullptr != l) && ((MEM_TRANSACTION_LLSC_LOAD == l->getTransactionType())
+                                       || (MEM_TRANSACTION_LOCK == l->getTransactionType()));
+            }
+            case INST_STORE:
+            {
+                VanadisStoreInstruction* st = ins->asStore();
+                return (nullptr != st) && ((MEM_TRANSACTION_LLSC_STORE == st->getTransactionType())
+                                        || (MEM_TRANSACTION_LOCK == st->getTransactionType()));
+            }
+            default: return false;
+            }
+        }
+
+        /// Hand one instruction to the queue proper, which is what the core did
+        /// directly before address generation was modelled.
+        void pushResolved(VanadisInstruction* ins)
+        {
+            switch ( ins->getInstFuncType() ) {
+            case INST_LOAD:  push(ins->asLoad());  break;
+            case INST_STORE: push(ins->asStore()); break;
+            case INST_FENCE: push(ins->asFence()); break;
+            default:
+                output->fatal(CALL_INFO, -1, "Error - a non-memory instruction reached address generation (%s)\n",
+                    ins->getInstCode());
+                break;
+            }
+        }
+
+        /// One cycle of the pipeline between address generation and the queue.
+        ///
+        /// An entry leaves when its address-generation cycles are up AND its
+        /// translation is in hand. Entries do not have to leave in the order
+        /// they arrived, because the speculative queue took their slots -- and
+        /// with them their program order -- when they were renamed; the
+        /// in-order queue has no such record, so there the pipeline drains
+        /// strictly from the front.
+        void drainAGU(const uint64_t cycle)
+        {
+            if ( agu_pipe_.empty() ) { return; }
+
+            size_t keep = 0;
+            bool   still_ordered = false;
+
+            for ( size_t i = 0; i < agu_pipe_.size(); ++i ) {
+                AGUEntry& e = agu_pipe_[i];
+
+                bool go = (e.ready_cycle <= cycle);
+
+                if ( go && tlb_.enabled() && !e.is_fence ) { go = translateFor(e); }
+
+                if ( !go ) {
+                    if ( e.ordered ) { still_ordered = true; }
+                    agu_pipe_[keep++] = e;
+                    if ( !spec_ ) {
+                        // Strictly in order: nothing behind a held entry moves.
+                        for ( size_t j = i + 1; j < agu_pipe_.size(); ++j ) {
+                            if ( agu_pipe_[j].ordered ) { still_ordered = true; }
+                            agu_pipe_[keep++] = agu_pipe_[j];
+                        }
+                        agu_pipe_.resize(keep);
+                        agu_ordered_in_pipe_ = still_ordered;
+                        return;
+                    }
+                    continue;
+                }
+
+                pushResolved(e.ins);
+            }
+
+            agu_pipe_.resize(keep);
+            agu_ordered_in_pipe_ = still_ordered;
+        }
+
+        /// Ask the translation path about this operation's effective address.
+        /// The address is computed exactly as the queue computes it a moment
+        /// later, from registers the scheduler has already seen produced.
+        bool translateFor(AGUEntry& e)
+        {
+            uint64_t addr  = 0;
+            uint16_t width = 0;
+            const uint32_t thr = e.ins->getHWThread();
+
+            if ( e.is_store ) { e.ins->asStore()->computeStoreAddress(output, registerFiles->at(thr), &addr, &width); }
+            else              { e.ins->asLoad()->computeLoadAddress(output, registerFiles->at(thr), &addr, &width); }
+
+            return tlb_.access(false, addr & address_mask);
+        }
+
+        /// The accumulated translation counts, published as this cycle's delta.
+        void publishTLBStats()
+        {
+            publishDelta(stat_tlb_l1d_hits,   tlb_.l1dHits(),   tlb_pub_l1d_hits_);
+            publishDelta(stat_tlb_l1d_misses, tlb_.l1dMisses(), tlb_pub_l1d_misses_);
+            publishDelta(stat_tlb_l1i_hits,   tlb_.l1iHits(),   tlb_pub_l1i_hits_);
+            publishDelta(stat_tlb_l1i_misses, tlb_.l1iMisses(), tlb_pub_l1i_misses_);
+            publishDelta(stat_tlb_l2_hits,    tlb_.l2Hits(),    tlb_pub_l2_hits_);
+            publishDelta(stat_tlb_l2_misses,  tlb_.l2Misses(),  tlb_pub_l2_misses_);
+            publishDelta(stat_tlb_walks,      tlb_.walks(),     tlb_pub_walks_);
+            publishDelta(stat_tlb_walk_reads, tlb_.walkReads(), tlb_pub_walk_reads_);
+        }
+
+        static void publishDelta(Statistic<uint64_t>* stat, const uint64_t now, uint64_t& last)
+        {
+            if ( now > last ) { stat->addData(now - last); last = now; }
         }
 
         bool issueStoreFront(uint32_t thr)
