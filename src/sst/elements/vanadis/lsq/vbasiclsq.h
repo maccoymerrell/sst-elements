@@ -75,8 +75,16 @@ public:
 
     bool containsStorePC(uint64_t store_pc) const override
     {
+        // Only an older instance of that store whose address is still
+        // unknown is a reason to wait. Once it has resolved, the load is
+        // compared against it like any other resolved store (forwarded from
+        // or waited on by address), so it must not keep the load held; and
+        // a store leaves this queue only at commit, so counting resolved
+        // instances would hold the load until every older copy of that
+        // store had committed -- serialising harder than the counter.
         for ( auto* e : q_ ) {
             if ( e->getAge() >= load_age_ ) { break; }
+            if ( e->isResolved() ) { continue; }
             if ( e->getInstructionAddress() == store_pc ) { return true; }
         }
         return false;
