@@ -39,6 +39,7 @@
 #include <deque>
 #include <limits>
 #include <set>
+#include <unordered_set>
 #include <vector>
 #include <sst/core/component.h>
 #include <sst/core/interfaces/stdMem.h>
@@ -511,7 +512,8 @@ public:
         { "core_id", "Identifier for this core. Each core in the system needs a unique ID between 0 and (number of cores) - 1.", 0 },
         { "hardware_threads", "Number of hardware threads in this core", "1" },
         { "clock", "Core clock frequency", "1GHz" },
-        { "reorder_slots", "Number of slots in the reorder buffer", "64"},
+        { "execute_branch_resolve", "Repair mis-speculation when the branch executes rather than when it retires", "1" },
+    { "reorder_slots", "Number of slots in the reorder buffer", "64"},
         { "physical_integer_registers", "Number of physical integer registers per hardware thread", "128" },
         { "physical_fp_registers", "Number of physical floating point registers per hardware thread", "128" },
         { "integer_arith_units", "Number of integer arithemetic units", "2" },
@@ -571,6 +573,13 @@ public:
           "instructions", 1 },
         { "instructions_decoded", "Number of instructions decoded", "instructions", 1 },
         { "branch_mispredicts", "Number of retired branches which were mis-predicted", "instructions", 1 },
+        { "execute_squash", "Mis-speculations repaired when the branch executed, not when it retired", "squashes", 1 },
+        { "wrong_path_instructions", "Instructions fetched after a mispredicted branch and thrown away", "instructions", 1 },
+        { "wrong_path_renamed", "Of those, the ones that had been renamed and held physical registers", "instructions", 1 },
+        { "wrong_path_executed", "Of those, the ones that had already executed", "instructions", 1 },
+        { "wrong_path_loads", "Of those, the ones that were loads", "instructions", 1 },
+        { "wrong_path_loads_sent", "Wrong-path loads that had already been sent to the level-one data cache", "loads", 1 },
+        { "redirect_delay_cycles", "Cycles from a branch resolving to the front end being redirected", "cycles", 1 },
         { "branches", "Number of retired branches", "instructions", 1 },
         { "loads_issued", "Number of load instructions issued to the LSQ", "instructions", 1 },
         { "stores_issued", "Number of store instructions issued to the LSQ", "instructions", 1 },
@@ -621,6 +630,18 @@ public:
     void clearROBMisspeculate(const uint32_t hw_thr);
 
     void clearFuncUnit(const uint32_t hw_thr, std::vector<VanadisFunctionalUnit*>& unit);
+
+    // MIS-SPECULATION REPAIR AT EXECUTE. Called once a cycle, after the
+    // functional units have run: if a branch has resolved wrongly, everything
+    // younger than it is thrown away and fetch is redirected, without waiting
+    // for the branch to reach the head of the reorder buffer.
+    void resolveBranchesAtExecute(const uint64_t cycle);
+    bool squashAfterBranch(const uint32_t hw_thr, const size_t branch_index, const uint64_t new_ip);
+    void dropInstructionsFromScheduler(
+        const uint32_t hw_thr, const std::unordered_set<VanadisInstruction*>& victims,
+        const std::vector<uint16_t>& slots);
+    void clearFuncUnitInstructions(
+        std::vector<VanadisFunctionalUnit*>& unit, const std::unordered_set<VanadisInstruction*>& victims);
 
     void syscallReturn(uint32_t thr);
     void setHalt(uint32_t thr, int64_t halt_code);
@@ -862,6 +883,14 @@ private:
     Statistic<uint64_t>* stat_loads_issued;
     Statistic<uint64_t>* stat_stores_issued;
     Statistic<uint64_t>* stat_branch_mispredicts;
+    Statistic<uint64_t>* stat_execute_squash;
+    Statistic<uint64_t>* stat_wrong_path_squashed;
+    Statistic<uint64_t>* stat_wrong_path_renamed;
+    Statistic<uint64_t>* stat_wrong_path_executed;
+    Statistic<uint64_t>* stat_wrong_path_loads;
+    Statistic<uint64_t>* stat_wrong_path_loads_sent;
+    Statistic<uint64_t>* stat_redirect_delay;
+    bool                 execute_branch_resolve_ = true;
     Statistic<uint64_t>* stat_branches;
     Statistic<uint64_t>* stat_cycles;
     Statistic<uint64_t>* stat_rob_entries;

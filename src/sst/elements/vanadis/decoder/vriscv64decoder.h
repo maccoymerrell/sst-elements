@@ -151,6 +151,19 @@ public:
 
         cycle_count = cycle;
 
+        // THE FRONT END IS RE-STEERING. The decode stage overrode the fetch
+        // stage's prediction, and the cycles between the two stages produce
+        // nothing while fetch restarts down the corrected path.
+        if ( UNLIKELY(cycle < frontend_resteer_until) ) {
+            // Once a cycle: the fetch stage is called several times a cycle and
+            // a bubble is a cycle, not an attempt.
+            if ( cycle != frontend_bubble_cycle ) {
+                frontend_bubble_cycle = cycle;
+                stat_frontend_bubble->addData(1);
+            }
+            return true;
+        }
+
         bool success = false;
         if ( ! thread_rob->full() ) {
             if ( ins_loader->hasBundleAt(ip) ) {
@@ -179,23 +192,100 @@ public:
                             VanadisSpeculatedInstruction* next_spec_ins =
                                 dynamic_cast<VanadisSpeculatedInstruction*>(next_ins);
 
-                            // THE FETCH TARGET BUFFER LEARNS HERE, and it has
-                            // to learn here rather than at retire: the
-                            // run-ahead predictor's whole job is to know that
-                            // there is a branch at this address before fetch
-                            // gets back to it, and this is the first moment
-                            // anything in the machine knows.
-                            fdip->observeBranchAtDecode(
-                                bundle_ip, next_spec_ins->getBranchClass(), bundle->pcIncrement(),
-                                next_spec_ins->hasStaticTarget(), next_spec_ins->getStaticTarget());
+                            if ( branch_predictor->hasFetchStage() ) {
+                                // THE SECOND OF TWO STAGES.
+                                //
+                                // The fetch stage has already been here: its
+                                // branch target buffer marked this address, its
+                                // bimodal counter chose a direction and its
+                                // entry gave a target, and the block it made
+                                // went into the fetch target queue for the
+                                // prefetch engine to work from. What arrives
+                                // here is that prediction, and the tagged
+                                // predictor's answer for the same branch, taken
+                                // against the same history. If the two differ
+                                // the tagged answer wins and fetch is
+                                // re-steered, at the cost of the bubble between
+                                // the stages.
+                                const uint64_t fallthrough = ip + bundle->pcIncrement();
+                                const uint64_t static_tgt  = next_spec_ins->getStaticTarget();
+                                const bool     has_static  = next_spec_ins->hasStaticTarget();
 
-                            if ( branch_predictor->hasDirectionPrediction() ) {
-                                // The unit predicts the taken/not-taken bit as
-                                // well as the address. Everything it needs is
-                                // already in hand: this bundle was decoded on
-                                // an earlier visit to this address, so the
-                                // branch's class and, for a direct branch, its
-                                // target are known before the prediction.
+                                VanadisFetchStageBranch fs;
+                                VanadisBranchCheckpoint ckpt;
+                                uint64_t                predicted_address = fallthrough;
+                                bool                    resteer           = false;
+
+                                if ( fdip->takeBranchPrediction(bundle_ip, &fs) ) {
+                                    ckpt              = fs.ckpt;
+                                    predicted_address = fs.taken ? fs.next : fallthrough;
+                                    if ( 0 == predicted_address ) { predicted_address = fallthrough; }
+                                }
+                                else if ( branch_predictor->btbMarks(bundle_ip) ) {
+                                    // Marked, but the run-ahead is somewhere
+                                    // else. The prediction the fetch stage
+                                    // would have made is made here, out of the
+                                    // same entry, and fetch is re-steered from
+                                    // it whatever happens next.
+                                    fdip->resteerBefore();
+                                    branch_predictor->predictAtDecode(
+                                        bundle_ip, next_spec_ins->getBranchClass(), static_tgt, has_static,
+                                        fallthrough, (uint8_t)bundle->pcIncrement(), &ckpt, &predicted_address);
+                                    resteer = true;
+                                    stat_frontend_btb_miss->addData(1);
+                                }
+                                else {
+                                    // NOT MARKED, SO NOT A BRANCH AS FAR AS THE
+                                    // FETCH STAGE IS CONCERNED. A conditional
+                                    // branch that has never resolved taken has
+                                    // no entry in the buffer, and the published
+                                    // machines say what follows from that: it is
+                                    // implicitly predicted not-taken and the
+                                    // global history is not updated for it. So
+                                    // it takes no record, changes no history,
+                                    // costs no re-steer, and the fetch stage --
+                                    // which ran through this address as
+                                    // straight-line code -- is still on the
+                                    // path being taken.
+                                    ckpt.clear();
+                                    predicted_address = fallthrough;
+                                }
+
+                                uint64_t override_pc = predicted_address;
+                                if ( branch_predictor->overrideAtDecode(
+                                         ckpt, static_tgt, has_static, fallthrough, &override_pc) ) {
+                                    predicted_address = override_pc;
+                                    resteer           = true;
+                                    // THE BUBBLE. The stages are apart by the
+                                    // time it takes a prediction to reach
+                                    // decode; when the second overrides the
+                                    // first, that time is lost.
+                                    frontend_resteer_until = cycle_count + frontend_override_bubble;
+                                    stat_frontend_override->addData(1);
+                                }
+
+                                if ( resteer ) { fdip->flush(predicted_address); }
+
+                                // Written before the micro-op is copied into
+                                // the reorder buffer, so the copy carries it.
+                                next_spec_ins->setBranchCheckpoint(ckpt);
+                                next_spec_ins->setSpeculatedAddress(predicted_address);
+
+                                if(output_->getVerboseLevel() >= 16) {
+                                    output_->verbose(
+                                        CALL_INFO, 16, 0,
+                                        "----> contains a branch: 0x%" PRI_ADDR " / predicted: 0x%" PRI_ADDR
+                                        " / re-steer: %s\n",
+                                        bundle_ip, predicted_address, resteer ? "yes" : "no");
+                                }
+
+                                ip                = predicted_address;
+                                bundle_has_branch = true;
+                            }
+                            else if ( branch_predictor->hasDirectionPrediction() ) {
+                                // A direction predictor with no fetch stage:
+                                // the prediction is made here, once, when the
+                                // branch is decoded.
                                 const uint64_t fallthrough = ip + bundle->pcIncrement();
 
                                 VanadisBranchCheckpoint ckpt;
@@ -212,18 +302,8 @@ public:
                                                 fallthrough, &ckpt)
                                           : fallthrough;
 
-                                // Written before the micro-op is copied into
-                                // the reorder buffer, so the copy carries it.
                                 next_spec_ins->setBranchCheckpoint(ckpt);
                                 next_spec_ins->setSpeculatedAddress(predicted_address);
-
-                                if(output_->getVerboseLevel() >= 16) {
-                                    output_->verbose(
-                                        CALL_INFO, 16, 0,
-                                        "----> contains a branch: 0x%" PRI_ADDR " / direction: %s / "
-                                        "predicted: 0x%" PRI_ADDR "\n",
-                                        ip, taken ? "taken" : "not-taken", predicted_address);
-                                }
 
                                 ip                = predicted_address;
                                 bundle_has_branch = true;

@@ -509,6 +509,121 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_fences_issued->addData(1);
         }
 
+        // A PARTIAL CLEAR, FOR A SQUASH AT EXECUTE.
+        //
+        // A branch that resolves wrongly while it is still inside the reorder
+        // buffer takes only the instructions YOUNGER than it. Everything older
+        // is on the right path and has to survive, so the queue cannot simply
+        // be emptied by thread the way a squash at the head of the buffer does.
+        // The set names the instructions being discarded; every structure that
+        // holds a pointer to one of them drops it here.
+        //
+        // A wrong-path STORE has never reached memory: a store is only sent
+        // when it is at the head of the reorder buffer, which a store younger
+        // than an unresolved branch cannot be. A wrong-path LOAD may well be in
+        // flight, and is left in flight -- the read has already gone to the
+        // level-one data cache and the translation has already been made, which
+        // is what a real core does too. Its response arrives to find no entry
+        // waiting for it and is dropped, which the read-response handler
+        // already does for the whole-thread clear.
+        size_t clearLSQAfter(const uint32_t thread, const std::unordered_set<VanadisInstruction*>& victims) override
+        {
+            if ( victims.empty() ) { return 0; }
+
+            size_t in_flight = 0;
+
+            if ( !agu_pipe_.empty() ) {
+                size_t keep          = 0;
+                bool   still_ordered = false;
+                for ( size_t i = 0; i < agu_pipe_.size(); ++i ) {
+                    if ( victims.count(agu_pipe_[i].ins) > 0 ) { continue; }
+                    if ( agu_pipe_[i].ordered ) { still_ordered = true; }
+                    agu_pipe_[keep++] = agu_pipe_[i];
+                }
+                agu_pipe_.resize(keep);
+                agu_ordered_in_pipe_ = still_ordered;
+            }
+
+            for ( auto itr = op_q[thread].begin(); itr != op_q[thread].end(); ) {
+                if ( victims.count((*itr)->getInstruction()) > 0 ) {
+                    delete (*itr);
+                    itr = op_q[thread].erase(itr);
+                    op_q_size--;
+                }
+                else {
+                    ++itr;
+                }
+            }
+
+            if ( spec_ ) {
+                for ( auto itr = loads_pending.begin(); itr != loads_pending.end(); ) {
+                    if ( victims.count((*itr)->getInstruction()) > 0 ) {
+                        ++in_flight;
+                        itr = loads_pending.erase(itr);
+                    }
+                    else { ++itr; }
+                }
+
+                for ( auto itr = load_q[thread].begin(); itr != load_q[thread].end(); ) {
+                    VanadisBasicLoadPendingEntry* entry = *itr;
+                    if ( victims.count(entry->getInstruction()) > 0 ) {
+                        if ( VanadisBasicLoadPendingEntry::WAITING == entry->getState() ) {
+                            if ( waiting_loads_[thread] > 0 ) { waiting_loads_[thread]--; }
+                        }
+                        reserved_loads_.erase(entry->getInstruction());
+                        itr = load_q[thread].erase(itr);
+                        load_q_size--;
+                        delete entry;
+                    }
+                    else {
+                        ++itr;
+                    }
+                }
+
+                for ( auto itr = stores_pending[thread].begin(); itr != stores_pending[thread].end(); ) {
+                    VanadisBasicStorePendingEntry* entry = *itr;
+                    if ( victims.count(entry->getInstruction()) > 0 ) {
+                        reserved_stores_.erase(entry->getInstruction());
+                        itr = stores_pending[thread].erase(itr);
+                        stores_pending_size--;
+                        delete entry;
+                    }
+                    else {
+                        ++itr;
+                    }
+                }
+
+                if ( (nullptr != ordered_ins_[thread]) && (victims.count(ordered_ins_[thread]) > 0) ) {
+                    ordered_ins_[thread] = nullptr;
+                }
+            }
+            else {
+                for ( auto itr = loads_pending.begin(); itr != loads_pending.end(); ) {
+                    if ( victims.count((*itr)->getInstruction()) > 0 ) {
+                        ++in_flight;
+                        delete (*itr);
+                        itr = loads_pending.erase(itr);
+                    }
+                    else {
+                        ++itr;
+                    }
+                }
+
+                for ( auto itr = stores_pending[thread].begin(); itr != stores_pending[thread].end(); ) {
+                    if ( victims.count((*itr)->getInstruction()) > 0 ) {
+                        delete (*itr);
+                        itr = stores_pending[thread].erase(itr);
+                        stores_pending_size--;
+                    }
+                    else {
+                        ++itr;
+                    }
+                }
+            }
+
+            return in_flight;
+        }
+
         void clearLSQByThreadID(const uint32_t thread) override
         {
             // Iterate over the queue, anything with a matching thread ID is

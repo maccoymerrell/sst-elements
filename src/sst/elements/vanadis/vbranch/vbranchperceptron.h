@@ -132,6 +132,48 @@ public:
         uint64_t s_ras[RAS_DEPTH]            = {0};
         uint32_t s_ras_top                   = 0;
 
+        // The two-stage front end, as in the TAGE-SC-L core: the fetch stage
+        // steers on the bimodal counter held in the branch target buffer's
+        // slot for this branch, and the perceptron sum overrides it at decode.
+        bool     bim_valid   = false;
+        int8_t   bim_pred    = 0;
+        int8_t   bim_hyst    = 1;
+        bool     bim_dirty   = false;
+        bool     fetch_dir   = false;
+        bool     tage_dir    = false;
+        bool     overridden  = false;
+        // A BRANCH THE BUFFER NEVER MARKED. It is implicitly predicted
+        // not-taken and, following the published machines, the global history
+        // is not updated for it -- so this record moved nothing and trains
+        // nothing. It exists only to keep the ring in fetch order, which is
+        // what lets a squash discard exactly the records younger than a
+        // branch.
+        bool     no_history  = false;
+        // No fetch stage: one prediction, the tagged one, and it is what the
+        // speculative history advances with. Only the standalone trace-driven
+        // tests set this; the machine has a fetch stage.
+        bool     single_stage = false;
+        // THE BUFFER'S BIMODAL COUNTER WAS TRAINED WHEN THE BRANCH RESOLVED,
+        // not when it retired. A mispredicting branch is repaired at execute
+        // and the machine starts fetching the corrected path at once; in a
+        // loop that path begins with the same branch, and the counter that
+        // steers it has to hold the answer that was just proved. The counter
+        // is a per-branch state machine, so training it out of program order
+        // changes nothing but its timing. The TAGGED tables are different --
+        // their allocation, their useful bits and their tick counter all
+        // depend on the order updates arrive in -- so they are trained at
+        // retirement, which is program order.
+        bool     base_trained = false;
+        // The prediction the front end finally made, after the decode stage
+        // had its say. Repair never touches these two, so the retirement path
+        // can still say what was predicted and what the two stages each said.
+        bool     final_dir    = false;
+        uint64_t final_target = 0;
+        bool     btb_block_hit = false;
+        bool     btb_from_l2   = false;
+        uint8_t  width         = 4;
+        uint64_t fetch_target  = 0;
+
         uint64_t           pc          = 0;
         uint64_t           hist_target = 0;
         uint64_t           fallthrough = 0;
@@ -194,23 +236,61 @@ public:
         // The sum decides a conditional branch. An unconditional branch is
         // taken whatever the sum says, but the sum is still computed and still
         // trained on, which is what the reference does.
-        const bool dir = vanadisBranchIsConditional(cls) ? (sum >= THRESHOLD) : true;
-        C.pred_dir     = dir;
-
-        for ( int i = 0; i < NTABLES; ++i ) {
-            spec_.ghist[i].push_back(dir);
+        if ( vanadisBranchIsConditional(cls) ) {
+            C.fetch_dir = C.bim_valid && (C.bim_pred > 0);
+            C.tage_dir  = (sum >= THRESHOLD);
+        }
+        else {
+            C.fetch_dir = true;
+            C.tage_dir  = true;
         }
 
-        return dir;
+        const bool steer = C.single_stage ? C.tage_dir : C.fetch_dir;
+        C.pred_dir       = steer;
+
+        for ( int i = 0; i < NTABLES; ++i ) {
+            spec_.ghist[i].push_back(steer);
+        }
+
+        return steer;
+    }
+
+    // The bimodal counter in the branch target buffer's slot is trained here
+    // too, so that the fetch stage of a machine running this predictor learns
+    // the same way.
+    void baseupdate(const bool taken, Checkpoint& C)
+    {
+        if ( !C.bim_valid ) { return; }
+        int inter = (C.bim_pred << 1) + C.bim_hyst;
+        if ( taken ) { if ( inter < 3 ) { inter += 1; } }
+        else if ( inter > 0 ) { inter--; }
+        C.bim_pred  = (int8_t)(inter >> 1);
+        C.bim_hyst  = (int8_t)(inter & 1);
+        C.bim_dirty = true;
+    }
+
+    void applyOverride(Checkpoint& C, const bool dir)
+    {
+        repair(C, dir);
+        C.pred_dir   = dir;
+        C.overridden = true;
     }
 
     // ---- training ----------------------------------------------------------
-    void update(const uint64_t pc, const VanadisBranchClass cls, const bool taken, Checkpoint& C)
+    // See the note on the TAGE core: a branch that mispredicted trains its
+    // weights when it resolves, so that the corrected path is predicted from
+    // them, and moves the architected history later, in program order.
+    void trainAtResolve(const uint64_t pc, const VanadisBranchClass cls, const bool taken, Checkpoint& C)
     {
-        for ( int i = 0; i < NTABLES; ++i ) {
-            arch_.ghist[i].push_back(taken);
-        }
+        (void)pc;
+        if ( C.no_history || C.base_trained ) { return; }
+        if ( !vanadisBranchIsConditional(cls) ) { return; }
+        baseupdate(taken, C);
+        C.base_trained = true;
+    }
 
+    void trainWeights(const bool taken, Checkpoint& C)
+    {
         const bool prediction_correct = (taken == (C.yout >= THRESHOLD));
         const bool prediction_weak    = (abs(C.yout) < theta);
 
@@ -222,6 +302,18 @@ public:
                 tables[i][C.indices[i]] = static_cast<int8_t>(w);
             }
             adjustThreshold(prediction_correct);
+        }
+    }
+
+    void update(const uint64_t pc, const VanadisBranchClass cls, const bool taken, Checkpoint& C)
+    {
+        if ( C.no_history ) { return; }
+
+        if ( vanadisBranchIsConditional(cls) && !C.base_trained ) { baseupdate(taken, C); }
+        trainWeights(taken, C);
+
+        for ( int i = 0; i < NTABLES; ++i ) {
+            arch_.ghist[i].push_back(taken);
         }
 
         // The return address stack has an architected copy for the same reason
@@ -236,7 +328,11 @@ public:
     // behind that the oldest checkpoint does not already hold.
     void restoreWords(const Checkpoint&) {}
 
-    void repair(const Checkpoint& C, const bool taken)
+    // Put the speculative state back to what this branch found, and stop
+    // there: the branch itself is not replayed. This is what a re-steer that
+    // discards the fetch stage's run-ahead needs, because the branch the
+    // oldest discarded record belongs to never happened on the path taken.
+    void restoreOnly(const Checkpoint& C)
     {
         for ( int i = 0; i < NTABLES; ++i ) {
             for ( int w = 0; w < MAX_WORDS; ++w ) {
@@ -245,6 +341,13 @@ public:
         }
         memcpy(spec_.ras, C.s_ras, sizeof(spec_.ras));
         spec_.ras_top = C.s_ras_top;
+    }
+
+    void repair(const Checkpoint& C, const bool taken)
+    {
+        restoreOnly(C);
+
+        if ( C.no_history ) { return; }
 
         for ( int i = 0; i < NTABLES; ++i ) {
             spec_.ghist[i].push_back(taken);

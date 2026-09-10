@@ -17,8 +17,11 @@
 #define _H_VANADIS_SPECULATE
 
 #include "inst/vdelaytype.h"
+#include "inst/isatable.h"
 #include "inst/vinst.h"
 #include "vbranch/vbranchcheckpoint.h"
+
+#include <vector>
 
 #define VANADIS_SPECULATE_JUMP_ADDR_ADD 4
 
@@ -83,6 +86,42 @@ public:
     const VanadisBranchCheckpoint& getBranchCheckpoint() const { return branch_ckpt; }
     void setBranchCheckpoint(const VanadisBranchCheckpoint& c) { branch_ckpt = c; }
 
+    // THE RENAME MAP AS THIS BRANCH FOUND IT.
+    //
+    // Taken when the branch is renamed, which is the last moment the map is
+    // the one every instruction older than the branch built and nothing
+    // younger has touched. A squash at execute puts it back. The pending read
+    // and write counts are deliberately not part of it -- see the note on
+    // VanadisISATable::copyMap.
+    void saveRenameMap(VanadisISATable* tbl)
+    {
+        tbl->copyMap(rename_int_, rename_fp_);
+        rename_saved_ = true;
+    }
+
+    bool hasRenameMap() const { return rename_saved_; }
+
+    void restoreRenameMap(VanadisISATable* tbl) const { tbl->restoreMap(rename_int_, rename_fp_); }
+
+    // A misprediction repaired at EXECUTE, so that the head of the reorder
+    // buffer does not repair it a second time when it gets there.
+    bool misspeculationHandled() const { return misspec_handled_; }
+    void markMisspeculationHandled() { misspec_handled_ = true; }
+
+    // THE CYCLE THE BRANCH KNEW ITS OWN ANSWER. Stamped by the core's
+    // execute-stage scan the first time it sees the branch resolved, whether or
+    // not it repairs from it. The distance from here to the redirect is what
+    // repairing at execute rather than at the head of the reorder buffer saves.
+    bool     resolveStamped() const { return resolve_stamped_; }
+    uint64_t resolveCycle() const { return resolve_cycle_; }
+    void     stampResolveCycle(const uint64_t c)
+    {
+        if ( !resolve_stamped_ ) {
+            resolve_stamped_ = true;
+            resolve_cycle_   = c;
+        }
+    }
+
     virtual uint64_t getSpeculatedAddress() const { return speculatedAddress; }
     virtual void     setSpeculatedAddress(const uint64_t spec_ad) { speculatedAddress = spec_ad; }
     virtual uint64_t getTakenAddress() const { return takenAddress; }
@@ -118,6 +157,12 @@ protected:
     bool                        resolved_taken    = true;
     uint64_t                    static_target     = 0;
     VanadisBranchCheckpoint     branch_ckpt;
+    bool                        rename_saved_    = false;
+    bool                        misspec_handled_ = false;
+    bool                        resolve_stamped_ = false;
+    uint64_t                    resolve_cycle_   = 0;
+    std::vector<uint16_t>       rename_int_;
+    std::vector<uint16_t>       rename_fp_;
     uint64_t                    speculatedAddress;
     uint64_t                    takenAddress;
     uint64_t                    ins_width;

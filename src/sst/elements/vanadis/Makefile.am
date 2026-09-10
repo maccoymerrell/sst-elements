@@ -127,6 +127,7 @@ vanadis.h \
 vanadisDbgFlags.h \
 vbranch/vbranchbasic.h \
 vbranch/vbranchbtb.h \
+vbranch/vbranchfetchbtb.h \
 vbranch/vbranchcheckpoint.h \
 vbranch/vbranchperceptron.h \
 vbranch/vbranchperceptron.cc \

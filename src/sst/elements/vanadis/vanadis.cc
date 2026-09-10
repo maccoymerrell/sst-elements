@@ -183,6 +183,13 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     clock_tc_        = registerClock(clock_rate, clock_handler_);
 
     const uint32_t rob_count = params.find<uint32_t>("reorder_slots", 64);
+
+    // WHERE MIS-SPECULATION IS REPAIRED. On by default: a branch that has
+    // executed knows its own answer, and a real core turns the front end round
+    // then rather than waiting for the branch to reach the head of the reorder
+    // buffer. Setting this to 0 restores the older behaviour, which is the
+    // measurement the two are compared with.
+    execute_branch_resolve_ = params.find<bool>("execute_branch_resolve", true);
     dCacheLineWidth          = params.find<uint64_t>("dcache_line_width", 64);
     iCacheLineWidth          = params.find<uint64_t>("icache_line_width", 64);
 
@@ -323,9 +330,12 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
         thread_decoders[i]->setThreadROB(rob[i]);
 
         // The predictor keeps one checkpoint per branch it has predicted and
-        // not yet retired. A branch holds one only while it holds a
-        // reorder-buffer entry, so a ring of this depth can never fill.
-        thread_decoders[i]->getBranchPredictor()->setMaxInFlightBranches(rob_count);
+        // not yet retired. A branch in the reorder buffer holds one, and so
+        // does every branch the FETCH STAGE has predicted that the decode
+        // stage has not reached yet -- at most one per fetch target queue
+        // entry. A ring of the two added together can never fill.
+        thread_decoders[i]->getBranchPredictor()->setMaxInFlightBranches(
+            rob_count + params.find<uint32_t>("fdip_ftq_entries", 32) + 8);
 
         // Reserve ISA registers.
         //
@@ -604,6 +614,17 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     stat_loads_issued         = registerStatistic<uint64_t>("loads_issued", "1");
     stat_stores_issued        = registerStatistic<uint64_t>("stores_issued", "1");
     stat_branch_mispredicts   = registerStatistic<uint64_t>("branch_mispredicts", "1");
+
+    // WRONG-PATH EXECUTION, COUNTED. Everything the machine fetched, renamed,
+    // executed and then threw away because a branch older than it turned out to
+    // have gone somewhere else.
+    stat_execute_squash        = registerStatistic<uint64_t>("execute_squash", "1");
+    stat_wrong_path_squashed   = registerStatistic<uint64_t>("wrong_path_instructions", "1");
+    stat_wrong_path_renamed    = registerStatistic<uint64_t>("wrong_path_renamed", "1");
+    stat_wrong_path_executed   = registerStatistic<uint64_t>("wrong_path_executed", "1");
+    stat_wrong_path_loads      = registerStatistic<uint64_t>("wrong_path_loads", "1");
+    stat_wrong_path_loads_sent = registerStatistic<uint64_t>("wrong_path_loads_sent", "1");
+    stat_redirect_delay        = registerStatistic<uint64_t>("redirect_delay_cycles", "1");
     stat_branches             = registerStatistic<uint64_t>("branches", "1");
     stat_cycles               = registerStatistic<uint64_t>("cycles", "1");
     stat_rob_entries          = registerStatistic<uint64_t>("rob_slots_in_use", "1");
@@ -1355,6 +1376,15 @@ VANADIS_COMPONENT::dispatchOne(const uint32_t hw_thr)
         thread_decoders[hw_thr]->countISAIntReg(), thread_decoders[hw_thr]->countISAFPReg(), ins,
         int_register_stack, fp_register_stack, issue_isa_tables[hw_thr]);
 
+    // THE RENAME MAP AS THIS BRANCH FOUND IT, taken the instant the branch has
+    // renamed. Everything older has already written the map and nothing younger
+    // has, because rename is in program order; so this is what a squash at
+    // execute puts back.
+    if ( UNLIKELY(ins->isSpeculated()) ) {
+        VanadisSpeculatedInstruction* spec = ins->asSpeculated();
+        if ( nullptr != spec ) { spec->saveRenameMap(issue_isa_tables[hw_thr]); }
+    }
+
     ins->setWritebackQueue(&writeback_q);
     ins->markRenamed();
 
@@ -1720,18 +1750,23 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 // tables are trained and where its architected history moves.
                 thr_decoder->getBranchPredictor()->update(
                     spec_ins->getInstructionAddress(), spec_ins->getBranchClass(), branch_taken, pipeline_reset_addr,
-                    spec_ins->getBranchCheckpoint());
+                    spec_ins->getBranchCheckpoint(), (uint8_t)spec_ins->getInstructionWidth());
 
-                thr_decoder->getBranchPredictor()->push(
-                spec_ins->getInstructionAddress(), pipeline_reset_addr);
-
-                // The run-ahead predictor of the decoupled front end trains
-                // here too, from the same outcome and in the same order: its
-                // direction table, its architected history, its architected
-                // return stack, and the target of an indirect branch, which is
-                // the only place one is known.
-                thr_decoder->fdipBranchRetired(
-                    spec_ins->getInstructionAddress(), spec_ins->getBranchClass(), branch_taken, pipeline_reset_addr);
+                // THE ADDRESS-ONLY UNIT'S TRAINING, AND ONLY ITS.
+                //
+                // `push` records "this branch last went here" with no notion of
+                // direction, so on a NOT-TAKEN branch it records the
+                // fall-through as the branch's target. That is exactly what the
+                // address-only predictor means by a target and exactly what a
+                // real branch target buffer must never hold: the fetch stage
+                // reads the entry's target when it predicts taken, and a target
+                // that is the fall-through sends fetch to the wrong place every
+                // time the branch is taken. The direction-predicting units
+                // maintain their buffer in update(), which knows the direction.
+                if ( !thr_decoder->getBranchPredictor()->hasDirectionPrediction() ) {
+                    thr_decoder->getBranchPredictor()->push(
+                        spec_ins->getInstructionAddress(), pipeline_reset_addr);
+                }
 
                 if ( stop_verbose_when_retire_address > 0 && (rob_front->getInstructionAddress() == stop_verbose_when_retire_address) ) {
                     output->setVerboseLevel(0);
@@ -1903,6 +1938,15 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                     pause_on_retire_address);
             }
 
+            // THE REPAIR MAY ALREADY HAVE HAPPENED, AT EXECUTE. If it did, the
+            // front end has been fetching the corrected path since the branch
+            // resolved and everything younger has already gone; the reorder
+            // buffer's head has nothing left to repair.
+            VanadisSpeculatedInstruction* mispredicted = rob_front->asSpeculated();
+            const bool already_repaired = (nullptr != mispredicted) && mispredicted->misspeculationHandled();
+
+            if ( UNLIKELY(perform_pipeline_clear && already_repaired) ) { perform_pipeline_clear = false; }
+
             if ( UNLIKELY(perform_pipeline_clear) )
             {
                 #ifdef VANADIS_BUILD_DEBUG
@@ -1914,9 +1958,16 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 // branch found, then replay this branch with the direction and
                 // target it actually took. The reorder-buffer entry is still
                 // alive here, which is what carries the checkpoint.
-                VanadisSpeculatedInstruction* mispredicted = rob_front->asSpeculated();
-
                 if ( nullptr != mispredicted ) {
+                    // HOW LONG THE WRONG PATH RAN. The branch knew its answer
+                    // when the execute-stage scan stamped it; the front end is
+                    // only being turned round now, at the head of the reorder
+                    // buffer, which on this core is after every older load has
+                    // come back from memory.
+                    if ( mispredicted->resolveStamped() ) {
+                        stat_redirect_delay->addData(cycle - mispredicted->resolveCycle());
+                    }
+
                     thr_decoder->getBranchPredictor()->repair(
                         mispredicted->getBranchCheckpoint(), mispredicted->resolvedTaken(), pipeline_reset_addr);
                 }
@@ -1925,6 +1976,7 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 // discarding everything unretired, so the predictor is never
                 // left carrying speculative state for instructions that no
                 // longer exist.
+                stat_wrong_path_squashed->addData(rob->size() - 1);
                 handleMisspeculate(ins_thread, pipeline_reset_addr, nullptr == mispredicted);
                 stat_branch_mispredicts->addData(1);
             }
@@ -2344,6 +2396,15 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     }
     #endif
     performExecute(cycle);
+
+    // MIS-SPECULATION IS DISCOVERED HERE, NOT AT THE HEAD OF THE REORDER
+    // BUFFER. A branch that has executed knows where it went; if that is not
+    // where the front end guessed, everything younger goes now and fetch is
+    // turned round now. This runs after execute so that a branch resolved this
+    // cycle is acted on in the same cycle, and before issue so that nothing
+    // wrong-path is dispatched after the branch that kills it.
+    resolveBranchesAtExecute(cycle);
+
 
     // Issue
     // //////////////////////////////////////////////////////////////////////////
@@ -2969,6 +3030,312 @@ VANADIS_COMPONENT::handleMisspeculate(const uint32_t hw_thr, const uint64_t new_
         VANADIS_VERB(output, 8, 0, "-> Mis-speculate repair finished.\n");
     }
     #endif
+}
+
+// MIS-SPECULATION IS REPAIRED WHERE A REAL CORE REPAIRS IT: AT EXECUTE.
+//
+// A branch that has executed knows where it went. If that is not where the
+// front end guessed, everything fetched after it is wrong-path work and the
+// machine can stop making more of it now, rather than when the branch reaches
+// the head of the reorder buffer -- which, on this core, is after every older
+// load has come back from memory.
+//
+// Only the OLDEST resolved wrong branch is acted on. A younger one may itself
+// be on the wrong path of an older branch that has not executed yet; when that
+// older one resolves, this runs again and takes the younger one with it, which
+// is what a real core does too.
+void
+VANADIS_COMPONENT::resolveBranchesAtExecute(const uint64_t cycle)
+{
+    for ( uint32_t thr = 0; thr < hw_threads; ++thr ) {
+        if ( halted_masks[thr] ) { continue; }
+
+        VanadisCircularQueue<VanadisInstruction*>* thr_rob = rob[thr];
+
+        for ( size_t i = 0; i < thr_rob->size(); ++i ) {
+            VanadisInstruction* ins = thr_rob->peekAt(i);
+
+            if ( LIKELY(!ins->isSpeculated()) ) { continue; }
+
+            VanadisSpeculatedInstruction* spec = ins->asSpeculated();
+            if ( nullptr == spec ) { continue; }
+            if ( spec->misspeculationHandled() ) { continue; }
+            if ( !spec->completedExecution() ) {
+                // An unresolved branch: nothing younger can be judged yet,
+                // because it may all be about to disappear.
+                break;
+            }
+
+            // A DELAY-SLOT BRANCH IS LEFT TO RETIRE. The instruction in its
+            // shadow is architecturally after it and is not wrong-path work,
+            // and the reorder buffer's head is where that is sorted out. No
+            // RISC-V branch has a delay slot; the MIPS decoder's do.
+            if ( VANADIS_NO_DELAY_SLOT != spec->getDelaySlotType() ) { continue; }
+
+            // The first cycle the branch's own answer is known, whether or not
+            // the repair is made from here.
+            spec->stampResolveCycle(cycle);
+
+            if ( spec->getTakenAddress() == spec->getSpeculatedAddress() ) {
+                // Predicted correctly. Nothing to do, and the branch is not
+                // looked at again.
+                spec->markMisspeculationHandled();
+                continue;
+            }
+
+            if ( !execute_branch_resolve_ ) { break; }
+
+            // A BRANCH THE BUFFER NEVER MARKED HAS NO RECORD, and without one
+            // the predictor cannot be told which of its records are younger
+            // than this branch. That happens the first time a conditional
+            // branch is taken, and once, because resolving taken is what marks
+            // it; such a branch is left to the head of the reorder buffer,
+            // where the repair discards everything unretired and needs no
+            // record to do it.
+            if ( !spec->getBranchCheckpoint().valid() ) { break; }
+
+            if ( squashAfterBranch(thr, i, spec->getTakenAddress()) ) {
+                stat_branch_mispredicts->addData(1);
+                stat_execute_squash->addData(1);
+                stat_redirect_delay->addData(cycle - spec->resolveCycle());
+            }
+            break;
+        }
+    }
+}
+
+// Throw away everything younger than the branch at `branch_index`, put the
+// rename map back to what that branch found, and redirect the front end.
+// Everything older is on the right path and is not touched.
+bool
+VANADIS_COMPONENT::squashAfterBranch(const uint32_t hw_thr, const size_t branch_index, const uint64_t new_ip)
+{
+    VanadisCircularQueue<VanadisInstruction*>* thr_rob = rob[hw_thr];
+
+    VanadisSpeculatedInstruction* branch = thr_rob->peekAt(branch_index)->asSpeculated();
+    if ( nullptr == branch ) { return false; }
+
+    // WITHOUT THE BRANCH'S RENAME MAP THERE IS NOTHING TO GO BACK TO. A branch
+    // that has executed has been renamed, so this cannot happen; if it ever
+    // did, leaving the repair to the head of the reorder buffer is correct and
+    // merely slower.
+    if ( !branch->hasRenameMap() ) { return false; }
+
+    const size_t total   = thr_rob->size();
+    const size_t victims = total - (branch_index + 1);
+
+    branch->markMisspeculationHandled();
+
+    if ( victims > 0 ) {
+        std::unordered_set<VanadisInstruction*> dead;
+        std::vector<uint16_t>                   dead_slots;
+        dead.reserve(victims);
+        dead_slots.reserve(victims);
+
+        for ( size_t i = branch_index + 1; i < total; ++i ) {
+            dead.insert(thr_rob->peekAt(i));
+            dead_slots.push_back(static_cast<uint16_t>(thr_rob->physicalIndex(i)));
+        }
+
+        // The scheduler first: its ready sets, waiter lists and memory-order
+        // queue name instructions that are about to be deleted.
+        dropInstructionsFromScheduler(hw_thr, dead, dead_slots);
+
+        clearFuncUnitInstructions(fu_int_arith, dead);
+        clearFuncUnitInstructions(fu_int_mul, dead);
+        clearFuncUnitInstructions(fu_int_div, dead);
+        clearFuncUnitInstructions(fu_fp_arith, dead);
+        clearFuncUnitInstructions(fu_fp_div, dead);
+        clearFuncUnitInstructions(fu_branch, dead);
+
+        const size_t wrong_path_loads_sent = lsq->clearLSQAfter(hw_thr, dead);
+        if ( wrong_path_loads_sent > 0 ) { stat_wrong_path_loads_sent->addData(wrong_path_loads_sent); }
+
+        for ( auto& q : rocc_queues_ ) {
+            size_t keep = 0;
+            for ( size_t i = 0; i < q.size(); ++i ) {
+                if ( dead.count(q[i]) == 0 ) { q[keep++] = q[i]; }
+            }
+            q.resize(keep);
+        }
+
+        // THE PHYSICAL REGISTERS AND THE PENDING COUNTS GO BACK ONE
+        // INSTRUCTION AT A TIME, which is exactly what retirement does to them
+        // on the other path. A saved copy of the counts would be stale: an
+        // older instruction retiring between the branch's rename and now has
+        // already decremented them.
+        VanadisISATable* issue_tbl = issue_isa_tables[hw_thr];
+
+        uint64_t wrong_path_renamed  = 0;
+        uint64_t wrong_path_executed = 0;
+        uint64_t wrong_path_loads    = 0;
+
+        for ( size_t i = total; i > branch_index + 1; --i ) {
+            VanadisInstruction* victim = thr_rob->peekAt(i - 1);
+
+            if ( INST_LOAD == victim->getInstFuncType() ) { ++wrong_path_loads; }
+            if ( victim->completedExecution() ) { ++wrong_path_executed; }
+
+            if ( victim->completedRename() ) {
+                ++wrong_path_renamed;
+                for ( uint16_t k = 0; k < victim->countISAIntRegIn(); ++k ) {
+                    issue_tbl->decIntRead(victim->getISAIntRegIn(k));
+                }
+                for ( uint16_t k = 0; k < victim->countISAFPRegIn(); ++k ) {
+                    issue_tbl->decFPRead(victim->getISAFPRegIn(k));
+                }
+                for ( uint16_t k = 0; k < victim->countISAIntRegOut(); ++k ) {
+                    issue_tbl->decIntWrite(victim->getISAIntRegOut(k));
+                }
+                for ( uint16_t k = 0; k < victim->countISAFPRegOut(); ++k ) {
+                    issue_tbl->decFPWrite(victim->getISAFPRegOut(k));
+                }
+
+                victim->returnOutRegs(int_register_stack, fp_register_stack);
+
+                for ( uint16_t k = 0; k < victim->countPhysIntRegOut(); ++k ) {
+                    setIntRegReady(victim->getPhysIntRegOut(k));
+                }
+                for ( uint16_t k = 0; k < victim->countPhysFPRegOut(); ++k ) {
+                    setFPRegReady(victim->getPhysFPRegOut(k));
+                }
+            }
+
+            delete victim;
+        }
+
+        thr_rob->popBack(victims);
+        stat_rob_cleared_entries->addData(victims);
+        stat_wrong_path_squashed->addData(victims);
+        if ( wrong_path_renamed > 0 ) { stat_wrong_path_renamed->addData(wrong_path_renamed); }
+        if ( wrong_path_executed > 0 ) { stat_wrong_path_executed->addData(wrong_path_executed); }
+        if ( wrong_path_loads > 0 ) { stat_wrong_path_loads->addData(wrong_path_loads); }
+
+        // The map the branch found. Rename is in program order, so the only
+        // instructions that have written it since are the ones just deleted.
+        branch->restoreRenameMap(issue_tbl);
+    }
+
+    // The predictor's speculative history goes back to what this branch found
+    // and is advanced again with what actually happened. The branch's own
+    // record stays: it is still in the reorder buffer and has still to train
+    // the tables when it retires.
+    VanadisBranchUnit* bp = thread_decoders[hw_thr]->getBranchPredictor();
+    if ( nullptr != bp ) {
+        bp->repairAtExecute(
+            branch->getBranchCheckpoint(), branch->getInstructionAddress(), branch->getBranchClass(),
+            branch->resolvedTaken(), new_ip);
+    }
+
+    // The front end restarts down the corrected path. This is also what throws
+    // away the fetch target queue and the fetch stage's run-ahead.
+    thread_decoders[hw_thr]->setInstructionPointerAfterMisspeculate(new_ip);
+
+    return true;
+}
+
+void
+VANADIS_COMPONENT::dropInstructionsFromScheduler(
+    const uint32_t hw_thr, const std::unordered_set<VanadisInstruction*>& victims,
+    const std::vector<uint16_t>& slots)
+{
+    VanadisIssueScheduler& s = sched[hw_thr];
+
+    // The write-back queue holds results of instructions that will not exist.
+    if ( !writeback_q.empty() ) {
+        size_t keep = 0;
+        for ( size_t i = 0; i < writeback_q.size(); ++i ) {
+            if ( victims.count(writeback_q[i]) == 0 ) { writeback_q[keep++] = writeback_q[i]; }
+        }
+        writeback_q.resize(keep);
+    }
+
+    std::vector<bool> is_dead(s.rob_slots_, false);
+    for ( const uint16_t slot : slots ) {
+        if ( slot < s.rob_slots_ ) { is_dead[slot] = true; }
+    }
+
+    uint32_t renamed_gone = 0;
+    uint32_t coproc_gone  = 0;
+    bool     syscall_gone = false;
+
+    // THE WAITER LISTS FIRST, AND BEFORE ANY `wait_next_` IS CLEARED.
+    //
+    // A squashed slot may be linked behind a physical register that a surviving
+    // instruction is also waiting on, and the list runs THROUGH it: clearing
+    // the squashed slot's link before unlinking it truncates the list and
+    // leaves every survivor behind it waiting for a wake-up that can no longer
+    // reach it. That is a deadlock, and it is why this loop comes first.
+    for ( size_t p = 0; p < s.int_waiter_.size(); ++p ) {
+        uint16_t* link = &s.int_waiter_[p];
+        while ( VanadisIssueScheduler::NO_SLOT != *link ) {
+            const uint16_t w = *link;
+            if ( (w < s.rob_slots_) && is_dead[w] ) { *link = s.wait_next_[w]; }
+            else                                    { link = &s.wait_next_[w]; }
+        }
+    }
+    for ( size_t p = 0; p < s.fp_waiter_.size(); ++p ) {
+        uint16_t* link = &s.fp_waiter_[p];
+        while ( VanadisIssueScheduler::NO_SLOT != *link ) {
+            const uint16_t w = *link;
+            if ( (w < s.rob_slots_) && is_dead[w] ) { *link = s.wait_next_[w]; }
+            else                                    { link = &s.wait_next_[w]; }
+        }
+    }
+
+    for ( const uint16_t slot : slots ) {
+        if ( slot >= s.rob_slots_ ) { continue; }
+
+        VanadisInstruction* v = rob[hw_thr]->peekAtPhysical(static_cast<int>(slot));
+
+        // Every class's ready bit, because a slot is only ever ready in one and
+        // clearing the others costs a word each.
+        for ( int c = 0; c < VSC_COUNT; ++c ) { s.clearReady(static_cast<uint8_t>(c), slot); }
+        s.wait_next_[slot] = VanadisIssueScheduler::NO_SLOT;
+
+        if ( (nullptr == v) || !v->completedRename() ) { continue; }
+
+        ++renamed_gone;
+
+        // AN ISSUE-QUEUE ENTRY IS GIVEN BACK AT ISSUE. One that has issued has
+        // already given its entry back; one that has not still holds it.
+        if ( !v->completedIssue() ) { s.releaseQueue(vanadisSchedQueueOf(s.slot_class_[slot])); }
+
+        if ( VSC_ROCC == s.slot_class_[slot] ) { ++coproc_gone; }
+        if ( INST_SYSCALL == v->getInstFuncType() ) { syscall_gone = true; }
+    }
+
+    // The memory-order queue.
+    if ( !s.mem_order_.empty() ) {
+        std::deque<VanadisMemOrderEntry> keep;
+        for ( const auto& e : s.mem_order_ ) {
+            if ( (e.slot < s.rob_slots_) && is_dead[e.slot] ) { continue; }
+            keep.push_back(e);
+        }
+        s.mem_order_.swap(keep);
+    }
+
+    s.renamed_count_ = (s.renamed_count_ > renamed_gone) ? (s.renamed_count_ - renamed_gone) : 0;
+
+    // A coprocessor instruction issues only at the head of the reorder buffer,
+    // so a squashed one has been dispatched and nothing more.
+    s.coproc_dispatched_ = (s.coproc_dispatched_ > coproc_gone) ? (s.coproc_dispatched_ - coproc_gone) : 0;
+
+    // A system call renames only at the head of the reorder buffer and nothing
+    // younger renames until it retires, so a squashed one is the only one there
+    // can be and the barrier goes with it.
+    if ( syscall_gone ) { s.syscall_barrier_ = false; }
+}
+
+// Every functional unit of a class drops the records of instructions that are
+// being squashed.
+void
+VANADIS_COMPONENT::clearFuncUnitInstructions(
+    std::vector<VanadisFunctionalUnit*>& unit, const std::unordered_set<VanadisInstruction*>& victims)
+{
+    for ( VanadisFunctionalUnit* next_fu : unit ) {
+        next_fu->clearInstructions(victims);
+    }
 }
 
 void

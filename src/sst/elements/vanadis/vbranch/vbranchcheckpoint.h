@@ -133,13 +133,14 @@ template <typename RECORD>
 class VanadisCheckpointRing
 {
 public:
-    VanadisCheckpointRing() : head_(0), tail_(0), count_(0), exhausted_(0), stale_(0) {}
+    VanadisCheckpointRing() : head_(0), tail_(0), count_(0), undecoded_(0), exhausted_(0), stale_(0) {}
 
     void resize(const uint32_t n)
     {
         entry_.assign(n == 0 ? 1 : n, RECORD());
         gen_.assign(entry_.size(), 1);
         head_ = tail_ = count_ = 0;
+        undecoded_ = 0;
     }
 
     uint32_t capacity() const { return static_cast<uint32_t>(entry_.size()); }
@@ -163,8 +164,62 @@ public:
 
         handle->slot = static_cast<uint16_t>(slot);
         handle->gen  = gen_[slot];
+        undecoded_++;
 
         return &entry_[slot];
+    }
+
+    // THE DECODE STAGE HAS CAUGHT UP WITH THIS RECORD. Records are allocated
+    // by the fetch stage, in fetch order, and consumed by the decode stage in
+    // the same order; the ones between the two stages are the fetch stage's
+    // run-ahead, and they are what a re-steer at decode throws away.
+    void markDecoded(const VanadisBranchCheckpoint& handle)
+    {
+        if ( handleIsLive(handle) && (undecoded_ > 0) ) { undecoded_--; }
+    }
+
+    uint32_t undecodedCount() const { return undecoded_; }
+
+    // Throw away the fetch stage's run-ahead: every record allocated after the
+    // last one the decode stage consumed. Nothing older is touched, so the
+    // branches already in the reorder buffer keep their records.
+    uint32_t discardUndecoded()
+    {
+        const uint32_t n       = static_cast<uint32_t>(entry_.size());
+        const uint32_t discard = (undecoded_ > count_) ? count_ : undecoded_;
+
+        for ( uint32_t i = 0; i < discard; ++i ) {
+            const uint32_t slot = (head_ + n - 1 - i) % n;
+            gen_[slot]          = static_cast<uint16_t>(gen_[slot] + 1);
+        }
+
+        head_      = (head_ + n - discard) % n;
+        count_    -= discard;
+        undecoded_ = 0;
+        return discard;
+    }
+
+    // Everything younger than this record, decoded or not. The record itself
+    // stays live, because the branch that owns it is still in the reorder
+    // buffer and has still to retire.
+    uint32_t discardYoungerThan(const VanadisBranchCheckpoint& handle)
+    {
+        if ( !handleIsLive(handle) ) { return 0; }
+
+        const uint32_t n     = static_cast<uint32_t>(entry_.size());
+        const uint32_t after = (static_cast<uint32_t>(handle.slot) + 1) % n;
+
+        uint32_t discard = 0;
+        while ( head_ != after ) {
+            head_ = (head_ + n - 1) % n;
+            gen_[head_] = static_cast<uint16_t>(gen_[head_] + 1);
+            ++discard;
+            if ( discard > n ) { break; }
+        }
+
+        count_    -= (discard > count_) ? count_ : discard;
+        undecoded_ = 0;
+        return discard;
     }
 
     bool handleIsLive(const VanadisBranchCheckpoint& handle) const
@@ -197,6 +252,18 @@ public:
     // Records still in the ring, newest first. After retire() of the
     // mispredicting branch these are exactly the wrong-path branches.
     uint32_t youngerCount() const { return count_; }
+    uint32_t tailSlot() const { return tail_; }
+    RECORD&  slotRecord(const uint32_t slot) { return entry_[slot]; }
+    uint32_t headSlot() const { return head_; }
+
+    // Records allocated after this one and still live.
+    uint32_t countYoungerThan(const VanadisBranchCheckpoint& handle) const
+    {
+        if ( !handleIsLive(handle) ) { return 0; }
+        const uint32_t n     = static_cast<uint32_t>(entry_.size());
+        const uint32_t after = (static_cast<uint32_t>(handle.slot) + 1) % n;
+        return (head_ + n - after) % n;
+    }
 
     RECORD& younger(const uint32_t i)
     {
@@ -213,8 +280,9 @@ public:
             const uint32_t slot = (tail_ + i) % n;
             gen_[slot]          = static_cast<uint16_t>(gen_[slot] + 1);
         }
-        head_  = tail_;
-        count_ = 0;
+        head_      = tail_;
+        count_     = 0;
+        undecoded_ = 0;
     }
 
 private:
@@ -223,6 +291,7 @@ private:
     uint32_t              head_;
     uint32_t              tail_;
     uint32_t              count_;
+    uint32_t              undecoded_;
     uint64_t              exhausted_;
     uint64_t              stale_;
 };

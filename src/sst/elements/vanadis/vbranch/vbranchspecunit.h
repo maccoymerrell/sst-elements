@@ -16,7 +16,7 @@
 #ifndef _H_VANADIS_BRANCH_SPECULATIVE_UNIT
 #define _H_VANADIS_BRANCH_SPECULATIVE_UNIT
 
-#include "vbranch/vbranchbtb.h"
+#include "vbranch/vbranchfetchbtb.h"
 #include "vbranch/vbranchcheckpoint.h"
 #include "vbranch/vbranchspeccore.h"
 #include "vbranch/vbranchunit.h"
@@ -41,7 +41,8 @@ public:
 
     VanadisSpeculativeBranchUnit(ComponentId_t id, Params& params) :
         VanadisBranchUnit(id, params),
-        btb(params.find<uint32_t>("branch_entries", 1536))
+        btb(params.find<uint32_t>("btb_l1_entries", 1536), params.find<uint32_t>("btb_l2_entries", 7680),
+            params.find<uint64_t>("btb_block_bytes", 64))
     {
         const uint32_t verbose = params.find<uint32_t>("verbose", 0);
         output_                = new SST::Output("[branch-unit]: ", verbose, 0, SST::Output::STDOUT);
@@ -61,6 +62,21 @@ public:
         stat_wrong_path_branches  = registerStatistic<uint64_t>("wrong_path_branches", "1");
         stat_predictions          = registerStatistic<uint64_t>("predictions", "1");
 
+        stat_btb_l1_hit        = registerStatistic<uint64_t>("btb_l1_hit", "1");
+        stat_btb_l2_hit        = registerStatistic<uint64_t>("btb_l2_hit", "1");
+        stat_btb_miss          = registerStatistic<uint64_t>("btb_miss", "1");
+        stat_btb_alloc         = registerStatistic<uint64_t>("btb_alloc", "1");
+        stat_btb_evict         = registerStatistic<uint64_t>("btb_evict", "1");
+        stat_btb_slot_overflow = registerStatistic<uint64_t>("btb_slot_overflow", "1");
+        stat_btb_unknown       = registerStatistic<uint64_t>("btb_unknown_at_decode", "1");
+        stat_fetch_mispredict  = registerStatistic<uint64_t>("fetch_stage_mispredict", "1");
+        stat_override          = registerStatistic<uint64_t>("override_count", "1");
+        stat_override_right    = registerStatistic<uint64_t>("override_correct", "1");
+        stat_override_wrong    = registerStatistic<uint64_t>("override_wrong", "1");
+        stat_override_missing  = registerStatistic<uint64_t>("override_missed", "1");
+        stat_runahead_discard  = registerStatistic<uint64_t>("runahead_records_discarded", "1");
+        stat_execute_repairs   = registerStatistic<uint64_t>("execute_repairs", "1");
+
         stat_class_branches[0] = registerStatistic<uint64_t>("conditional_branches", "1");
         stat_class_branches[1] = registerStatistic<uint64_t>("direct_jump_branches", "1");
         stat_class_branches[2] = registerStatistic<uint64_t>("direct_call_branches", "1");
@@ -79,16 +95,21 @@ public:
     virtual ~VanadisSpeculativeBranchUnit() { delete output_; }
 
     // ---- the address-only interface, still a target buffer -----------------
-    void push(const uint64_t ins_addr, const uint64_t pred_addr) override
-    {
-        if ( btb.push(ins_addr, pred_addr) ) { stat_branch_cache_castout->addData(1); }
-    }
+    // THE ADDRESS-ONLY INTERFACE IS THE FETCH BUFFER, READ BY ITS OWN NAME.
+    // There is one target buffer in this unit, not two: these three methods
+    // are the old address-only view of the same slots the fetch stage reads.
+    void push(const uint64_t ins_addr, const uint64_t pred_addr) override { btb.setTarget(ins_addr, pred_addr); }
 
-    uint64_t predictAddress(const uint64_t addr) override { return btb.predict(addr); }
+    uint64_t predictAddress(const uint64_t addr) override
+    {
+        VanadisFetchBTB::Slot* s = btb.slotFor(addr);
+        return ((nullptr != s) && s->has_target) ? s->target : 0;
+    }
 
     bool contains(const uint64_t addr) override
     {
-        const bool found = btb.contains(addr);
+        VanadisFetchBTB::Slot* s     = btb.slotFor(addr);
+        const bool             found = (nullptr != s) && s->has_target;
         if ( found ) { stat_branch_hits->addData(1); }
         else {
             stat_branch_misses->addData(1);
@@ -127,31 +148,210 @@ public:
         uint64_t pc, VanadisBranchClass cls, uint64_t static_target, bool has_static_target, uint64_t fallthrough,
         VanadisBranchCheckpoint* ckpt) override
     {
-        const bool     hit    = btb.contains(pc);
-        const uint64_t target = hit ? btb.predict(pc) : 0;
+        VanadisFetchBTB::Slot* s      = btb.slotFor(pc);
+        const bool             hit    = (nullptr != s) && s->has_target;
+        const uint64_t         target = hit ? s->target : 0;
 
         return predictor.predictTarget(pc, cls, static_target, has_static_target, fallthrough, target, hit, ckpt);
     }
 
+    // ---- the two-stage front end -------------------------------------------
+
+    bool     hasFetchStage() const override { return true; }
+    uint64_t fetchBlockBytes() const override { return btb.blockBytes(); }
+
+    VanadisFetchBlockPrediction predictFetchBlock(uint64_t pc) override
+    {
+        VanadisFetchBlockPrediction out;
+
+        const VanadisFetchBTB::Lookup lk = btb.lookup(pc);
+        out.block_hit = lk.block_hit;
+        out.from_l2   = lk.from_l2;
+
+        if ( lk.from_l2 ) { stat_btb_l2_hit->addData(1); }
+        else if ( lk.block_hit ) {
+            stat_btb_l1_hit->addData(1);
+        }
+        else {
+            stat_btb_miss->addData(1);
+        }
+
+        if ( !lk.found ) { return out; }
+
+        out.found      = true;
+        out.branch_pc  = lk.branch_pc;
+        out.branch_end = lk.branch_pc + lk.slot.width;
+        out.cls        = lk.slot.cls;
+
+        uint64_t next = 0;
+        out.taken     = predictor.predictAtFetch(
+            lk.branch_pc, lk.slot.cls, lk.slot.target, lk.slot.has_target && !vanadisBranchIsIndirect(lk.slot.cls),
+            out.branch_end, true, lk.slot.pred, lk.slot.hyst, lk.block_hit, lk.from_l2, lk.slot.width, lk.slot.target,
+            lk.slot.has_target, &out.ckpt, &next);
+
+        if ( !out.ckpt.valid() ) {
+            output_->fatal(
+                CALL_INFO, -1,
+                "Branch predictor checkpoint ring is exhausted (%" PRIu32 " entries, %" PRIu32 " in flight).\n",
+                predictor.capacity(), predictor.inFlight());
+            out.found = false;
+            return out;
+        }
+
+        stat_predictions->addData(1);
+        stat_class_branches[static_cast<int>(lk.slot.cls)]->addData(1);
+
+        out.next = out.taken ? next : out.branch_end;
+        return out;
+    }
+
+    bool btbMarks(uint64_t pc) override { return nullptr != btb.slotFor(pc); }
+
+    bool recordUnpredicted(
+        uint64_t pc, VanadisBranchClass cls, uint64_t fallthrough, uint8_t width,
+        VanadisBranchCheckpoint* ckpt) override
+    {
+        if ( !predictor.recordUnpredicted(pc, cls, fallthrough, width, ckpt) ) {
+            output_->fatal(
+                CALL_INFO, -1,
+                "Branch predictor checkpoint ring is exhausted (%" PRIu32 " entries, %" PRIu32 " in flight).\n",
+                predictor.capacity(), predictor.inFlight());
+            return false;
+        }
+
+        stat_predictions->addData(1);
+        stat_class_branches[static_cast<int>(cls)]->addData(1);
+        return true;
+    }
+
+    bool predictAtDecode(
+        uint64_t pc, VanadisBranchClass cls, uint64_t static_target, bool has_static_target, uint64_t fallthrough,
+        uint8_t width, VanadisBranchCheckpoint* ckpt, uint64_t* next_pc) override
+    {
+        stat_btb_unknown->addData(1);
+
+        // The branch IS marked -- the decode stage checked before calling --
+        // but the fetch stage's run-ahead is somewhere else, so the prediction
+        // the fetch stage would have made is made here instead, out of the
+        // same entry.
+        VanadisFetchBTB::Slot* s          = btb.slotFor(pc);
+        const bool             marked     = (nullptr != s);
+        const bool             has_target = marked && s->has_target;
+        const uint64_t         target     = has_target ? s->target : 0;
+
+        uint64_t next = fallthrough;
+        predictor.predictAtFetch(
+            pc, cls, static_target, has_static_target, fallthrough, marked, marked ? s->pred : 0,
+            marked ? s->hyst : 1, marked, false, width, target, has_target, ckpt, &next);
+
+        if ( !ckpt->valid() ) {
+            output_->fatal(
+                CALL_INFO, -1,
+                "Branch predictor checkpoint ring is exhausted (%" PRIu32 " entries, %" PRIu32 " in flight).\n",
+                predictor.capacity(), predictor.inFlight());
+            return false;
+        }
+
+        stat_predictions->addData(1);
+        stat_class_branches[static_cast<int>(cls)]->addData(1);
+
+        *next_pc = next;
+        return true;
+    }
+
+    bool overrideAtDecode(
+        const VanadisBranchCheckpoint& ckpt, uint64_t static_target, bool has_static_target, uint64_t fallthrough,
+        uint64_t* next_pc) override
+    {
+        uint32_t   discarded = 0;
+        const bool did       = predictor.overrideAtDecode(ckpt, static_target, has_static_target, fallthrough,
+                                                          next_pc, &discarded);
+        if ( did ) {
+            stat_override->addData(1);
+            if ( discarded > 0 ) { stat_runahead_discard->addData(discarded); }
+        }
+        return did;
+    }
+
+    void markDecoded(const VanadisBranchCheckpoint& ckpt) override { predictor.markDecoded(ckpt); }
+
+    uint32_t discardRunAhead() override
+    {
+        const uint32_t n = predictor.discardRunAhead();
+        if ( n > 0 ) { stat_runahead_discard->addData(n); }
+        return n;
+    }
+
+    uint32_t repairAtExecute(
+        const VanadisBranchCheckpoint& ckpt, uint64_t pc, VanadisBranchClass cls, bool taken,
+        uint64_t target) override
+    {
+        bool   bim_dirty = false;
+        int8_t bim_pred  = 0;
+        int8_t bim_hyst  = 1;
+
+        const uint32_t n = predictor.repairAtExecute(ckpt, pc, cls, taken, &bim_dirty, &bim_pred, &bim_hyst);
+
+        // The buffer's own counter learns here too, for the same reason.
+        if ( bim_dirty ) { btb.setBimodal(pc, bim_pred, bim_hyst); }
+        if ( taken ) { btb.setTarget(pc, target); }
+
+        stat_execute_repairs->addData(1);
+        stat_wrong_path_branches->addData(n);
+        return n;
+    }
+
     // ---- training ----------------------------------------------------------
     void update(
-        uint64_t pc, VanadisBranchClass cls, bool taken, uint64_t target,
-        const VanadisBranchCheckpoint& ckpt) override
+        uint64_t pc, VanadisBranchClass cls, bool taken, uint64_t target, const VanadisBranchCheckpoint& ckpt,
+        uint8_t ins_width) override
     {
+        uint8_t  width          = ins_width;
+        bool     marked         = false;
+        bool     bim_dirty      = false;
+        int8_t   bim_pred       = 0;
+        int8_t   bim_hyst       = 1;
+
         if ( predictor.live(ckpt) ) {
             const Checkpoint& C = predictor.record(ckpt);
+            width  = C.width;
+            marked = C.bim_valid;
 
-            if ( taken != C.pred_dir ) {
+            // THE TWO STAGES ARE SCORED SEPARATELY, IN PROGRAM ORDER.
+            //
+            // `fetch_dir` is what the branch target buffer's bimodal counter
+            // steered fetch with; `final_dir` is what the front end settled on
+            // after the tagged predictor had its say. Repair never writes
+            // either, so both are still what they were when the branch was
+            // predicted.
+            if ( vanadisBranchIsConditional(cls) && (taken != C.fetch_dir) ) {
+                stat_fetch_mispredict->addData(1);
+            }
+
+            if ( C.overridden ) {
+                if ( taken == C.final_dir ) { stat_override_right->addData(1); }
+                else {
+                    stat_override_wrong->addData(1);
+                }
+            }
+            else if ( vanadisBranchIsConditional(cls) && (taken != C.final_dir) && (C.tage_dir == taken) ) {
+                // The tagged predictor had the right answer and did not use it,
+                // which cannot happen while the override is unconditional; the
+                // counter exists so that it is visible if it ever does.
+                stat_override_missing->addData(1);
+            }
+
+            if ( taken != C.final_dir ) {
                 stat_direction_mispredict->addData(1);
                 stat_class_mispredict[static_cast<int>(cls)]->addData(1);
             }
-            else if ( taken && (target != C.pred_target) ) {
+            else if ( taken && (target != C.final_target) ) {
                 stat_target_mispredict->addData(1);
                 stat_class_mispredict[static_cast<int>(cls)]->addData(1);
             }
 
             if ( C.used_ras ) {
-                if ( target == C.pred_target ) { stat_ras_hit->addData(1); }
+                if ( target == C.final_target ) { stat_ras_hit->addData(1); }
                 else {
                     stat_ras_miss->addData(1);
                 }
@@ -161,14 +361,53 @@ public:
         if ( !predictor.update(pc, cls, taken, target, ckpt) ) {
             output_->fatal(
                 CALL_INFO, -1,
-                "Branch predictor checkpoint released out of order: branches retire in program order, "
-                "so the record released has to be the oldest one in the ring.\n");
+                "Branch predictor checkpoint released out of order at pc 0x%" PRIx64 ": slot %" PRIu16
+                " gen %" PRIu16 ", ring tail %" PRIu32 " (pc 0x%" PRIx64 ") head %" PRIu32 " in-flight %" PRIu32
+                " live %d.\n",
+                pc, ckpt.slot, ckpt.gen, predictor.tailSlot(), predictor.tailPC(), predictor.headSlot(), predictor.inFlight(),
+                predictor.live(ckpt) ? 1 : 0);
+        }
+
+        // THE BUFFER LEARNS HERE, AND ONLY HERE. A branch it did not hold is
+        // marked now that it has resolved -- a conditional only if it resolved
+        // taken, which is the rule the marked slots exist to express -- and a
+        // branch it did hold has its bimodal counter written back and, if it
+        // is indirect, its target refreshed.
+        {
+            const Checkpoint* C = predictor.liveRecord(ckpt);
+            if ( nullptr != C ) {
+                bim_dirty = C->bim_dirty;
+                bim_pred  = C->bim_pred;
+                bim_hyst  = C->bim_hyst;
+            }
+        }
+
+        syncBufferCounters();
+
+        if ( !marked ) {
+            const uint64_t alloc_target = taken ? target : 0;
+            const size_t   before       = (size_t)btb.allocations();
+            btb.allocate(pc, cls, width, alloc_target, taken, taken);
+            if ( (size_t)btb.allocations() != before ) { stat_btb_alloc->addData(1); }
+        }
+        else {
+            if ( bim_dirty ) { btb.setBimodal(pc, bim_pred, bim_hyst); }
+            if ( taken ) { btb.setTarget(pc, target); }
         }
     }
 
     // ---- repair ------------------------------------------------------------
     void repair(const VanadisBranchCheckpoint& ckpt, bool taken, uint64_t target) override
     {
+        // A branch the buffer never marked made no record, so there is nothing
+        // to repair to: everything unretired is being thrown away, and the
+        // architected state is the right speculative state.
+        if ( !predictor.live(ckpt) ) {
+            predictor.repairToCommit();
+            stat_checkpoints_repaired->addData(1);
+            return;
+        }
+
         stat_wrong_path_branches->addData(predictor.repair(ckpt, taken));
         stat_checkpoints_repaired->addData(1);
     }
@@ -183,8 +422,28 @@ public:
     }
 
 protected:
+    // The buffer keeps plain counters; this hands their increments to the
+    // statistics engine once per retired branch, which is often enough for
+    // structures that only change when a branch resolves.
+    void syncBufferCounters()
+    {
+        const uint64_t evict = btb.l1Evictions() + btb.l2Evictions();
+        if ( evict > last_evict_ ) {
+            stat_btb_evict->addData(evict - last_evict_);
+            last_evict_ = evict;
+        }
+        const uint64_t over = btb.slotOverflow();
+        if ( over > last_overflow_ ) {
+            stat_btb_slot_overflow->addData(over - last_overflow_);
+            last_overflow_ = over;
+        }
+    }
+
+    uint64_t last_evict_    = 0;
+    uint64_t last_overflow_ = 0;
+
     VanadisSpeculativePredictor<CORE> predictor;
-    VanadisBranchTargetBuffer         btb;
+    VanadisFetchBTB                   btb;
     SST::Output*                      output_ = nullptr;
 
     Statistic<uint64_t>* stat_branch_hits;
@@ -199,6 +458,21 @@ protected:
     Statistic<uint64_t>* stat_predictions;
     Statistic<uint64_t>* stat_class_branches[6];
     Statistic<uint64_t>* stat_class_mispredict[6];
+
+    Statistic<uint64_t>* stat_btb_l1_hit;
+    Statistic<uint64_t>* stat_btb_l2_hit;
+    Statistic<uint64_t>* stat_btb_miss;
+    Statistic<uint64_t>* stat_btb_alloc;
+    Statistic<uint64_t>* stat_btb_evict;
+    Statistic<uint64_t>* stat_btb_slot_overflow;
+    Statistic<uint64_t>* stat_btb_unknown;
+    Statistic<uint64_t>* stat_fetch_mispredict;
+    Statistic<uint64_t>* stat_override;
+    Statistic<uint64_t>* stat_override_right;
+    Statistic<uint64_t>* stat_override_wrong;
+    Statistic<uint64_t>* stat_override_missing;
+    Statistic<uint64_t>* stat_runahead_discard;
+    Statistic<uint64_t>* stat_execute_repairs;
 };
 
 // The statistics both direction predictors publish.
@@ -225,8 +499,25 @@ protected:
         { "direct_call_mispredict", "Direct calls mispredicted", "branches", 1 },                                 \
         { "indirect_jump_mispredict", "Indirect jumps mispredicted", "branches", 1 },                             \
         { "indirect_call_mispredict", "Indirect calls mispredicted", "branches", 1 },                             \
+        { "return_mispredict", "Returns mispredicted", "branches", 1 },                                          \
+        { "btb_l1_hit", "Fetch-stage lookups answered by the first-level branch target buffer", "lookups", 1 },  \
+        { "btb_l2_hit", "Fetch-stage lookups answered by the second-level buffer", "lookups", 1 },               \
+        { "btb_miss", "Fetch-stage lookups that found no entry for the block", "lookups", 1 },                    \
+        { "btb_alloc", "Branches marked in the buffer when they resolved", "branches", 1 },                       \
+        { "btb_evict", "Buffer entries thrown out", "entries", 1 },                                               \
+        { "btb_slot_overflow", "Times a block held more branches than one entry describes", "events", 1 },        \
+        { "btb_unknown_at_decode", "Branches the decode stage met that the buffer had not marked", "branches",    \
+          1 },                                                                                                   \
+        { "fetch_stage_mispredict", "Conditional branches the buffer's bimodal counter got wrong", "branches",    \
+          1 },                                                                                                   \
+        { "override_count", "Times the tagged predictor overrode the fetch stage", "branches", 1 },               \
+        { "override_correct", "Of those, the ones the tagged predictor got right", "branches", 1 },               \
+        { "override_wrong", "Of those, the ones it got wrong", "branches", 1 },                                   \
+        { "override_missed", "Branches the tagged predictor had right and did not override with", "branches",     \
+          1 },                                                                                                   \
+        { "runahead_records_discarded", "Fetch-stage predictions thrown away by a re-steer", "branches", 1 },     \
     {                                                                                                            \
-        "return_mispredict", "Returns mispredicted", "branches", 1                                               \
+        "execute_repairs", "Mis-speculation repairs made at execute rather than at retire", "squashes", 1        \
     }
 
 } // namespace Vanadis

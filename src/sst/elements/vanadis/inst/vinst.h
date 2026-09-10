@@ -202,6 +202,10 @@ class VanadisInstruction
             // derived copy constructor may rewrite them again afterwards.
             isa_reg_masks_valid_  = false;
             sw_thread             = copy_me.sw_thread;
+            // A clone is a NEW instance of the instruction, so it is not the
+            // same one as its master copy and takes its own number when the
+            // decode stage puts it in the reorder buffer.
+            ins_seq_              = 0;
 
             // One block, then one memcpy: the source's eight lists are
             // contiguous in the same order, so the clone is a straight copy.
@@ -529,6 +533,14 @@ class VanadisInstruction
 
         void markIssued() { has_issued_ = true; }
 
+        // WHERE THIS INSTRUCTION IS IN PROGRAM ORDER, as a number that only
+        // increases. The reorder buffer is in program order already, so this
+        // is not needed to sort it; it is needed to say, of a pointer held by
+        // a functional unit or a load/store queue entry, whether it belongs to
+        // an instruction younger than the branch that has just resolved.
+        uint64_t sequence() const { return ins_seq_; }
+        void     setSequence(const uint64_t s) { ins_seq_ = s; }
+
         bool checkFrontOfROB() const { return is_front_of_rob_; }
         void markFrontOfROB() { is_front_of_rob_ = true; }
 
@@ -731,6 +743,7 @@ class VanadisInstruction
         uint16_t* isa_fp_regs_out;
 
         uint16_t* phys_int_regs_in;
+        uint64_t  ins_seq_ = 0;
         uint16_t* phys_int_regs_out;
         uint16_t* phys_fp_regs_in;
         uint16_t* phys_fp_regs_out;

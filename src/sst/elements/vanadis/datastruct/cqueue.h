@@ -95,6 +95,21 @@ public:
     int    physicalIndex(const size_t logical) const { return calculateIndex(logical); }
     int    nextPhysicalIndex(const int index) const { return incrementIndex(index); }
 
+    // DROP THE YOUNGEST ENTRIES. A branch that resolves wrongly inside the
+    // buffer takes everything behind it, which is a suffix of the queue.
+    void popBack(const size_t howmany) {
+        const size_t n = (howmany > count) ? count : howmany;
+        count -= n;
+
+        // THE WRITE POINTER COMES BACK TOO. `push` writes at `tail`; leaving it
+        // where the discarded entries ended would push the next instruction
+        // past a hole, and every logical index behind it would name a slot that
+        // holds a pointer to a deleted instruction.
+        int t = tail - static_cast<int>(n);
+        if ( t < 0 ) { t += static_cast<int>(max_capacity); }
+        tail = t;
+    }
+
     void clear() {
         head = 0;
         tail = 0;

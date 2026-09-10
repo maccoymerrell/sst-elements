@@ -20,6 +20,7 @@
 #include "inst/regfile.h"
 
 #include <cstdint>
+#include <vector>
 
 #ifndef PRI_ADDR
 #define PRI_ADDR PRIx64
@@ -145,6 +146,28 @@ public:
     uint16_t getIntPhysReg(const uint16_t int_reg) { assert(int_reg < count_int_reg); return int_reg_ptr[int_reg]; }
 
     uint16_t getFPPhysReg(const uint16_t fp_reg) { assert(fp_reg < count_fp_reg); return fp_reg_ptr[fp_reg]; }
+
+    // THE MAPPING ALONE, WITHOUT THE PENDING COUNTS.
+    //
+    // A branch checkpoints the rename map when it is renamed, and a squash at
+    // execute puts that map back. The pending read and write counts are NOT
+    // part of it: an older instruction retiring between the checkpoint and the
+    // squash decrements them, so a saved copy would be stale. They are undone
+    // one squashed instruction at a time instead, which is exactly what
+    // retirement does to them on the other path.
+    void copyMap(std::vector<uint16_t>& int_map, std::vector<uint16_t>& fp_map) const
+    {
+        int_map.assign(int_reg_ptr, int_reg_ptr + count_int_reg);
+        fp_map.assign(fp_reg_ptr, fp_reg_ptr + count_fp_reg);
+    }
+
+    void restoreMap(const std::vector<uint16_t>& int_map, const std::vector<uint16_t>& fp_map)
+    {
+        const uint16_t ni = (int_map.size() < count_int_reg) ? (uint16_t)int_map.size() : count_int_reg;
+        const uint16_t nf = (fp_map.size() < count_fp_reg) ? (uint16_t)fp_map.size() : count_fp_reg;
+        for ( uint16_t i = 0; i < ni; ++i ) { int_reg_ptr[i] = int_map[i]; }
+        for ( uint16_t i = 0; i < nf; ++i ) { fp_reg_ptr[i] = fp_map[i]; }
+    }
 
     void reset(VanadisISATable* tbl)
     {

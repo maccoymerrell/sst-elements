@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdint>
 #include <deque>
+#include <unordered_set>
 
 #include "inst/vinst.h"
 
@@ -112,6 +113,21 @@ public:
         for (auto q_itr = pending_execute.begin(); q_itr != pending_execute.end();) {
             // if we get a hardware thread match, remove and carry out
             if ((*q_itr)->getHardwareThread() == hw_thr) {
+                delete (*q_itr);
+                q_itr = pending_execute.erase(q_itr);
+            } else {
+                q_itr++;
+            }
+        }
+    }
+
+    // A SQUASH AT EXECUTE takes only the younger half of a thread's window, so
+    // the unit is asked about instructions rather than about a thread.
+    void clearInstructions(const std::unordered_set<VanadisInstruction*>& victims) {
+        if (victims.empty()) { return; }
+
+        for (auto q_itr = pending_execute.begin(); q_itr != pending_execute.end();) {
+            if (victims.count((*q_itr)->getInstruction()) > 0) {
                 delete (*q_itr);
                 q_itr = pending_execute.erase(q_itr);
             } else {

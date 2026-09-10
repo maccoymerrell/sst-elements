@@ -29,6 +29,23 @@
 namespace SST {
 namespace Vanadis {
 
+// What the fetch stage gets back from one branch target buffer lookup: where
+// the block it was asked about ends, whether a branch ends it, and where fetch
+// goes next. `next` of zero means the target is not known -- an indirect
+// branch the buffer has never seen resolve -- and the run-ahead must stop
+// rather than guess.
+struct VanadisFetchBlockPrediction {
+    VanadisBranchCheckpoint ckpt;
+    uint64_t                branch_pc  = 0;
+    uint64_t                branch_end = 0;
+    uint64_t                next       = 0;
+    VanadisBranchClass      cls        = VanadisBranchClass::CONDITIONAL;
+    bool                    found      = false;   // a marked branch in this block
+    bool                    block_hit  = false;   // the block had an entry at all
+    bool                    from_l2    = false;
+    bool                    taken      = false;
+};
+
 class VanadisBranchUnit : public SST::SubComponent {
 
 public:
@@ -85,8 +102,13 @@ public:
     // At retire, in program order. Trains the tables from what the checkpoint
     // recorded, advances the architected copy of the history and releases the
     // checkpoint.
+    // `width` is the branch's own width in bytes, which the buffer needs to
+    // mark a branch it has never held, and which a record-less branch -- one
+    // the buffer never marked, so the fetch stage never predicted -- has
+    // nowhere else to come from.
     virtual void update(
-        uint64_t pc, VanadisBranchClass cls, bool taken, uint64_t target, const VanadisBranchCheckpoint& ckpt)
+        uint64_t pc, VanadisBranchClass cls, bool taken, uint64_t target, const VanadisBranchCheckpoint& ckpt,
+        uint8_t width)
     {}
 
     // On a branch misprediction, after update() for the same branch. Puts the
@@ -113,6 +135,70 @@ public:
     // A byte image of the speculative history alone, which is what a repair
     // has to put back.
     virtual void serializeSpeculativeState(std::vector<uint8_t>& out) const { out.clear(); }
+
+    // ---- the two-stage front end -------------------------------------------
+    //
+    // A unit that answers yes here carries a fetch-stage branch target buffer
+    // and steers fetch from it, a cycle or more before the branch is decoded.
+    // The decode stage then overrides with the tagged predictor.
+    virtual bool hasFetchStage() const { return false; }
+
+    // The aligned instruction fetch block the buffer is indexed by.
+    virtual uint64_t fetchBlockBytes() const { return 64; }
+
+    // STAGE ONE. One buffer lookup for the block `pc` falls in.
+    virtual VanadisFetchBlockPrediction predictFetchBlock(uint64_t pc)
+    {
+        return VanadisFetchBlockPrediction();
+    }
+
+    // A branch the buffer does not mark still takes a record, so that the ring
+    // stays in fetch order. It predicts nothing and moves no history.
+    virtual bool recordUnpredicted(
+        uint64_t pc, VanadisBranchClass cls, uint64_t fallthrough, uint8_t width, VanadisBranchCheckpoint* ckpt)
+    {
+        return false;
+    }
+
+    // Does the buffer mark a branch at this address? A branch it does not mark
+    // is not a branch as far as the fetch stage is concerned: it is predicted
+    // not-taken, it enters no history and it costs nothing.
+    virtual bool btbMarks(uint64_t pc) { return false; }
+
+    // STAGE ONE, late. The decode stage reached a marked branch the fetch
+    // stage has not predicted, because the run-ahead is elsewhere. This makes
+    // the record the fetch stage would have made, from the same buffer entry.
+    virtual bool predictAtDecode(
+        uint64_t pc, VanadisBranchClass cls, uint64_t static_target, bool has_static_target, uint64_t fallthrough,
+        uint8_t width, VanadisBranchCheckpoint* ckpt, uint64_t* next_pc)
+    {
+        return false;
+    }
+
+    // STAGE TWO. Returns true when the tagged predictor disagreed with the
+    // buffer and fetch has to be re-steered to *next_pc.
+    virtual bool overrideAtDecode(
+        const VanadisBranchCheckpoint& ckpt, uint64_t static_target, bool has_static_target, uint64_t fallthrough,
+        uint64_t* next_pc)
+    {
+        return false;
+    }
+
+    // The decode stage consumed a record without overriding.
+    virtual void markDecoded(const VanadisBranchCheckpoint& ckpt) {}
+
+    // Throw away the records of every branch the fetch stage predicted that
+    // the decode stage has not reached. Returns how many.
+    virtual uint32_t discardRunAhead() { return 0; }
+
+    // A branch resolved wrongly and is being repaired while it is still in the
+    // reorder buffer, at execute rather than at retire. Returns how many
+    // wrong-path branch records went with it.
+    virtual uint32_t repairAtExecute(
+        const VanadisBranchCheckpoint& ckpt, uint64_t pc, VanadisBranchClass cls, bool taken, uint64_t target)
+    {
+        return 0;
+    }
 };
 
 } // namespace Vanadis

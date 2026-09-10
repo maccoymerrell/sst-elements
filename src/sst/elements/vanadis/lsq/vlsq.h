@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 #include <queue>
 
@@ -222,6 +223,12 @@ public:
 
     virtual void tick(uint64_t cycle) = 0;
     virtual void clearLSQByThreadID(const uint32_t thread) = 0;
+
+    // Discard only the entries belonging to these instructions -- the younger
+    // half of a thread's window, after a branch resolved wrongly at execute.
+    // Returns how many of the discarded loads had already been sent to the
+    // level-one data cache -- wrong-path memory traffic that really happened.
+    virtual size_t clearLSQAfter(const uint32_t thread, const std::unordered_set<VanadisInstruction*>& victims) = 0;
 
     virtual void init(unsigned int phase) = 0;
 

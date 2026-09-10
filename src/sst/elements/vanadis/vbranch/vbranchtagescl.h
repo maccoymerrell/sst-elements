@@ -271,6 +271,54 @@ public:
         uint64_t s_ras[RAS_DEPTH] = {0};
         uint32_t s_ras_top        = 0;
 
+        // -- THE TWO-STAGE FRONT END ----------------------------------------
+        //
+        // The fetch stage read this branch's slot in the fetch branch target
+        // buffer. `bim_valid` says the slot was there; `bim_pred` and
+        // `bim_hyst` are the two bits of the bimodal counter that live IN THAT
+        // SLOT and are this predictor's base prediction. `fetch_dir` is what
+        // the fetch stage steered with, `tage_dir` what the tagged tables, the
+        // statistical corrector and the loop predictor say, and `overridden`
+        // records that the second answer replaced the first.
+        bool     bim_valid   = false;
+        int8_t   bim_pred    = 0;
+        int8_t   bim_hyst    = 1;
+        bool     bim_dirty   = false;
+        bool     fetch_dir   = false;
+        bool     tage_dir    = false;
+        bool     overridden  = false;
+        // A BRANCH THE BUFFER NEVER MARKED. It is implicitly predicted
+        // not-taken and, following the published machines, the global history
+        // is not updated for it -- so this record moved nothing and trains
+        // nothing. It exists only to keep the ring in fetch order, which is
+        // what lets a squash discard exactly the records younger than a
+        // branch.
+        bool     no_history  = false;
+        // No fetch stage: one prediction, the tagged one, and it is what the
+        // speculative history advances with. Only the standalone trace-driven
+        // tests set this; the machine has a fetch stage.
+        bool     single_stage = false;
+        // THE BUFFER'S BIMODAL COUNTER WAS TRAINED WHEN THE BRANCH RESOLVED,
+        // not when it retired. A mispredicting branch is repaired at execute
+        // and the machine starts fetching the corrected path at once; in a
+        // loop that path begins with the same branch, and the counter that
+        // steers it has to hold the answer that was just proved. The counter
+        // is a per-branch state machine, so training it out of program order
+        // changes nothing but its timing. The TAGGED tables are different --
+        // their allocation, their useful bits and their tick counter all
+        // depend on the order updates arrive in -- so they are trained at
+        // retirement, which is program order.
+        bool     base_trained = false;
+        // The prediction the front end finally made, after the decode stage
+        // had its say. Repair never touches these two, so the retirement path
+        // can still say what was predicted and what the two stages each said.
+        bool     final_dir    = false;
+        uint64_t final_target = 0;
+        bool     btb_block_hit = false;
+        bool     btb_from_l2   = false;
+        uint8_t  width         = 4;
+        uint64_t fetch_target  = 0;
+
         // -- what this branch was predicted to do ---------------------------
         uint64_t           pc          = 0;
         uint64_t           hist_target = 0;
@@ -285,7 +333,6 @@ public:
 
     ~VanadisTageSclCore()
     {
-        delete[] btable;
         delete[] gtable[1];
         delete[] gtable[BORN];
         delete[] ltable;
@@ -333,7 +380,6 @@ public:
             gtable[i] = gtable[BORN];
         for ( int i = 2; i <= BORN - 1; i++ )
             gtable[i] = gtable[1];
-        btable = new bentry[1 << LOGB];
 
         for ( int i = 1; i <= NHIST; i++ ) {
             arch_.ch_i[i].init(m[i], (logg[i]));
@@ -391,11 +437,6 @@ public:
         for ( int i = 0; i < PNB; i++ )
             for ( int j = 0; j < ((1 << LOGPNB) - 1); j++ )
                 if ( !(j & 1) ) PGEHL[i][j] = -1;
-
-        for ( int i = 0; i < (1 << LOGB); i++ ) {
-            btable[i].pred = 0;
-            btable[i].hyst = 1;
-        }
 
         for ( int j = 0; j < (1 << LOGBIAS); j++ ) {
             switch ( j & 3 ) {
@@ -497,26 +538,79 @@ public:
         C.hist_target = hist_target;
         C.fallthrough = fallthrough;
 
-        bool dir = true;
-        if ( vanadisBranchIsConditional(cls) ) { dir = GetPrediction(PC, C); }
+        // BOTH ANSWERS ARE COMPUTED HERE, AND ONLY THE FIRST IS ACTED ON.
+        //
+        // The fetch stage has one lookup to spend and spends it on the branch
+        // target buffer, whose slot for this branch carries the base
+        // predictor's two bits; that is `fetch_dir`, and it is what steers
+        // fetch and what the speculative history advances with. The tagged
+        // tables, the statistical corrector and the loop predictor are read
+        // against the same history, in the same call, and their answer is put
+        // away in the checkpoint as `tage_dir` for the decode stage to
+        // override with. Reading them now rather than a cycle later reads the
+        // same history -- the checkpoint holds it either way -- and saves
+        // carrying a second copy of the folded registers to the decode stage.
+        if ( vanadisBranchIsConditional(cls) ) {
+            C.fetch_dir = C.bim_valid && (C.bim_pred > 0);
+            C.tage_dir  = GetPrediction(PC, C);
+        }
         else {
+            // Every other class is taken by construction, and the two stages
+            // cannot disagree about it.
             C.pred_taken = true;
             C.tage_pred  = true;
+            C.fetch_dir  = true;
+            C.tage_dir   = true;
         }
 
-        C.pred_dir = dir;
+        const bool steer = C.single_stage ? C.tage_dir : C.fetch_dir;
+        C.pred_dir       = steer;
 
-        // The speculative history moves now, so that the next prediction sees
-        // this branch. It moves with the predicted direction and target,
-        // because that is all that is known yet.
-        HistoryUpdate(spec_, PC, cls, dir, hist_target);
+        // The speculative history moves now, with the direction the FETCH
+        // STAGE chose, because that is the path the machine is about to fetch.
+        // If the decode stage overrides, the history is put back and advanced
+        // again with the overriding direction.
+        HistoryUpdate(spec_, PC, cls, steer, hist_target);
 
-        return dir;
+        return steer;
+    }
+
+    // The decode stage disagreed. Put the speculative history back to what
+    // this branch found and advance it again with the answer that won. The
+    // caller has already restored the per-index words of every branch the
+    // fetch stage ran ahead into.
+    void applyOverride(Checkpoint& C, const bool dir)
+    {
+        repair(C, dir);
+        C.pred_dir   = dir;
+        C.overridden = true;
     }
 
     // ---- training, at retirement, in program order -------------------------
+    // THE FETCH STAGE'S COUNTER LEARNS WHEN THE BRANCH RESOLVES.
+    //
+    // A branch that mispredicted is repaired at execute and the machine starts
+    // fetching the corrected path at once; in a loop that path begins with the
+    // same branch, and the bimodal counter in the buffer entry that steers
+    // fetch has to hold the answer that was just proved wrong. Nothing else is
+    // trained here: the tagged tables' allocation, useful bits and tick counter
+    // all depend on the order the updates arrive in, and that order is program
+    // order, which is retirement.
+    void trainAtResolve(const uint64_t PC, const VanadisBranchClass cls, const bool taken, Checkpoint& C)
+    {
+        (void)PC;
+        if ( C.no_history || C.base_trained ) { return; }
+        if ( !vanadisBranchIsConditional(cls) ) { return; }
+        baseupdate(taken, C);
+        C.base_trained = true;
+    }
+
     void update(const uint64_t PC, const VanadisBranchClass cls, const bool taken, Checkpoint& C)
     {
+        // A branch the buffer never marked trains nothing and moves no
+        // architected history, exactly as it moved no speculative history.
+        if ( C.no_history ) { return; }
+
         if ( vanadisBranchIsConditional(cls) ) { UpdatePredictor(PC, taken, C); }
         else {
             HistoryUpdate(arch_, PC, cls, taken, C.hist_target);
@@ -543,7 +637,11 @@ public:
 
     // Put back the state that is a single copy, then replay this branch with
     // what actually happened.
-    void repair(const Checkpoint& C, const bool taken)
+    // Put the speculative state back to what this branch found, and stop
+    // there: the branch itself is not replayed. A re-steer that throws away
+    // the fetch stage's run-ahead needs exactly this, because the branch the
+    // oldest discarded record belongs to is not on the path being taken.
+    void restoreOnly(const Checkpoint& C)
     {
         restoreWords(C);
 
@@ -560,6 +658,14 @@ public:
 
         memcpy(spec_.ras, C.s_ras, sizeof(spec_.ras));
         spec_.ras_top = C.s_ras_top;
+    }
+
+    void repair(const Checkpoint& C, const bool taken)
+    {
+        restoreOnly(C);
+
+        // A record that advanced no history has nothing to replay.
+        if ( C.no_history ) { return; }
 
         // The bit buffer the folded registers read from does not have to be
         // restored: every slot a squashed branch wrote is written again, in
@@ -637,10 +743,6 @@ public:
         append(out, &WITHLOOP, sizeof(WITHLOOP));
         // Field by field, because the padding inside these entries is never
         // written and comparing it would compare uninitialised bytes.
-        for ( int i = 0; i < (1 << LOGB); i++ ) {
-            append(out, &btable[i].pred, sizeof(int8_t));
-            append(out, &btable[i].hyst, sizeof(int8_t));
-        }
         for ( int bank = 0; bank < 2; bank++ ) {
             const int     which = (bank == 0) ? 1 : BORN;
             const gentry* g     = gtable[which];
@@ -700,7 +802,9 @@ public:
         s += NBANKHIGH * (1 << LOGG) * (CWIDTH + UWIDTH + (TBITS + 4));
         s += NBANKLOW * (1 << LOGG) * (CWIDTH + UWIDTH + TBITS);
         s += SIZEUSEALT * ALTWIDTH;
-        s += (1 << LOGB) + (1 << (LOGB - HYSTSHIFT));
+        // The bimodal base table is gone: its two bits per branch live in the
+        // fetch branch target buffer's slot for that branch, and are counted
+        // against the buffer instead.
         s += MAXHIST;
         s += PHISTWIDTH;
         s += 10;
@@ -789,26 +893,50 @@ private:
         }
     }
 
+    // THE BASE PREDICTION COMES OUT OF THE FETCH BRANCH TARGET BUFFER.
+    //
+    // TAGE's base predictor is bimodal, and its two bits per branch are held
+    // in that branch's slot in the fetch-stage buffer rather than in a table
+    // of this predictor's own. The fetch stage copies them into the checkpoint
+    // when it reads the slot; this reads them back from there. A branch the
+    // buffer does not hold -- one that has never resolved taken -- has no
+    // counter, and its base prediction is not-taken with low confidence, which
+    // is what an unmarked branch is predicted as.
     bool getbim(Checkpoint& C)
     {
-        C.BIM      = (btable[C.BI].pred << 1) + (btable[C.BI >> HYSTSHIFT].hyst);
+        if ( !C.bim_valid ) {
+            C.BIM      = 1;
+            C.HighConf = false;
+            C.LowConf  = true;
+            C.AltConf  = false;
+            C.MedConf  = false;
+            return false;
+        }
+
+        C.BIM      = (C.bim_pred << 1) + C.bim_hyst;
         C.HighConf = (C.BIM == 0) || (C.BIM == 3);
         C.LowConf  = !C.HighConf;
         C.AltConf  = C.HighConf;
         C.MedConf  = false;
-        return (btable[C.BI].pred > 0);
+        return (C.bim_pred > 0);
     }
 
-    void baseupdate(bool Taken, const Checkpoint& C)
+    // Trains the counter in the checkpoint. The caller writes it back into the
+    // buffer slot, because only the caller knows where the slot is.
+    void baseupdate(bool Taken, Checkpoint& C)
     {
+        if ( !C.bim_valid ) { return; }
+
         int inter = C.BIM;
         if ( Taken ) {
             if ( inter < 3 ) inter += 1;
         }
         else if ( inter > 0 )
             inter--;
-        btable[C.BI].pred              = inter >> 1;
-        btable[C.BI >> HYSTSHIFT].hyst = (inter & 1);
+        C.bim_pred  = (int8_t)(inter >> 1);
+        C.bim_hyst  = (int8_t)(inter & 1);
+        C.BIM       = inter;
+        C.bim_dirty = true;
     }
 
     // The pseudo-random source. It reads the architected history, because it
@@ -1240,7 +1368,7 @@ private:
             if ( abs(2 * gtable[HitBank][GI[HitBank]].ctr + 1) == 1 )
                 if ( LongestMatchPred != resolveDir ) {
                     if ( AltBank > 0 ) { ctrupdate(gtable[AltBank][GI[AltBank]].ctr, resolveDir, CWIDTH); }
-                    if ( AltBank == 0 ) baseupdate(resolveDir, C);
+                    if ( (AltBank == 0) && !C.base_trained ) baseupdate(resolveDir, C);
                 }
             ctrupdate(gtable[HitBank][GI[HitBank]].ctr, resolveDir, CWIDTH);
             if ( abs(2 * gtable[HitBank][GI[HitBank]].ctr + 1) == 1 ) gtable[HitBank][GI[HitBank]].u = 0;
@@ -1251,8 +1379,9 @@ private:
                             if ( LongestMatchPred == resolveDir ) { gtable[HitBank][GI[HitBank]].u = 0; }
                         }
         }
-        else
+        else if ( !C.base_trained ) {
             baseupdate(resolveDir, C);
+        }
 
         if ( LongestMatchPred != alttaken )
             if ( LongestMatchPred == resolveDir ) {
@@ -1407,7 +1536,6 @@ private:
     int8_t SecondH = 0;
     int8_t use_alt_on_na[SIZEUSEALT] = {0};
 
-    bentry* btable = nullptr;
     gentry* gtable[NHIST + 1] = {nullptr};
     lentry* ltable = nullptr;
 

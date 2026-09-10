@@ -61,12 +61,13 @@
         { "fdip_runahead_blocked", "Cycles the run-ahead could not continue because an indirect target was unknown", "cycles", 1 }, \
         { "fdip_ftq_flushes", "Times the fetch target queue was thrown away", "flushes", 1 },         \
         { "fdip_ftq_flushed_entries", "FTQ entries discarded by those flushes", "entries", 1 },       \
-        { "fdip_ftb_hits", "Run-ahead lookups that found a branch in the fetch block", "hits", 1 },   \
-        { "fdip_ftb_misses", "Run-ahead lookups that found none, so the block fell through", "misses", 1 }, \
-        { "fdip_ftb_evictions", "Fetch target buffer entries thrown out", "entries", 1 },             \
-        { "fdip_ras_pushes", "Return addresses pushed by the run-ahead", "entries", 1 },              \
-        { "fdip_ras_pops", "Return addresses popped by the run-ahead", "entries", 1 },                \
-        { "fdip_ras_empty", "Returns the run-ahead met with an empty return stack", "events", 1 },    \
+        { "frontend_override", "Times the decode stage overrode the fetch stage's prediction", "branches", 1 }, \
+        { "frontend_bubble", "Cycles decode produced nothing while the front end re-steered", "cycles", 1 }, \
+        { "frontend_btb_miss", "Branches the decode stage met that the fetch stage had not predicted", "branches", 1 }, \
+        { "fdip_btb_bubbles", "Prediction bubbles charged by second-level buffer hits", "cycles", 1 },  \
+        { "fdip_fetch_branches", "Branches the fetch stage predicted", "branches", 1 },               \
+        { "fdip_decode_hit", "Branches the decode stage found a fetch-stage prediction for", "branches", 1 }, \
+        { "fdip_decode_miss", "Branches the decode stage met with no fetch-stage prediction", "branches", 1 }, \
         { "fdip_pf_issued", "Instruction prefetches issued", "prefetches", 1 },                       \
         { "fdip_pf_useful", "Prefetched lines a demand fetch then asked for", "prefetches", 1 },      \
         { "fdip_pf_late", "Of those, the ones still in flight when the demand asked", "prefetches", 1 }, \
@@ -111,10 +112,8 @@ public:
                             { "fdip_blocks_per_cycle", "Fetch blocks the run-ahead predictor produces per cycle", "2" },
                             { "fdip_prefetch_per_cycle", "Instruction prefetches issued per cycle", "2" },
                             { "fdip_max_outstanding", "Instruction prefetches allowed in flight at once", "8" },
-                            { "fdip_ftb_entries", "Fetch target buffer entries (branches the run-ahead knows about)", "4096" },
-                            { "fdip_ras_entries", "Return address stack entries in the run-ahead predictor", "32" },
-                            { "fdip_gshare_entries", "Two-bit counters in the run-ahead direction predictor", "16384" },
-                            { "fdip_history_bits", "Global history bits the run-ahead direction predictor indexes with", "14" },
+                            { "frontend_override_bubble", "Cycles lost when the decode stage overrides the fetch stage's prediction", "3" },
+                            { "fdip_l2_bubble", "Prediction bubbles charged when the second-level branch target buffer answers", "1" },
                             { "fdip_filter_sets", "Sets in the record of lines recently sent to the L1I", "64" },
                             { "fdip_filter_ways", "Ways in that record", "8" })
 
@@ -180,6 +179,18 @@ public:
         stat_fetch_stall_icache   = registerStatistic<uint64_t>("fetch_stall_icache", "1");
         stat_icache_demand        = registerStatistic<uint64_t>("icache_demand_fetches", "1");
 
+        // THE COST OF THE SECOND STAGE. AMD's Zen 4 optimisation guide gives
+        // the published figure for a later predictor overriding the one that
+        // steered fetch: "The L2 BTB has 7680 entries and creates three
+        // prediction bubbles if its prediction differs from that of the L1
+        // BTB" (publication 57647, section 2.8.1.2).
+        frontend_override_bubble = params.find<uint64_t>("frontend_override_bubble", 3);
+        frontend_resteer_until   = 0;
+
+        stat_frontend_override = registerStatistic<uint64_t>("frontend_override", "1");
+        stat_frontend_bubble   = registerStatistic<uint64_t>("frontend_bubble", "1");
+        stat_frontend_btb_miss = registerStatistic<uint64_t>("frontend_btb_miss", "1");
+
         // FETCH-DIRECTED INSTRUCTION PREFETCHING (vfdip.h). Default on.
         VanadisFDIP::Config fdip_cfg;
         fdip_cfg.enable             = params.find<bool>("fdip_enable", true);
@@ -187,23 +198,12 @@ public:
         fdip_cfg.blocks_per_cycle   = params.find<uint32_t>("fdip_blocks_per_cycle", 2);
         fdip_cfg.prefetch_per_cycle = params.find<uint32_t>("fdip_prefetch_per_cycle", 2);
         fdip_cfg.max_outstanding    = params.find<uint32_t>("fdip_max_outstanding", 8);
-        fdip_cfg.ftb_entries        = params.find<uint32_t>("fdip_ftb_entries", 4096);
-        fdip_cfg.ras_entries        = params.find<uint32_t>("fdip_ras_entries", 32);
-        fdip_cfg.gshare_entries     = params.find<uint32_t>("fdip_gshare_entries", 16384);
-        fdip_cfg.history_bits       = params.find<uint32_t>("fdip_history_bits", 14);
+        fdip_cfg.l2_bubble          = params.find<uint32_t>("fdip_l2_bubble", 1);
         fdip_cfg.filter_sets        = params.find<uint32_t>("fdip_filter_sets", 64);
         fdip_cfg.filter_ways        = params.find<uint32_t>("fdip_filter_ways", 8);
         fdip_cfg.line_width         = icache_line_width;
 
-        if ( 0 != (fdip_cfg.gshare_entries & (fdip_cfg.gshare_entries - 1)) ) {
-            fatal(CALL_INFO, -1, "Error: fdip_gshare_entries must be a power of two, is %" PRIu32 "\n",
-                  fdip_cfg.gshare_entries);
-        }
-        if ( 0 == fdip_cfg.ras_entries ) {
-            fatal(CALL_INFO, -1, "Error: fdip_ras_entries must not be zero\n");
-        }
-
-        fdip = new VanadisFDIP(fdip_cfg, ins_loader, output);
+        fdip = new VanadisFDIP(fdip_cfg, ins_loader, branch_predictor, output);
 
         VanadisFDIPStats fdip_stats;
         fdip_stats.ftq_occupancy       = registerStatistic<uint64_t>("fdip_ftq_occupancy", "1");
@@ -213,12 +213,10 @@ public:
         fdip_stats.runahead_blocked    = registerStatistic<uint64_t>("fdip_runahead_blocked", "1");
         fdip_stats.ftq_flushes         = registerStatistic<uint64_t>("fdip_ftq_flushes", "1");
         fdip_stats.ftq_flushed_entries = registerStatistic<uint64_t>("fdip_ftq_flushed_entries", "1");
-        fdip_stats.ftb_hits            = registerStatistic<uint64_t>("fdip_ftb_hits", "1");
-        fdip_stats.ftb_misses          = registerStatistic<uint64_t>("fdip_ftb_misses", "1");
-        fdip_stats.ftb_evictions       = registerStatistic<uint64_t>("fdip_ftb_evictions", "1");
-        fdip_stats.ras_pushes          = registerStatistic<uint64_t>("fdip_ras_pushes", "1");
-        fdip_stats.ras_pops            = registerStatistic<uint64_t>("fdip_ras_pops", "1");
-        fdip_stats.ras_empty           = registerStatistic<uint64_t>("fdip_ras_empty", "1");
+        fdip_stats.btb_bubbles         = registerStatistic<uint64_t>("fdip_btb_bubbles", "1");
+        fdip_stats.fetch_branches      = registerStatistic<uint64_t>("fdip_fetch_branches", "1");
+        fdip_stats.decode_hit          = registerStatistic<uint64_t>("fdip_decode_hit", "1");
+        fdip_stats.decode_miss         = registerStatistic<uint64_t>("fdip_decode_miss", "1");
         fdip_stats.pf_issued           = registerStatistic<uint64_t>("fdip_pf_issued", "1");
         fdip_stats.pf_useful           = registerStatistic<uint64_t>("fdip_pf_useful", "1");
         fdip_stats.pf_late             = registerStatistic<uint64_t>("fdip_pf_late", "1");
@@ -310,6 +308,7 @@ public:
         // place the queue has to be discarded and the run-ahead's own history
         // and return stack put back to the architected copies.
         fdip->flush(newIP);
+        frontend_resteer_until = 0;
 
         output_->verbose(CALL_INFO, 16, 0, "[decoder] -> clear decode-q and set new ip: 0x%" PRI_ADDR "\n", newIP);
 
@@ -346,12 +345,6 @@ public:
     {
         cycle_count = cycle;
         fdip->tick(cycle, ip);
-    }
-
-    // At retire, in program order, with the outcome known.
-    void fdipBranchRetired(const uint64_t pc, const VanadisBranchClass cls, const bool taken, const uint64_t target)
-    {
-        fdip->branchRetired(pc, cls, taken, target);
     }
 
     virtual VanadisCPUOSHandler* getOSHandler() { return os_handler; }
@@ -391,6 +384,13 @@ protected:
     Statistic<uint64_t>* stat_ins_bytes_loaded;
     Statistic<uint64_t>* stat_fetch_stall_icache;
     Statistic<uint64_t>* stat_icache_demand;
+    Statistic<uint64_t>* stat_frontend_override;
+    Statistic<uint64_t>* stat_frontend_bubble;
+    Statistic<uint64_t>* stat_frontend_btb_miss;
+
+    uint64_t frontend_override_bubble;
+    uint64_t frontend_resteer_until;
+    uint64_t frontend_bubble_cycle = 0;
 
     VanadisFDIP* fdip;
 };
