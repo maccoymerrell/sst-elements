@@ -309,6 +309,7 @@ public:
         uint8_t  width          = ins_width;
         bool     marked         = false;
         bool     bim_dirty      = false;
+        bool     base_pending   = false;
         int8_t   bim_pred       = 0;
         int8_t   bim_hyst       = 1;
 
@@ -316,6 +317,13 @@ public:
             const Checkpoint& C = predictor.record(ckpt);
             width  = C.width;
             marked = C.bim_valid;
+
+            // THE COUNTER IS READ OUT BEFORE THE RECORD IS RELEASED. Training
+            // it is the last thing UpdatePredictor does, and releasing the
+            // record is the last thing update() does; reading it afterwards
+            // reads a slot the ring has already handed back, so the counter
+            // would never reach the buffer at all.
+            base_pending = true;
 
             // THE TWO STAGES ARE SCORED SEPARATELY, IN PROGRAM ORDER.
             //
@@ -373,13 +381,15 @@ public:
         // taken, which is the rule the marked slots exist to express -- and a
         // branch it did hold has its bimodal counter written back and, if it
         // is indirect, its target refreshed.
-        {
-            const Checkpoint* C = predictor.liveRecord(ckpt);
-            if ( nullptr != C ) {
-                bim_dirty = C->bim_dirty;
-                bim_pred  = C->bim_pred;
-                bim_hyst  = C->bim_hyst;
-            }
+        //
+        // `record()` is still readable after the ring has released the slot:
+        // the contents stay until the slot is handed out again, which is the
+        // property the retire-then-repair path already relied on.
+        if ( base_pending ) {
+            const Checkpoint& C = predictor.record(ckpt);
+            bim_dirty = C.bim_dirty;
+            bim_pred  = C.bim_pred;
+            bim_hyst  = C.bim_hyst;
         }
 
         syncBufferCounters();

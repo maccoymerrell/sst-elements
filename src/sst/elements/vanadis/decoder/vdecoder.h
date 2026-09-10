@@ -112,7 +112,7 @@ public:
                             { "fdip_blocks_per_cycle", "Fetch blocks the run-ahead predictor produces per cycle", "2" },
                             { "fdip_prefetch_per_cycle", "Instruction prefetches issued per cycle", "2" },
                             { "fdip_max_outstanding", "Instruction prefetches allowed in flight at once", "8" },
-                            { "frontend_override_bubble", "Cycles lost when the decode stage overrides the fetch stage's prediction", "3" },
+                            { "frontend_override_bubble", "Cycles lost when the decode stage overrides the fetch stage's prediction", "1" },
                             { "fdip_l2_bubble", "Prediction bubbles charged when the second-level branch target buffer answers", "1" },
                             { "fdip_filter_sets", "Sets in the record of lines recently sent to the L1I", "64" },
                             { "fdip_filter_ways", "Ways in that record", "8" })
@@ -179,12 +179,19 @@ public:
         stat_fetch_stall_icache   = registerStatistic<uint64_t>("fetch_stall_icache", "1");
         stat_icache_demand        = registerStatistic<uint64_t>("icache_demand_fetches", "1");
 
-        // THE COST OF THE SECOND STAGE. AMD's Zen 4 optimisation guide gives
-        // the published figure for a later predictor overriding the one that
-        // steered fetch: "The L2 BTB has 7680 entries and creates three
-        // prediction bubbles if its prediction differs from that of the L1
-        // BTB" (publication 57647, section 2.8.1.2).
-        frontend_override_bubble = params.find<uint64_t>("frontend_override_bubble", 3);
+        // THE COST OF THE SECOND STAGE, DERIVED FROM THE DISTANCE BETWEEN THE
+        // TWO STAGES IN THIS CORE.
+        //
+        // The fetch stage runs once a cycle and puts a block in the queue; the
+        // decode stage reads that queue in the same cycle. They are one cycle
+        // apart, so a re-steer at decode costs the cycle in which the fetch
+        // stage restarts, and that is the default. A machine whose two stages
+        // are further apart pays more: AMD's Zen 4 optimisation guide gives
+        // three for an override across its front end -- "The L2 BTB has 7680
+        // entries and creates three prediction bubbles if its prediction
+        // differs from that of the L1 BTB" (publication 57647, section
+        // 2.8.1.2) -- and the parameter takes that or any other value.
+        frontend_override_bubble = params.find<uint64_t>("frontend_override_bubble", 1);
         frontend_resteer_until   = 0;
 
         stat_frontend_override = registerStatistic<uint64_t>("frontend_override", "1");
