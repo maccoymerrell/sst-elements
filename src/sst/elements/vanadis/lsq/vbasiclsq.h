@@ -154,7 +154,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
                                     { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1},
                                     { "mdp_clears", "Count the periodic invalidations of the memory-dependence predictor's table", "operations", 1},
-                                    { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},)
+                                    { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},
+                                    { "wrong_path_load_returned", "Count the load responses that arrived after the load had been squashed, and were therefore dropped", "operations", 1},
+                                    { "wrong_path_load_slow", "Count those dropped responses whose round trip exceeded a level-one data cache hit, which every miss does and a response delayed by queueing also does: an UPPER BOUND on the wrong-path loads that missed in that cache", "operations", 1},
+                                    { "wrong_path_load_latency", "The round trip in core cycles of a load response that arrived after the load had been squashed", "cycles", 1},)
 
 
         VanadisBasicLoadStoreQueue(ComponentId_t id, Params& params, int coreid, int hwthreads) : VanadisLoadStoreQueue(id, params, coreid, hwthreads),
@@ -171,6 +174,14 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             address_mask = params.find<uint64_t>("address_mask", 0xFFFFFFFFFFFFFFFFULL);
 
             cache_line_width = params.find<uint64_t>("cache_line_width", 64);
+
+            // THE ROUND TRIP A HIT COSTS. A load response that comes back in this
+            // many core cycles or fewer was answered by the level-one data
+            // cache; one that takes longer missed in it. The number is the
+            // cache's own configured hit latency plus the fixed cost of the
+            // interface and the two links, and it is a parameter because those
+            // are all configuration.
+            l1d_hit_cycles_ = params.find<uint64_t>("l1d_hit_cycles", 8);
 
             op_q.resize(hw_threads);
             op_q_index = 0;
@@ -189,6 +200,9 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_fences_executed = registerStatistic<uint64_t>("fences_executed", "1");
 
             stat_loaded_bytes = registerStatistic<uint64_t>("bytes_read", "1");
+            stat_wrong_path_load_returned = registerStatistic<uint64_t>("wrong_path_load_returned", "1");
+            stat_wrong_path_load_slow = registerStatistic<uint64_t>("wrong_path_load_slow", "1");
+            stat_wrong_path_load_latency  = registerStatistic<uint64_t>("wrong_path_load_latency", "1");
             stat_stored_bytes = registerStatistic<uint64_t>("bytes_stored", "1");
 
             stat_store_buffer_entries = registerStatistic<uint64_t>("store_buffer_entries", "1");
@@ -725,6 +739,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
         void tick(uint64_t cycle) override
         {
+            cur_cycle_ = cycle;
             if(output->getVerboseLevel() >= 16) {
                 VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "-> tick LSQ at cycle %" PRIu64 "\n", cycle);
 
@@ -912,8 +927,34 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     }
                     #endif
 
+                    // THE ROUND TRIP, whichever path the load was on.
+                    uint64_t round_trip = 0;
+                    bool     timed      = false;
+                    {
+                        auto sent = lsq->load_sent_cycle_.find(ev->getID());
+                        if ( sent != lsq->load_sent_cycle_.end() ) {
+                            round_trip = lsq->cur_cycle_ - sent->second;
+                            timed      = true;
+                            lsq->load_sent_cycle_.erase(sent);
+                        }
+                    }
+
                     if(nullptr == load_entry) {
-                        // not found, so previous cleared by a branch mis-predict ignore
+                        // Not found: the load was squashed while this read was
+                        // in flight, so this is a WRONG-PATH load coming back
+                        // from the data cache. Nothing consumes the data, and
+                        // the round trip says whether the cache had the line.
+                        lsq->stat_wrong_path_load_returned->addData(1);
+                        if ( timed ) {
+                            lsq->stat_wrong_path_load_latency->addData(round_trip);
+                            // LONGER THAN A HIT. Every load that missed in the
+                            // level-one data cache is in here, and so is one
+                            // the cache answered but that queued on the way, so
+                            // the count is an upper bound on the misses.
+                            if ( round_trip > lsq->l1d_hit_cycles_ ) {
+                                lsq->stat_wrong_path_load_slow->addData(1);
+                            }
+                        }
                         return;
                     }
 
@@ -1566,6 +1607,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         {
             // load_entry->addRequest(load_req->getID(), load_ins->getSWThread());
             load_entry->addRequest(load_req->getID());
+            // WHEN IT LEFT, so that when it comes back the round trip is known.
+            load_sent_cycle_[load_req->getID()] = cur_cycle_;
             // load_ins->setNumLoads(1);
 
         }
@@ -2613,6 +2656,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         Statistic<uint64_t>* stat_split_loads;
         Statistic<uint64_t>* stat_stored_bytes;
         Statistic<uint64_t>* stat_loaded_bytes;
+        Statistic<uint64_t>* stat_wrong_path_load_returned;
+        Statistic<uint64_t>* stat_wrong_path_load_slow;
+        Statistic<uint64_t>* stat_wrong_path_load_latency;
+        uint64_t l1d_hit_cycles_ = 8;
+        uint64_t cur_cycle_ = 0;
+        std::unordered_map<uint64_t, uint64_t> load_sent_cycle_;
         Statistic<uint64_t>* stat_mem_loads_speculated;
         Statistic<uint64_t>* stat_mem_loads_forwarded;
         Statistic<uint64_t>* stat_mem_violations;
