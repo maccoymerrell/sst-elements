@@ -52,6 +52,7 @@ public:
                             { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
                             { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
                             { "mdp_counter_decay", "When the counter predictor counts down: retire (every clean retire) or speculated (only when the load actually went past an unknown store)", "retire"},
+                            { "mdp_clear_interval", "Cycles between invalidations of the store-address predictor's table, in the manner of a store-set predictor; 0 never clears it", "1048576"},
             )
 
     /*

@@ -121,6 +121,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
                 { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
                 { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"},
+                { "mdp_clear_interval", "Cycles between invalidations of the store-address predictor's table; 0 never clears it", "1048576"},
                 { "agu_enable", "1 models address generation: a memory operation takes an address-generation unit and a load or store port before it reaches this queue, and it reaches it agu_cycles later. 0 is the machine as it was, in which a memory operation stepped from the scheduler straight into the queue.", "1"},
                 { "agu_units", "Address-generation units. Zen 4 has three; Golden Cove generates addresses for three loads and two stores per cycle.", "3"},
                 { "agu_cycles", "Cycles address generation takes before the operation reaches the queue.", "1"},
@@ -152,6 +153,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "mem_violations", "Count the loads an older store resolved onto after they had already read", "operations", 1},
                                     { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
                                     { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1},
+                                    { "mdp_clears", "Count the periodic invalidations of the memory-dependence predictor's table", "operations", 1},
                                     { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},)
 
 
@@ -200,6 +202,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_mem_violations       = registerStatistic<uint64_t>("mem_violations", "1");
             stat_mem_replays          = registerStatistic<uint64_t>("mem_replays", "1");
             stat_mem_predictor_holds  = registerStatistic<uint64_t>("mem_predictor_holds", "1");
+            stat_mdp_clears           = registerStatistic<uint64_t>("mdp_clears", "1");
 
 
             // ADDRESS GENERATION AND THE MEMORY PORTS.
@@ -228,6 +231,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             const size_t mdp_entries       = params.find<size_t>("mdp_entries", 4096);
             const size_t mdp_store_entries = params.find<size_t>("mdp_store_entries", 4096);
             const std::string decay        = params.find<std::string>("mdp_counter_decay", "retire");
+            mdp_clear_interval_            = params.find<uint64_t>("mdp_clear_interval", 1048576);
 
             if ( (decay != "retire") && (decay != "speculated") ) {
                 output->fatal(CALL_INFO, -1,
@@ -257,7 +261,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             mem_dep_.resize(hw_threads, nullptr);
             for ( int t = 0; t < hw_threads; ++t ) {
                 mem_dep_[t] = vanadisMakeMemDepPredictor(
-                    mdp_kind_, mdp_entries, mdp_store_entries, decay == "speculated");
+                    mdp_kind_, mdp_entries, mdp_store_entries, decay == "speculated", mdp_clear_interval_);
                 if ( nullptr == mem_dep_[t] ) {
                     output->fatal(CALL_INFO, -1,
                         "Error: mem_dep_predictor is \"%s\"; it is one of counter, store_pc, none.\n",
@@ -631,6 +635,13 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                         }
                     }
                 }
+            }
+
+            // THE PREDICTOR'S TABLE AGES ON THE CLOCK. Once per core cycle,
+            // before anything this cycle consults it, so that a table due to be
+            // cleared is cleared before it holds another load.
+            for ( int t = 0; t < hw_threads; ++t ) {
+                if ( mem_dep_[t]->tick(cycle) ) { stat_mdp_clears->addData(1); }
             }
 
             // A NEW CYCLE'S ADDRESS-GENERATION UNITS AND PORTS. This runs once
@@ -2450,6 +2461,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         bool                                                  spec_ = false;
         bool                                                  forward_ = true;
         std::string                                           mdp_kind_;
+        uint64_t                                              mdp_clear_interval_ = 0;
         std::vector< std::deque<VanadisBasicLoadPendingEntry*> > load_q;
         std::vector<VanadisInstruction*>                      ordered_ins_;
         size_t                                                load_q_size = 0;
@@ -2491,6 +2503,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         Statistic<uint64_t>* stat_mem_violations;
         Statistic<uint64_t>* stat_mem_replays;
         Statistic<uint64_t>* stat_mem_predictor_holds;
+        Statistic<uint64_t>* stat_mdp_clears;
 };
 
 } // namespace SST
