@@ -28,7 +28,6 @@
 
 #include "datastruct/vcache.h"
 #include "vinsbundle.h"
-#include "vtlb.h"
 
 namespace SST {
 namespace Vanadis {
@@ -270,7 +269,6 @@ public:
 
     /// The host's translation path, shared with the data side. Null when
     /// translation is not modelled, and then nothing here changes.
-    void setTLB(VanadisTLBUnit* tlb) { tlb_ = tlb; }
 
     void requestLoadAt(const uint64_t addr, const uint64_t len) {
         if (len > cache_line_width) {
@@ -294,14 +292,10 @@ public:
                             " read-len=%" PRIu64 " \n",
                             line_start, line_start_offset, cache_line_width);
 
-            // AN INSTRUCTION FETCH IS TRANSLATED TOO. A line whose page is not
-            // in the instruction-side buffer is not asked for; the fetch stage
-            // asks again next cycle, and the second-level lookup or the walk
-            // that this started runs meanwhile. Refusing to fetch is always
-            // safe -- the decoder simply makes no progress this cycle.
-            if ( (nullptr != tlb_) && tlb_->enabled() && (! tlb_->access(true, line_start)) ) {
-                break;
-            }
+            // TRANSLATION IS NOT DONE HERE. The instruction loader asks the
+            // memory interface below it for a line and that interface -- the
+            // instruction-side MMU, which is where this machine's mapping
+            // actually lives -- translates it. The core does not.
 
             if ( predecode_cache->contains(line_start) ) {
                 // line is already in the cache, touch to make sure it is kept in LRU
@@ -411,7 +405,6 @@ private:
     std::unordered_map<uint64_t, VanadisInstructionBundle*> infinite_uop_cache;
 
     std::unordered_map<SST::Interfaces::StandardMem::Request::id_t, SST::Interfaces::StandardMem::Read*> pending_loads;
-    VanadisTLBUnit* tlb_ = nullptr;
 
     VanadisInstructionLoaderMode loader_mode;
     SST::Output* output_;

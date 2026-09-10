@@ -23,7 +23,6 @@
 #include "inst/vfence.h"
 #include "inst/vload.h"
 #include "inst/vstore.h"
-#include "vtlb.h"
 
 #include <cassert>
 #include <cinttypes>
@@ -219,7 +218,6 @@ public:
     /// The host's translation path, or nullptr when this queue has none. It is
     /// shared: the instruction side asks the same unit, because the second-level
     /// buffer and the walkers are shared structures on every reference core.
-    virtual VanadisTLBUnit* tlb() { return nullptr; }
 
     virtual void tick(uint64_t cycle) = 0;
     virtual void clearLSQByThreadID(const uint32_t thread) = 0;

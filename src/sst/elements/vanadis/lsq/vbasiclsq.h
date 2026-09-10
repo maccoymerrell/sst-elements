@@ -126,20 +126,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "agu_cycles", "Cycles address generation takes before the operation reaches the queue.", "1"},
                 { "load_ports", "Loads that may enter the memory pipeline per cycle. Golden Cove: three.", "3"},
                 { "store_ports", "Stores that may enter the memory pipeline per cycle. Golden Cove: two; Zen 4: at most two of its three memory operations may be stores.", "2"},
-                { "tlb_enable", "1 charges for address translation: a first-level buffer on each side, a shared second level, and a hardware walker whose cost is its page-table reads through the cache hierarchy. 0 leaves translation free, as it was.", "1"},
-                { "tlb_l1i_entries", "First-level instruction TLB entries. Neoverse V2: 48.", "48"},
-                { "tlb_l1i_ways", "First-level instruction TLB associativity. 0 or the entry count means fully associative.", "48"},
-                { "tlb_l1d_entries", "First-level data TLB entries. Neoverse V2: 48, fully associative.", "48"},
-                { "tlb_l1d_ways", "First-level data TLB associativity.", "48"},
-                { "tlb_l2_entries", "Shared second-level TLB entries. Neoverse V2: 2048.", "2048"},
-                { "tlb_l2_ways", "Shared second-level TLB associativity. Neoverse V2: 8-way.", "8"},
-                { "tlb_l1_hit_cycles", "Cycles a first-level TLB hit adds. Zero: the lookup is inside the first-level cache access already charged for.", "0"},
-                { "tlb_l2_hit_cycles", "Cycles a second-level TLB access adds. Neoverse V2: 5.", "5"},
-                { "tlb_walk_levels", "Memory accesses one page-table walk makes. RISC-V Sv39 with 4 KiB pages: three.", "3"},
-                { "tlb_walkers", "Page-table walks that may be outstanding at once.", "2"},
-                { "tlb_page_size", "Page size the translation covers.", "4096"},
-                { "tlb_page_table_root", "Physical address of the modelled page table's root page. The walker reads real addresses here so that its accesses cost what they cost; nothing reads their contents.", "4026531840"},
-                { "tlb_arena_pages", "Pages the modelled page table is wrapped into, so a walk can never address outside physical memory.", "4096"}
+                // TRANSLATION IS NOT DONE HERE. The core does not translate:
+                // the translation unit sits at the first-level caches, where the
+                // mapping is, and the tlb_* parameters this queue used to take
+                // were removed with the unit that read them.
             )
 
         SST_ELI_DOCUMENT_STATISTICS({ "bytes_read", "Count all the bytes read for data operations", "bytes", 1 },
@@ -162,15 +152,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "mem_violations", "Count the loads an older store resolved onto after they had already read", "operations", 1},
                                     { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
                                     { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1},
-                                    { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},
-                                    { "tlb_l1d_hits", "Count the data accesses whose translation was in the first-level data TLB", "operations", 1},
-                                    { "tlb_l1d_misses", "Count the data accesses whose translation was not", "operations", 1},
-                                    { "tlb_l1i_hits", "Count the instruction fetches whose translation was in the first-level instruction TLB", "operations", 1},
-                                    { "tlb_l1i_misses", "Count the instruction fetches whose translation was not", "operations", 1},
-                                    { "tlb_l2_hits", "Count the translations found in the shared second-level TLB", "operations", 1},
-                                    { "tlb_l2_misses", "Count the translations that were not, and had to be walked", "operations", 1},
-                                    { "tlb_walks", "Count the page-table walks performed", "operations", 1},
-                                    { "tlb_walk_reads", "Count the memory reads those walks made through the cache hierarchy", "operations", 1})
+                                    { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},)
 
 
         VanadisBasicLoadStoreQueue(ComponentId_t id, Params& params, int coreid, int hwthreads) : VanadisLoadStoreQueue(id, params, coreid, hwthreads),
@@ -219,14 +201,6 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_mem_replays          = registerStatistic<uint64_t>("mem_replays", "1");
             stat_mem_predictor_holds  = registerStatistic<uint64_t>("mem_predictor_holds", "1");
 
-            stat_tlb_l1d_hits    = registerStatistic<uint64_t>("tlb_l1d_hits", "1");
-            stat_tlb_l1d_misses  = registerStatistic<uint64_t>("tlb_l1d_misses", "1");
-            stat_tlb_l1i_hits    = registerStatistic<uint64_t>("tlb_l1i_hits", "1");
-            stat_tlb_l1i_misses  = registerStatistic<uint64_t>("tlb_l1i_misses", "1");
-            stat_tlb_l2_hits     = registerStatistic<uint64_t>("tlb_l2_hits", "1");
-            stat_tlb_l2_misses   = registerStatistic<uint64_t>("tlb_l2_misses", "1");
-            stat_tlb_walks       = registerStatistic<uint64_t>("tlb_walks", "1");
-            stat_tlb_walk_reads  = registerStatistic<uint64_t>("tlb_walk_reads", "1");
 
             // ADDRESS GENERATION AND THE MEMORY PORTS.
             agu_enabled_  = params.find<bool>("agu_enable", true);
@@ -241,18 +215,6 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // TRANSLATION. The walker sends its reads on this queue's own
             // interface, because a hardware walker's accesses go through the
             // data side of the cache hierarchy exactly as a load's do.
-            tlb_.configure(
-                params.find<bool>("tlb_enable", true),
-                params.find<uint32_t>("tlb_l1i_entries", 48), params.find<uint32_t>("tlb_l1i_ways", 48),
-                params.find<uint32_t>("tlb_l1d_entries", 48), params.find<uint32_t>("tlb_l1d_ways", 48),
-                params.find<uint32_t>("tlb_l2_entries", 2048), params.find<uint32_t>("tlb_l2_ways", 8),
-                params.find<uint16_t>("tlb_l1_hit_cycles", 0), params.find<uint16_t>("tlb_l2_hit_cycles", 5),
-                params.find<uint16_t>("tlb_walk_levels", 3), params.find<uint16_t>("tlb_walkers", 2),
-                params.find<uint64_t>("tlb_page_size", 4096),
-                params.find<uint64_t>("tlb_page_table_root", 0xF0000000ULL),
-                params.find<uint64_t>("tlb_arena_pages", 4096));
-            tlb_.setInterface(memInterface);
-            tlb_.setOutput(output);
 
             // SPECULATION IS THE DEFAULT, and turning it off restores the queue
             // this one grew out of: one in-order queue per hardware thread, a
@@ -357,7 +319,6 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             agu_pipe_.push_back(e);
         }
 
-        VanadisTLBUnit* tlb() override { return &tlb_; }
 
         void dropAGUByThreadID(const uint32_t thread) override
         {
@@ -675,9 +636,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // A NEW CYCLE'S ADDRESS-GENERATION UNITS AND PORTS. This runs once
             // per core cycle, before the issue stage of the same cycle, so the
             // budget an instruction asks for at issue is this cycle's.
-            tlb_.tick(cycle);
             drainAGU(cycle);
-            publishTLBStats();
             agu_avail_        = agu_units_;
             load_port_avail_  = load_ports_;
             store_port_avail_ = store_ports_;
@@ -739,25 +698,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         uint16_t              load_port_avail_ = 3;
         uint16_t              store_port_avail_ = 2;
 
-        VanadisTLBUnit tlb_;
 
-        uint64_t tlb_pub_l1d_hits_ = 0;
-        uint64_t tlb_pub_l1d_misses_ = 0;
-        uint64_t tlb_pub_l1i_hits_ = 0;
-        uint64_t tlb_pub_l1i_misses_ = 0;
-        uint64_t tlb_pub_l2_hits_ = 0;
-        uint64_t tlb_pub_l2_misses_ = 0;
-        uint64_t tlb_pub_walks_ = 0;
-        uint64_t tlb_pub_walk_reads_ = 0;
 
-        Statistic<uint64_t>* stat_tlb_l1d_hits;
-        Statistic<uint64_t>* stat_tlb_l1d_misses;
-        Statistic<uint64_t>* stat_tlb_l1i_hits;
-        Statistic<uint64_t>* stat_tlb_l1i_misses;
-        Statistic<uint64_t>* stat_tlb_l2_hits;
-        Statistic<uint64_t>* stat_tlb_l2_misses;
-        Statistic<uint64_t>* stat_tlb_walks;
-        Statistic<uint64_t>* stat_tlb_walk_reads;
 
         class StandardMemHandlers : public Interfaces::StandardMem::RequestHandler
         {
@@ -1122,11 +1064,6 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             assert(ev != nullptr);
             assert(std_mem_handlers != nullptr);
 
-            // A PAGE-TABLE READ IS NOT A LOAD. The walker's reads travel the
-            // same wires as this queue's, so they come back here; they belong
-            // to no instruction and must not be looked for among the loads.
-            if ( tlb_.handleResponse(ev->getID()) ) { delete ev; return; }
-
             ev->handle(std_mem_handlers);
             VANADIS_VERB(output, 16, VANADIS_DBG_LSQ_LOAD_FLG, "completed pass off to incoming handlers\n");
         }
@@ -1188,8 +1125,6 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
                 bool go = (e.ready_cycle <= cycle);
 
-                if ( go && tlb_.enabled() && !e.is_fence ) { go = translateFor(e); }
-
                 if ( !go ) {
                     if ( e.ordered ) { still_ordered = true; }
                     agu_pipe_[keep++] = e;
@@ -1213,38 +1148,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             agu_ordered_in_pipe_ = still_ordered;
         }
 
-        /// Ask the translation path about this operation's effective address.
-        /// The address is computed exactly as the queue computes it a moment
-        /// later, from registers the scheduler has already seen produced.
-        bool translateFor(AGUEntry& e)
-        {
-            uint64_t addr  = 0;
-            uint16_t width = 0;
-            const uint32_t thr = e.ins->getHWThread();
 
-            if ( e.is_store ) { e.ins->asStore()->computeStoreAddress(output, registerFiles->at(thr), &addr, &width); }
-            else              { e.ins->asLoad()->computeLoadAddress(output, registerFiles->at(thr), &addr, &width); }
 
-            return tlb_.access(false, addr & address_mask);
-        }
-
-        /// The accumulated translation counts, published as this cycle's delta.
-        void publishTLBStats()
-        {
-            publishDelta(stat_tlb_l1d_hits,   tlb_.l1dHits(),   tlb_pub_l1d_hits_);
-            publishDelta(stat_tlb_l1d_misses, tlb_.l1dMisses(), tlb_pub_l1d_misses_);
-            publishDelta(stat_tlb_l1i_hits,   tlb_.l1iHits(),   tlb_pub_l1i_hits_);
-            publishDelta(stat_tlb_l1i_misses, tlb_.l1iMisses(), tlb_pub_l1i_misses_);
-            publishDelta(stat_tlb_l2_hits,    tlb_.l2Hits(),    tlb_pub_l2_hits_);
-            publishDelta(stat_tlb_l2_misses,  tlb_.l2Misses(),  tlb_pub_l2_misses_);
-            publishDelta(stat_tlb_walks,      tlb_.walks(),     tlb_pub_walks_);
-            publishDelta(stat_tlb_walk_reads, tlb_.walkReads(), tlb_pub_walk_reads_);
-        }
-
-        static void publishDelta(Statistic<uint64_t>* stat, const uint64_t now, uint64_t& last)
-        {
-            if ( now > last ) { stat->addData(now - last); last = now; }
-        }
 
         bool issueStoreFront(uint32_t thr)
         {

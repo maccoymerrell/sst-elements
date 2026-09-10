@@ -462,7 +462,6 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     // the second-level buffer and the walkers are shared structures on every
     // reference core, so there is one of each here too.
     for ( uint32_t i = 0; i < thread_decoders.size(); ++i ) {
-        thread_decoders[i]->getInstructionLoader()->setTLB(lsq->tlb());
     }
     // The work counter the queue watches. Given here rather than to the queue's
     // own parameters so that one core carries one description of the program it
