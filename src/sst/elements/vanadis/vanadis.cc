@@ -779,6 +779,20 @@ VANADIS_COMPONENT::performFetch(const uint64_t cycle)
     // This is handled by the decoder step, so just keep it empty.
 }
 
+// FETCH-DIRECTED INSTRUCTION PREFETCHING, once per cycle per hardware thread.
+// The run-ahead predictor produces fetch blocks into the fetch target queue and
+// the prefetch engine issues the instruction-cache lines those blocks name.
+// performFetch() above runs `fetches_per_cycle` times a cycle, which is why
+// this is a separate function and not a line inside it: a predictor that ran
+// six times a cycle would be six front ends.
+void
+VANADIS_COMPONENT::performFDIP(const uint64_t cycle)
+{
+    for ( uint32_t i = 0; i < hw_threads; ++i ) {
+        if ( !halted_masks[i] ) { thread_decoders[i]->fdipTick(cycle); }
+    }
+}
+
 void
 VANADIS_COMPONENT::performDecode(const uint64_t cycle)
 {
@@ -1711,6 +1725,14 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                 thr_decoder->getBranchPredictor()->push(
                 spec_ins->getInstructionAddress(), pipeline_reset_addr);
 
+                // The run-ahead predictor of the decoupled front end trains
+                // here too, from the same outcome and in the same order: its
+                // direction table, its architected history, its architected
+                // return stack, and the target of an indirect branch, which is
+                // the only place one is known.
+                thr_decoder->fdipBranchRetired(
+                    spec_ins->getInstructionAddress(), spec_ins->getBranchClass(), branch_taken, pipeline_reset_addr);
+
                 if ( stop_verbose_when_retire_address > 0 && (rob_front->getInstructionAddress() == stop_verbose_when_retire_address) ) {
                     output->setVerboseLevel(0);
                     output->setVerboseMask(-1);
@@ -2371,6 +2393,8 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     for ( uint32_t i = 0; i < fetches_per_cycle; ++i ) {
         performFetch(cycle);
     }
+
+    performFDIP(cycle);
 
     uint64_t rob_total_count = 0;
     for ( uint32_t i = 0; i < hw_threads; ++i ) {

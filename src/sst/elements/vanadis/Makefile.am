@@ -139,6 +139,7 @@ velf/velfinfo.h \
 vfpflags.h \
 vfuncunit.h \
 vinsbundle.h \
+vfdip.h \
 vinsloader.h \
 \
 os/vappruntimememory.h \

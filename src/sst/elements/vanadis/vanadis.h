@@ -663,6 +663,7 @@ private:
         VanadisISATable* issue_isa_table, VanadisISATable* retire_isa_table, uint16_t sw_thr);
 
     void performFetch(const uint64_t cycle);
+    void performFDIP(const uint64_t cycle);
     void performDecode(const uint64_t cycle);
     void performIssue(const uint64_t cycle);
     void performExecute(const uint64_t cycle);

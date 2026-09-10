@@ -169,7 +169,8 @@ public:
                 // Do we have enough space in the ROB to push the micro-op bundle into
                 // the queue?
                 if ( bundle->getInstructionCount() < (thread_rob->capacity() - thread_rob->size()) ) {
-                    bool bundle_has_branch = false;
+                    bool           bundle_has_branch = false;
+                    const uint64_t bundle_ip         = ip;
 
                     for ( uint32_t i = 0; i < bundle->getInstructionCount(); ++i ) {
                         VanadisInstruction* next_ins = bundle->getInstructionByIndex(i);
@@ -177,6 +178,16 @@ public:
                         if ( next_ins->getInstFuncType() == INST_BRANCH ) {
                             VanadisSpeculatedInstruction* next_spec_ins =
                                 dynamic_cast<VanadisSpeculatedInstruction*>(next_ins);
+
+                            // THE FETCH TARGET BUFFER LEARNS HERE, and it has
+                            // to learn here rather than at retire: the
+                            // run-ahead predictor's whole job is to know that
+                            // there is a branch at this address before fetch
+                            // gets back to it, and this is the first moment
+                            // anything in the machine knows.
+                            fdip->observeBranchAtDecode(
+                                bundle_ip, next_spec_ins->getBranchClass(), bundle->pcIncrement(),
+                                next_spec_ins->hasStaticTarget(), next_spec_ins->getStaticTarget());
 
                             if ( branch_predictor->hasDirectionPrediction() ) {
                                 // The unit predicts the taken/not-taken bit as
@@ -326,10 +337,20 @@ public:
                         "0x%" PRI_ADDR ", requested read for cache line (line=%" PRIu64 ")\n",
                         ip, ins_loader->getCacheLineWidth());
                 }
+                const uint64_t demands_before = ins_loader->demandFetchCount();
                 ins_loader->requestLoadAt(ip, 4);
+                stat_icache_demand->addData(ins_loader->demandFetchCount() - demands_before);
                 stat_ins_bytes_loaded->addData(4);
                 stat_predecode_miss->addData(1);
+                // Nothing was decoded: the front end is waiting on the
+                // instruction cache, which is the stall fetch-directed
+                // prefetching exists to remove.
+                stat_fetch_stall_icache->addData(1);
                 success = true;
+            }
+            else {
+                // The line has been asked for and has not come back yet.
+                stat_fetch_stall_icache->addData(1);
             }
         }
         else {

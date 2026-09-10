@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "vanadisDbgFlags.h"
 
@@ -35,6 +36,19 @@ namespace Vanadis {
 enum class VanadisInstructionLoaderMode {
     INFINITE_CACHE_MODE,
     LRU_CACHE_MODE
+};
+
+// Where the loader reports instruction-side prefetch traffic. The fetch-directed
+// prefetcher (vfdip.h) implements it; nothing else in the element does, and with
+// no sink attached the loader behaves exactly as it did before it had one.
+class VanadisPrefetchSink {
+public:
+    virtual ~VanadisPrefetchSink() {}
+    // A line this sink asked for has come back. The bytes are NOT kept: an
+    // instruction prefetch's whole purpose is to leave the line in the L1I.
+    virtual void prefetchArrived(const uint64_t line) = 0;
+    // A demand fetch is about to be sent for this line.
+    virtual void demandFetch(const uint64_t line) = 0;
 };
 
 class VanadisInstructionLoader {
@@ -81,6 +95,21 @@ public:
     void setMemoryInterface(SST::Interfaces::StandardMem* new_if) { mem_if = new_if; }
 
     bool acceptResponse(SST::Interfaces::StandardMem::Request* req) {
+        // AN INSTRUCTION PREFETCH'S RESPONSE IS DROPPED. The line has been
+        // pulled into the L1I by the read itself, which is where a
+        // fetch-directed prefetch wants it; putting the bytes in the core's
+        // four-line predecode buffer as well would evict a line the decoder is
+        // about to read and would let the core execute bytes it prefetched
+        // speculatively. It is accepted here so that the caller deletes it.
+        auto check_prefetch = pending_prefetches.find(req->getID());
+        if (check_prefetch != pending_prefetches.end()) {
+            const uint64_t line = check_prefetch->second;
+            pending_prefetches.erase(check_prefetch);
+            prefetch_lines.erase(line);
+            if (nullptr != prefetch_sink) { prefetch_sink->prefetchArrived(line); }
+            return true;
+        }
+
         // Looks like we created this request, so we should accept and process it
         auto check_hit_local = pending_loads.find(req->getID());
 
@@ -324,6 +353,12 @@ public:
 	                    std::pair<SST::Interfaces::StandardMem::Request::id_t, SST::Interfaces::StandardMem::Read*>(
 	                        req_line->getID(), req_line));
 
+                    // The demand stream, told to the prefetcher: this is the
+                    // moment a prefetch of this line is judged useful, late or
+                    // absent.
+                    if (nullptr != prefetch_sink) { prefetch_sink->demandFetch(line_start); }
+                    demand_fetches++;
+
 	                mem_if->send(req_line);
 
 	            } else {
@@ -337,6 +372,45 @@ public:
         } while (line_start < (addr + len));
 
 		printPendingLoads();
+    }
+
+    // ---- what the fetch-directed prefetcher needs from the loader --------
+
+    void setPrefetchSink(VanadisPrefetchSink* sink) { prefetch_sink = sink; }
+
+    // Is this line already in the core's own line buffer?
+    bool linePresent(const uint64_t line) const { return predecode_cache->contains(line); }
+
+    // Is a DEMAND fetch already in the air for it?
+    bool demandPendingLine(const uint64_t line) const {
+        for (auto pending_load_itr : pending_loads) {
+            if (pending_load_itr.second->pAddr == line) { return true; }
+        }
+        return false;
+    }
+
+    size_t outstandingPrefetches() const { return pending_prefetches.size(); }
+
+    uint64_t demandFetchCount() const { return demand_fetches; }
+
+    // Send a prefetch for one line. It goes out of the SAME interface a fetch
+    // goes out of -- the instruction-side MMU -- so it is translated exactly as
+    // a fetch is translated, which is the only way its address can be the
+    // address the demand fetch will use.
+    void requestPrefetchLine(const uint64_t line) {
+        if (prefetch_lines.find(line) != prefetch_lines.end()) { return; }
+
+        SST::Interfaces::StandardMem::Read* req_line =
+            new SST::Interfaces::StandardMem::Read(line, cache_line_width);
+
+        pending_prefetches.insert(
+            std::pair<SST::Interfaces::StandardMem::Request::id_t, uint64_t>(req_line->getID(), line));
+        prefetch_lines.insert(line);
+
+        output_->verbose(CALL_INFO, 8, VANADIS_DBG_INS_LDR_FLG,
+                        "[ins-loader] ----> fetch-directed prefetch for line 0x%" PRI_ADDR "\n", line);
+
+        mem_if->send(req_line);
     }
 
     void printStatus() {
@@ -405,6 +479,14 @@ private:
     std::unordered_map<uint64_t, VanadisInstructionBundle*> infinite_uop_cache;
 
     std::unordered_map<SST::Interfaces::StandardMem::Request::id_t, SST::Interfaces::StandardMem::Read*> pending_loads;
+
+    // Outstanding instruction prefetches: request id -> the line it is for, and
+    // the set of those lines so a second prefetch of one in flight is free to
+    // detect.
+    std::unordered_map<SST::Interfaces::StandardMem::Request::id_t, uint64_t> pending_prefetches;
+    std::unordered_set<uint64_t> prefetch_lines;
+    VanadisPrefetchSink*         prefetch_sink = nullptr;
+    uint64_t                     demand_fetches = 0;
 
     VanadisInstructionLoaderMode loader_mode;
     SST::Output* output_;
