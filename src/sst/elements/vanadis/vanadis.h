@@ -560,6 +560,7 @@ public:
         { "sched_full_mem", "Cycles dispatch stalled because the memory issue queue was full", "cycles", 1 },
         { "sched_full_branch", "Cycles dispatch stalled because the branch issue queue was full", "cycles", 1 },
         { "agu_stalls", "Cycles a memory instruction was ready but no address-generation unit or port of its kind was free", "cycles", 1 },
+        { "rocc_store_stalls", "Cycles a coprocessor instruction was at the head of the reorder buffer and waited because this core still had a store the memory system had not acknowledged. The command is acted on by an agent that reads memory through the same hierarchy, so it must not be sent while a write of this core's is still invisible to that agent", "cycles", 1 },
         { "rob_cleared_entries", "Number of micro-ops that are cleared during a pipeline clear", "instructions", 1 },
         { "instructions_issued", "Number of instructions issued", "instructions", 1 },
         { "instructions_retired", "Number of instructions retired", "instructions", 1 },
@@ -830,6 +831,7 @@ private:
 
     Statistic<uint64_t>* stat_sched_full[VSQ_COUNT];
     Statistic<uint64_t>* stat_agu_stalls;
+    Statistic<uint64_t>* stat_rocc_store_stalls;
     std::vector<uint64_t>              int_phys_ready;
     std::vector<uint64_t>              fp_phys_ready;
 

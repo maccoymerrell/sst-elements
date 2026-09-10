@@ -634,6 +634,7 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     stat_sched_full[VSQ_BRANCH]  = registerStatistic<uint64_t>("sched_full_branch", "1");
     stat_sched_full[VSQ_NONE]    = nullptr;
     stat_agu_stalls              = registerStatistic<uint64_t>("agu_stalls", "1");
+    stat_rocc_store_stalls       = registerStatistic<uint64_t>("rocc_store_stalls", "1");
     stat_rob_cleared_entries  = registerStatistic<uint64_t>("rob_cleared_entries", "1");
     stat_syscall_cycles       = registerStatistic<uint64_t>("syscall-cycles", "1");
     stat_int_phys_regs_in_use = registerStatistic<uint64_t>("phys_int_reg_in_use", "1");
@@ -2163,6 +2164,34 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
         }
 
         VANADIS_VERB(output, 16, 0, "allocating rocc%d instruction\n", rocc_index);
+
+        // AND EVERY OLDER STORE HAS BEEN PERFORMED, NOT MERELY RETIRED.
+        //
+        // The coprocessor command leaves the core and is acted on by an agent
+        // that reads memory through the same coherent hierarchy this core does
+        // -- an NMFC invocation reads the very words the program wrote just
+        // before forking it. Issuing at the head of the reorder buffer makes the
+        // command non-speculative and puts it after every older instruction in
+        // PROGRAM order; it does nothing about MEMORY order, because a store
+        // retires as soon as its write has been handed to the memory system and
+        // the write is not visible to any other agent until it has been
+        // acknowledged. A store sitting in the store buffer is a store the
+        // coprocessor's agent can and does read around: the directory serialises
+        // its access ahead of the write, the agent reads the old value, and the
+        // write then lands on top of everything the agent did.
+        //
+        // So the command waits for the store buffer, exactly as a syscall does
+        // below and for exactly the same reason -- an operation whose effect is
+        // outside this core must see this core's memory state. A store older
+        // than the instruction at the head of the reorder buffer has already
+        // been sent (a store is sent from the front of the reorder buffer), so
+        // an empty store buffer here means "every older store has been
+        // acknowledged" and nothing younger can hold it: this cannot deadlock.
+        if ( lsq->storeBufferSize() != 0 || !lsq->aguPipeEmpty() ) {
+            stat_rocc_store_stalls->addData(1);
+            break;
+        }
+
         if (!roccs_[rocc_index]->RoCCFull()) {
             // Reserve the unit here; the instruction is recorded where the
             // command is pushed (assignRegistersToInstruction), so the core's
