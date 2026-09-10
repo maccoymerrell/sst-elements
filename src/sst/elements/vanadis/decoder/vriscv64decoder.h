@@ -1259,12 +1259,23 @@ protected:
                     case 0x0:
                     {
                         // ADDW
-                        // TODO - check register ordering
+                        //
+                        // `[Unpriv. Ch. 4: "ADDW ... adds the lower 32 bits of
+                        // rs1 and rs2 ... ignores overflow, and the 32-bit
+                        // result is sign-extended to 64 bits".]`
+                        //
+                        // int32_t, NOT int64_t: the template argument is the
+                        // width the instruction computes at, and a 64-bit ADDW
+                        // returns the whole sum where the ISA requires the
+                        // sign-extended low half. Every other W form here
+                        // already names the 32-bit width; this one did not, and
+                        // for operands whose sum carries out of bit 31 it
+                        // returned 0x0000000100000008 where 0x8 is required.
                          output_->verbose(
-                            CALL_INFO, 16, 0, "-------> ADD %" PRIu16 " <- %" PRIu16 " + %" PRIu16 " hw_thr=%d\n", rd, rs1, rs2, hw_thr);
+                            CALL_INFO, 16, 0, "-------> ADDW %" PRIu16 " <- %" PRIu16 " + %" PRIu16 " hw_thr=%d\n", rd, rs1, rs2, hw_thr);
 
                         bundle->addInstruction(
-                            new VanadisAddInstruction<int64_t>(
+                            new VanadisAddInstruction<int32_t>(
                                 ins_address, hw_thr, options, rd, rs1, rs2));
                         decode_fault = false;
                     } break;

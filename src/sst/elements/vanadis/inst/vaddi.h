@@ -17,6 +17,8 @@
 #define _H_VANADIS_ADDI
 
 #include "inst/vinst.h"
+
+#include <type_traits>
 //#include <string.h>
 
 namespace SST {
@@ -86,8 +88,19 @@ public:
     void instOp(VanadisRegisterFile* regFile,
         uint16_t phys_int_regs_out_0, uint16_t phys_int_regs_in_0) override
     {
+        using wrap_format = typename std::make_unsigned<gpr_format>::type;
+
+        // OVERFLOW IS IGNORED, AND IGNORING IT HAS TO BE WELL DEFINED.
+        // `[Unpriv. Ch. 4: the W forms "ignore overflow", and the 32-bit result
+        // is sign-extended to 64 bits.]` The operands of a W form are read as
+        // int32_t, so a sum that carries out of bit 31 overflows a signed C
+        // integer, which the C++ standard does not define. The arithmetic is
+        // therefore done in the unsigned type of the same width, where it wraps
+        // by definition, and converted back: identical results on two's
+        // complement, and no longer at the compiler's discretion.
         const gpr_format src_1 = regFile->getIntReg<gpr_format>(phys_int_regs_in_0);
-        const gpr_format result = src_1 + imm_value;
+        const gpr_format result = static_cast<gpr_format>(
+            static_cast<wrap_format>(src_1) + static_cast<wrap_format>(imm_value));
 		regFile->setIntReg<gpr_format>(phys_int_regs_out_0, result);
 
     }
