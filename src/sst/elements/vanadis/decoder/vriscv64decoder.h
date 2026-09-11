@@ -166,6 +166,24 @@ public:
 
         bool success = false;
         if ( ! thread_rob->full() ) {
+            // AN ADDRESS THIS CORE'S ADDRESS SPACE CANNOT HOLD (vdecoder.h,
+            // fetchFitsSpace). Nothing is asked of the instruction cache --
+            // the request would reach the coherence fabric as an address no
+            // memory holds -- and a faulting instruction is pushed in place of
+            // whatever is there. The front end then stops on this path until it
+            // is redirected: one fault per path, not one per cycle, because a
+            // machine that has taken a fetch fault has stopped fetching.
+            if ( UNLIKELY(! fetchFitsSpace(ip, 4)) ) {
+                if ( ! ifetch_fault_pending ) {
+                    noteIFetchOutsideSpace(ip, 4);
+                    ifetch_fault_pending = true;
+                    thread_rob->push(new VanadisInstructionFault(
+                        ip, hw_thr, options, "instruction fetch outside the address space this core is configured for"));
+                    success = true;
+                }
+                return success;
+            }
+
             if ( ins_loader->hasBundleAt(ip) ) {
                 // We have the instruction in our micro-op cache
                 stat_uop_hit->addData(1);

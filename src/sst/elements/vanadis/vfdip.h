@@ -128,6 +128,10 @@ public:
         uint32_t filter_sets       = 64;
         uint32_t filter_ways       = 8;
         uint64_t line_width        = 64;
+        // How wide an address is on this core. The run-ahead stops at
+        // an address the space cannot hold rather than naming lines the
+        // memory system has no destination for; see runAhead().
+        uint64_t address_mask      = 0xFFFFFFFFFFFFFFFFULL;
     };
 
     VanadisFDIP(const Config& cfg, VanadisInstructionLoader* loader, VanadisBranchUnit* bp, SST::Output* out) :
@@ -336,6 +340,21 @@ private:
             const uint64_t pc       = ftq_pc_;
             const uint64_t line     = pc & line_mask_;
             const uint64_t line_end = line + cfg_.line_width;
+
+            // AN ADDRESS THE SPACE CANNOT HOLD. The run-ahead has been steered
+            // at one -- an indirect branch on a mispredicted path computed its
+            // target from a register that means nothing -- and the lines it
+            // would name from here are lines no memory holds. Prefetching them
+            // sends the coherence fabric an address it cannot route. There is
+            // nothing honest to fetch, so the run-ahead stops, exactly as it
+            // does for an indirect branch with no target, until the core
+            // redirects it. The demand fetch of the same address is faulted in
+            // the decoder (vdecoder.h, fetchFitsSpace).
+            if ( ((line & cfg_.address_mask) != line)
+                 || (((line_end - 1) & cfg_.address_mask) != (line_end - 1)) ) {
+                blocked_ = true;
+                return;
+            }
 
             const VanadisFetchBlockPrediction p = bp_->predictFetchBlock(pc);
 
