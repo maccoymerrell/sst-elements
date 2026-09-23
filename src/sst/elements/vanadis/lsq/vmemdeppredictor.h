@@ -85,6 +85,31 @@ public:
     /// time: a table wiped on every branch mis-predict would stay empty.
     virtual void reset() = 0;
 
+    /// THE HOLD THAT BOUGHT NOTHING. The load this predictor held reached the
+    /// end of the older stores with none of them overlapping it. Evidence
+    /// against the entry that held it, and the only evidence a held load can
+    /// produce: a predictor without this has no way to take an entry back.
+    virtual void heldNeedlessly(uint64_t) {}
+
+    /// THE PATH THE LOAD WAS REACHED ALONG. Called in program order for every
+    /// memory instruction as it enters the queues, so that a predictor which
+    /// distinguishes contexts has something to distinguish them by. A predictor
+    /// indexed by the load address alone ignores it.
+    virtual void pathUpdate(uint64_t) {}
+
+    /// WHAT THE TABLE DID, for the statistics. `predictions` counts the times
+    /// the table was consulted and had something to say; `correct` the
+    /// speculations that retired without a violation; `violations` the loads
+    /// that read bytes an older store then wrote; `replays` the entries the
+    /// table allocated or rewrote in response; `occupancy` the entries it is
+    /// holding now.
+    virtual uint64_t predictions() const { return predictions_; }
+    virtual uint64_t correct() const { return correct_; }
+    virtual uint64_t violations() const { return violations_; }
+    virtual uint64_t replays() const { return replays_; }
+    virtual uint64_t occupancy() const { return 0; }
+    virtual uint64_t capacity() const { return 0; }
+
     /// One core cycle has passed. Returns true on the cycle the table was
     /// invalidated, so that the queue can count it. A predictor whose entries
     /// carry their own evidence -- the counter's, which decays -- does not age
@@ -92,6 +117,12 @@ public:
     virtual bool tick(uint64_t) { return false; }
 
     virtual const char* name() const = 0;
+
+protected:
+    uint64_t predictions_ = 0;
+    uint64_t correct_     = 0;
+    uint64_t violations_  = 0;
+    uint64_t replays_     = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -215,6 +246,268 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// C. PHAST: the same load, reached along different paths, predicted separately.
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM WITH B. A store-set predictor indexed by the load's address alone
+// gives one answer for that load wherever it is reached from. A load inside a
+// function called from two places, or inside a loop entered by two paths, has
+// one dependence on one path and none on the other, and one entry cannot say
+// both: whichever the last violation armed is what every execution gets, so the
+// path that does not alias is held and the path that does is the only one
+// predicted right.
+//
+// WHAT PHAST DOES. It indexes on the load's address AND the path taken to reach
+// it, at several history lengths at once, and lets the longest length that has
+// an entry for this context answer. The published design is Kim and Ros,
+// "Effective Context-Sensitive Memory Dependence Prediction", HPCA 2024: for
+// each load it finds the shortest history that predicts it precisely, using a
+// TAGE-like set of components at a geometric series of history lengths, trained
+// on the execution path between the conflicting store and the load.
+//
+// WHAT IS IMPLEMENTED HERE, and where it departs from that paper -- stated
+// because a model that quietly differs from what it cites is worse than one
+// that cites nothing:
+//
+//   * The COMPONENTS are as published: a PC-indexed base plus tagged
+//     components at a geometric series of history lengths, longest match
+//     provides, allocation on a misprediction goes to a longer component than
+//     the one that provided, and a usefulness counter protects entries from
+//     being taken.
+//   * The INDEX is the gshare-style fold the owner named: the load address
+//     hashed with the folded path history of that component's length. The
+//     paper's hash is more elaborate.
+//   * WHAT AN ENTRY HOLDS is the ADDRESS OF THE CONFLICTING STORE, as
+//     predictor B holds, rather than the paper's distance to that store along
+//     the path. The reason is the interface: the queue tells a predictor
+//     whether a named store instruction is among the unresolved older ones, and
+//     nothing about distances. ASSUMED: that the context-sensitivity, and not
+//     the distance encoding, is what the prediction accuracy comes from. The
+//     distance form would need the queue to expose its order, which is a change
+//     to the queue and not to the predictor.
+//   * THE PATH HISTORY is built from the MEMORY INSTRUCTIONS in program order,
+//     two bits of each address shifted in as it enters the queues, rather than
+//     from branch outcomes. ASSUMED: that this distinguishes the paths that
+//     matter here, since two paths to one load that differ at all differ in the
+//     loads and stores they execute. The queue does not see branches; taking
+//     the history from the branch unit would be a second change in a second
+//     component and is the better form if this one proves too coarse.
+//
+class VanadisMemDepPhast : public VanadisMemDepPredictor
+{
+public:
+    // The history lengths, in bits of the path register, geometric as the
+    // published design's are. The base component has no history at all.
+    static constexpr size_t COMPONENTS = 4;
+
+    VanadisMemDepPhast(size_t base_entries, size_t comp_entries, uint64_t clear_interval) :
+        base_mask_(base_entries - 1), comp_mask_(comp_entries - 1), clear_interval_(clear_interval),
+        last_clear_(0), base_(base_entries), hist_{ 4, 12, 36, 108 }
+    {
+        for ( size_t c = 0; c < COMPONENTS; ++c ) { comp_[c].assign(comp_entries, Entry()); }
+    }
+
+    void pathUpdate(uint64_t pc) override
+    {
+        // Two bits of each memory instruction's address, shifted into a 128-bit
+        // register in program order. Two bits rather than one because one bit
+        // per instruction makes two different addresses agree half the time.
+        const uint64_t bits = ((pc >> 2) ^ (pc >> 5) ^ (pc >> 9) ^ (pc >> 13)) & 0x3;
+        phr_hi_             = (phr_hi_ << 2) | (phr_lo_ >> 62);
+        phr_lo_             = (phr_lo_ << 2) | bits;
+    }
+
+    bool speculate(uint64_t load_pc, const VanadisStoreQView& older) override
+    {
+        const Provider p = provider(load_pc);
+        if ( !p.found ) { return true; }        // nothing known: let it go
+        predictions_++;
+        return !older.containsStorePC(p.store_pc);
+    }
+
+    void violated(uint64_t load_pc, uint64_t store_pc) override
+    {
+        violations_++;
+        const Provider p = provider(load_pc);
+
+        // The component that answered had the right store and the load
+        // violated anyway -- the store was not among the unresolved ones when
+        // the load was asked. Nothing to learn; strengthen what is there.
+        if ( p.found && p.store_pc == store_pc ) {
+            if ( p.comp < COMPONENTS ) {
+                Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+                if ( e.conf < 3 ) { e.conf++; }
+            }
+            return;
+        }
+
+        // Otherwise allocate in a component with a LONGER history than the one
+        // that provided, which is what makes the predictor find the shortest
+        // history that separates the two contexts. A base-only load allocates
+        // in the shortest component.
+        const size_t from  = p.found && p.comp < COMPONENTS ? p.comp + 1 : 0;
+        bool         taken = false;
+        for ( size_t c = from; c < COMPONENTS && !taken; ++c ) {
+            Entry& e = comp_[c][compIndex(load_pc, c)];
+            if ( e.valid && e.useful > 0 ) { e.useful--; continue; }   // protected; age it
+            e.valid    = true;
+            e.tag      = compTag(load_pc, c);
+            e.store_pc = store_pc;
+            e.conf     = 3;
+            e.useful   = 0;
+            taken      = true;
+            replays_++;
+        }
+        if ( !taken ) {
+            // Every component that could hold it is protected. The base still
+            // records the dependence, so the load is at least held somewhere.
+            BaseEntry& b = base_[static_cast<size_t>((load_pc >> 2) & base_mask_)];
+            b.valid      = true;
+            b.store_pc   = store_pc;
+            replays_++;
+        }
+    }
+
+    /// The entry that held this load was wrong: nothing older overlapped it.
+    /// Confidence falls, and an entry nothing confirms is given up, so a
+    /// context whose dependence was an accident stops costing anything.
+    void heldNeedlessly(uint64_t load_pc) override
+    {
+        const Provider p = provider(load_pc);
+        if ( !p.found ) { return; }
+        if ( p.comp < COMPONENTS ) {
+            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+            if ( e.conf > 0 ) { e.conf--; }
+            if ( 0 == e.conf ) { e.valid = false; }
+            if ( e.useful > 0 ) { e.useful--; }
+        }
+        else {
+            base_[static_cast<size_t>((load_pc >> 2) & base_mask_)].valid = false;
+        }
+    }
+
+    void retiredClean(uint64_t load_pc, bool speculated) override
+    {
+        if ( !speculated ) { return; }
+        correct_++;
+        const Provider p = provider(load_pc);
+        if ( p.found && p.comp < COMPONENTS ) {
+            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+            if ( e.useful < 3 ) { e.useful++; }
+        }
+    }
+
+    void reset() override
+    {
+        for ( auto& b : base_ ) { b = BaseEntry(); }
+        for ( size_t c = 0; c < COMPONENTS; ++c ) { std::fill(comp_[c].begin(), comp_[c].end(), Entry()); }
+        phr_lo_ = phr_hi_ = 0;
+    }
+
+    // PERIODIC AGEING, not a wipe. A tagged component whose entries were all
+    // cleared on a timer would relearn the same contexts from scratch every
+    // interval and the long histories would never pay for themselves. What the
+    // interval does here is halve the usefulness counters, so an entry nothing
+    // has confirmed lately becomes available to be taken, and clear the base --
+    // which is the untagged part and the part that goes stale the way B's whole
+    // table does.
+    bool tick(uint64_t cycle) override
+    {
+        if ( 0 == clear_interval_ ) { return false; }
+        if ( (cycle - last_clear_) < clear_interval_ ) { return false; }
+        last_clear_ = cycle;
+        for ( auto& b : base_ ) { b.valid = false; }
+        for ( size_t c = 0; c < COMPONENTS; ++c ) {
+            for ( auto& e : comp_[c] ) { e.useful >>= 1; }
+        }
+        return true;
+    }
+
+    uint64_t occupancy() const override
+    {
+        uint64_t n = 0;
+        for ( const auto& b : base_ ) { if ( b.valid ) { n++; } }
+        for ( size_t c = 0; c < COMPONENTS; ++c ) {
+            for ( const auto& e : comp_[c] ) { if ( e.valid ) { n++; } }
+        }
+        return n;
+    }
+
+    uint64_t capacity() const override { return base_.size() + COMPONENTS * comp_[0].size(); }
+
+    const char* name() const override { return "phast"; }
+
+private:
+    struct Entry
+    {
+        uint64_t store_pc = 0;
+        uint16_t tag      = 0;
+        uint8_t  conf     = 0;
+        uint8_t  useful   = 0;
+        bool     valid    = false;
+    };
+
+    struct BaseEntry
+    {
+        uint64_t store_pc = 0;
+        bool     valid    = false;
+    };
+
+    struct Provider
+    {
+        bool     found    = false;
+        size_t   comp     = COMPONENTS;   // COMPONENTS means "the base answered"
+        uint64_t store_pc = 0;
+    };
+
+    /// The path history folded down to `bits` bits, as a gshare index folds a
+    /// long global history into an index-sized value.
+    uint64_t foldedHistory(size_t bits) const
+    {
+        uint64_t v = 0;
+        for ( size_t b = 0; b < bits; ++b ) {
+            const uint64_t bit = (b < 64) ? ((phr_lo_ >> b) & 1ULL) : ((phr_hi_ >> (b - 64)) & 1ULL);
+            v ^= bit << (b % 16);
+        }
+        return v;
+    }
+
+    size_t compIndex(uint64_t load_pc, size_t c) const
+    {
+        const uint64_t h = foldedHistory(hist_[c]);
+        return static_cast<size_t>(((load_pc >> 2) ^ h ^ (h << 3)) & comp_mask_);
+    }
+
+    uint16_t compTag(uint64_t load_pc, size_t c) const
+    {
+        const uint64_t h = foldedHistory(hist_[c]);
+        return static_cast<uint16_t>(((load_pc >> 2) ^ (load_pc >> 14) ^ (h >> 1) ^ (h << 7)) & 0xFFFF);
+    }
+
+    /// The longest component holding this context, or the base, or nothing.
+    Provider provider(uint64_t load_pc) const
+    {
+        for ( size_t c = COMPONENTS; c-- > 0; ) {
+            const Entry& e = comp_[c][compIndex(load_pc, c)];
+            if ( e.valid && e.tag == compTag(load_pc, c) ) { return Provider{ true, c, e.store_pc }; }
+        }
+        const BaseEntry& b = base_[static_cast<size_t>((load_pc >> 2) & base_mask_)];
+        if ( b.valid ) { return Provider{ true, COMPONENTS, b.store_pc }; }
+        return Provider{};
+    }
+
+    const uint64_t         base_mask_;
+    const uint64_t         comp_mask_;
+    const uint64_t         clear_interval_;
+    uint64_t               last_clear_;
+    std::vector<BaseEntry> base_;
+    std::vector<Entry>     comp_[COMPONENTS];
+    const size_t           hist_[COMPONENTS];
+    uint64_t               phr_lo_ = 0;
+    uint64_t               phr_hi_ = 0;
+};
+
+// ---------------------------------------------------------------------------
 // No prediction at all: every load goes past every unknown store.
 // ---------------------------------------------------------------------------
 class VanadisMemDepNone : public VanadisMemDepPredictor
@@ -259,6 +552,10 @@ vanadisMakeMemDepPredictor(
     if ( kind == "counter" ) { return new VanadisMemDepCounter(vanadisMemDepRoundUp(counter_entries), decay_spec_only); }
     if ( kind == "store_pc" ) {
         return new VanadisMemDepStorePC(vanadisMemDepRoundUp(store_entries), store_clear_interval);
+    }
+    if ( kind == "phast" ) {
+        return new VanadisMemDepPhast(
+            vanadisMemDepRoundUp(counter_entries), vanadisMemDepRoundUp(store_entries), store_clear_interval);
     }
     if ( kind == "none" ) { return new VanadisMemDepNone(); }
     if ( kind == "hold" ) { return new VanadisMemDepHold(); }

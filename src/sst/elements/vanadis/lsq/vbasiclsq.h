@@ -117,11 +117,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "lsq_speculate", "1 lets a load issue past an older store whose address is not known yet, be answered from an older store's bytes, and be replayed when an older store later resolves onto bytes it has read. 0 is the strictly in-order queue, in which a load never passes a store.", "1"},
                 { "mem_dep_speculation", "Alias of lsq_speculate, kept because the design document names it.", "1"},
                 { "lsq_forward", "1 lets a load be answered out of an older store's bytes. 0 makes it wait for the store to reach memory, as the in-order queue does. Only meaningful when lsq_speculate is 1.", "1"},
-                { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: counter (a two-bit counter per load address), store_pc (the store that last made this load flush), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "counter"},
+                { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: phast (the default -- the load address hashed with the path it was reached along, at a geometric series of history lengths, so that one load gets a different prediction on each path), store_pc (the store that last made this load flush, indexed by the load address alone), counter (a two-bit counter per load address), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "phast"},
                 { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
-                { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two", "4096"},
+                { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two. For phast it is the size of ONE tagged component, of which there are four beside the base table", "4096"},
                 { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"},
-                { "mdp_clear_interval", "Cycles between invalidations of the store-address predictor's table; 0 never clears it", "1048576"},
+                { "mdp_clear_interval", "Cycles between invalidations of the store-address predictor's table; 0 never clears it. For phast the same interval halves the usefulness counters and clears the untagged base table, rather than wiping the tagged components, which would make the long histories relearn every interval", "1048576"},
                 { "agu_enable", "1 models address generation: a memory operation takes an address-generation unit and a load or store port before it reaches this queue, and it reaches it agu_cycles later. 0 is the machine as it was, in which a memory operation stepped from the scheduler straight into the queue.", "1"},
                 { "agu_units", "Address-generation units. Zen 4 has three; Golden Cove generates addresses for three loads and two stores per cycle.", "3"},
                 { "agu_cycles", "Cycles address generation takes before the operation reaches the queue.", "1"},
@@ -154,6 +154,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "mem_replays", "Count the flushes actually taken to re-execute such a load", "operations", 1},
                                     { "mem_predictor_holds", "Count the loads the memory-dependence predictor held back at least once", "operations", 1},
                                     { "mdp_clears", "Count the periodic invalidations of the memory-dependence predictor's table", "operations", 1},
+                                    { "mdp_predictions", "Count the times the memory-dependence predictor was consulted about a load and had an entry for it. A load the table knows nothing about is not a prediction and is not counted here", "operations", 1},
+                                    { "mdp_correct", "Count the loads that were allowed past a store of unknown address and retired without a violation -- the predictions that were right", "operations", 1},
+                                    { "mdp_violations", "Count the violations charged to the predictor: a load that read bytes an older store then wrote. Against mdp_correct it is the table's accuracy", "operations", 1},
+                                    { "mdp_allocations", "Count the entries the table allocated or rewrote in response to a violation", "operations", 1},
+                                    { "mdp_occupancy", "Entries the table is holding, summed over the cycles of the run. Over the cycle count it is the mean occupancy, and against mdp_capacity it says whether the table was ever the constraint", "operations", 1},
+                                    { "mdp_capacity", "Entries the table has. Configuration, recorded so that the occupancy has a denominator in the same file", "operations", 1},
                                     { "agu_stalls", "Count the cycles in which a memory instruction could not be handed over because no address-generation unit or no port of its kind was free", "cycles", 1},
                                     { "wrong_path_load_returned", "Count the load responses that arrived after the load had been squashed, and were therefore dropped", "operations", 1},
                                     { "wrong_path_load_slow", "Count those dropped responses whose round trip exceeded a level-one data cache hit, which every miss does and a response delayed by queueing also does: an UPPER BOUND on the wrong-path loads that missed in that cache", "operations", 1},
@@ -217,6 +223,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_mem_replays          = registerStatistic<uint64_t>("mem_replays", "1");
             stat_mem_predictor_holds  = registerStatistic<uint64_t>("mem_predictor_holds", "1");
             stat_mdp_clears           = registerStatistic<uint64_t>("mdp_clears", "1");
+            stat_mdp_predictions      = registerStatistic<uint64_t>("mdp_predictions", "1");
+            stat_mdp_correct          = registerStatistic<uint64_t>("mdp_correct", "1");
+            stat_mdp_violations       = registerStatistic<uint64_t>("mdp_violations", "1");
+            stat_mdp_allocations      = registerStatistic<uint64_t>("mdp_allocations", "1");
+            stat_mdp_occupancy        = registerStatistic<uint64_t>("mdp_occupancy", "1");
+            stat_mdp_capacity         = registerStatistic<uint64_t>("mdp_capacity", "1");
 
 
             // ADDRESS GENERATION AND THE MEMORY PORTS.
@@ -241,7 +253,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
             forward_ = params.find<bool>("lsq_forward", true);
 
-            mdp_kind_ = params.find<std::string>("mem_dep_predictor", "counter");
+            mdp_kind_ = params.find<std::string>("mem_dep_predictor", "phast");
             const size_t mdp_entries       = params.find<size_t>("mdp_entries", 4096);
             const size_t mdp_store_entries = params.find<size_t>("mdp_store_entries", 4096);
             const std::string decay        = params.find<std::string>("mdp_counter_decay", "retire");
@@ -278,7 +290,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     mdp_kind_, mdp_entries, mdp_store_entries, decay == "speculated", mdp_clear_interval_);
                 if ( nullptr == mem_dep_[t] ) {
                     output->fatal(CALL_INFO, -1,
-                        "Error: mem_dep_predictor is \"%s\"; it is one of counter, store_pc, none.\n",
+                        "Error: mem_dep_predictor is \"%s\"; it is one of phast, store_pc, counter, none, hold.\n",
                         mdp_kind_.c_str());
                 }
             }
@@ -383,6 +395,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 load_q_size++;
                 reserved_loads_[ins] = entry;
                 stat_loads_issued->addData(1);
+                // THE PATH, in program order. A predictor that distinguishes
+                // the routes to one load needs the route; this is where the
+                // queue sees the memory instructions in the order the program
+                // has them.
+                mem_dep_[thr]->pathUpdate(ins->getInstructionAddress());
             } break;
             case INST_STORE:
             {
@@ -392,6 +409,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 stores_pending_size++;
                 reserved_stores_[ins] = entry;
                 stat_stores_issued->addData(1);
+                mem_dep_[thr]->pathUpdate(ins->getInstructionAddress());
             } break;
             default:
                 // A fence takes no slot. It needs no age either: the core will
@@ -772,6 +790,32 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // cleared is cleared before it holds another load.
             for ( int t = 0; t < hw_threads; ++t ) {
                 if ( mem_dep_[t]->tick(cycle) ) { stat_mdp_clears->addData(1); }
+            }
+
+            // WHAT THE TABLE DID, published once a cycle as differences, so
+            // that a statistics dump taken at any point carries the counts up
+            // to it. Summed over the threads: the tables are per thread and the
+            // statistic is the core's.
+            {
+                uint64_t pred = 0, corr = 0, viol = 0, alloc = 0, occ = 0, cap = 0;
+                for ( int t = 0; t < hw_threads; ++t ) {
+                    pred += mem_dep_[t]->predictions();
+                    corr += mem_dep_[t]->correct();
+                    viol += mem_dep_[t]->violations();
+                    alloc += mem_dep_[t]->replays();
+                    occ += mem_dep_[t]->occupancy();
+                    cap += mem_dep_[t]->capacity();
+                }
+                stat_mdp_predictions->addData(pred - mdp_last_pred_);
+                stat_mdp_correct->addData(corr - mdp_last_corr_);
+                stat_mdp_violations->addData(viol - mdp_last_viol_);
+                stat_mdp_allocations->addData(alloc - mdp_last_alloc_);
+                mdp_last_pred_ = pred;
+                mdp_last_corr_ = corr;
+                mdp_last_viol_ = viol;
+                mdp_last_alloc_ = alloc;
+                stat_mdp_occupancy->addData(occ);
+                stat_mdp_capacity->addData(cap);
             }
 
             // A NEW CYCLE'S ADDRESS-GENERATION UNITS AND PORTS. This runs once
@@ -2033,6 +2077,15 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 load_entry->markSpeculated();
                 stat_mem_loads_speculated->addData(1);
             }
+
+            // THE HOLD THAT BOUGHT NOTHING. This load reached the end of the
+            // older stores with none of them overlapping it, so every cycle the
+            // predictor kept it waiting was spent for nothing -- and this is the
+            // only moment the machine can know that. A predictor whose entry is
+            // armed by a violation and has no way to be taken back keeps paying
+            // this for ever; telling it is what lets it stop.
+            if( load_entry->wasHeld() ) { mem_dep_[thr]->heldNeedlessly(load_pc); }
+
             sendLoadFromEntry(load_entry);
         }
 
@@ -2619,6 +2672,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         bool                                                  spec_ = false;
         bool                                                  forward_ = true;
         std::string                                           mdp_kind_;
+        /// What the predictor's own counters read the last time they were
+        /// published, so that an accumulator statistic is fed the DIFFERENCE.
+        uint64_t                                              mdp_last_pred_ = 0;
+        uint64_t                                              mdp_last_corr_ = 0;
+        uint64_t                                              mdp_last_viol_ = 0;
+        uint64_t                                              mdp_last_alloc_ = 0;
         uint64_t                                              mdp_clear_interval_ = 0;
         std::vector< std::deque<VanadisBasicLoadPendingEntry*> > load_q;
         std::vector<VanadisInstruction*>                      ordered_ins_;
@@ -2668,6 +2727,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         Statistic<uint64_t>* stat_mem_replays;
         Statistic<uint64_t>* stat_mem_predictor_holds;
         Statistic<uint64_t>* stat_mdp_clears;
+        Statistic<uint64_t>* stat_mdp_predictions;
+        Statistic<uint64_t>* stat_mdp_correct;
+        Statistic<uint64_t>* stat_mdp_violations;
+        Statistic<uint64_t>* stat_mdp_allocations;
+        Statistic<uint64_t>* stat_mdp_occupancy;
+        Statistic<uint64_t>* stat_mdp_capacity;
 };
 
 } // namespace SST
