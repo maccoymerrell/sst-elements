@@ -71,14 +71,21 @@ public:
 
     /// May the load at `load_pc` be issued past older stores whose addresses
     /// are not known? False means hold it.
-    virtual bool speculate(uint64_t load_pc, const VanadisStoreQView& older) = 0;
+    /// `path` is the token this predictor handed out when the load entered the
+    /// queue -- the route the program took to REACH it. It is carried by the
+    /// load's own queue entry and given back here and at `violated`, because by
+    /// the time a load's address resolves, and again by the time a violation on
+    /// it is noticed, every memory instruction issued since has moved the live
+    /// path history on: asking the live history would key the prediction, and
+    /// then the training, on a route the load was never reached along.
+    virtual bool speculate(uint64_t load_pc, const VanadisStoreQView& older, uint64_t path) = 0;
 
     /// The load at `load_pc` read bytes the store at `store_pc` then wrote.
-    virtual void violated(uint64_t load_pc, uint64_t store_pc) = 0;
+    virtual void violated(uint64_t load_pc, uint64_t store_pc, uint64_t path) = 0;
 
     /// The load at `load_pc` retired without having caused a flush.
     /// `speculated` says whether it actually went past an unknown store.
-    virtual void retiredClean(uint64_t load_pc, bool speculated) = 0;
+    virtual void retiredClean(uint64_t load_pc, bool speculated, uint64_t path) = 0;
 
     /// Everything the table has learned about a thread's program is discarded.
     /// Called when the thread's address space is replaced, and at no other
@@ -89,13 +96,18 @@ public:
     /// end of the older stores with none of them overlapping it. Evidence
     /// against the entry that held it, and the only evidence a held load can
     /// produce: a predictor without this has no way to take an entry back.
-    virtual void heldNeedlessly(uint64_t) {}
+    virtual void heldNeedlessly(uint64_t, uint64_t) {}
 
     /// THE PATH THE LOAD WAS REACHED ALONG. Called in program order for every
     /// memory instruction as it enters the queues, so that a predictor which
     /// distinguishes contexts has something to distinguish them by. A predictor
     /// indexed by the load address alone ignores it.
     virtual void pathUpdate(uint64_t) {}
+
+    /// A token naming the path history as it stands now, to be given back with
+    /// this load at `speculate` and `violated`. A predictor that does not use a
+    /// path returns the same token always and ignores it.
+    virtual uint64_t pathSnapshot() { return 0; }
 
     /// WHAT THE TABLE DID, for the statistics. `predictions` counts the times
     /// the table was consulted and had something to say; `correct` the
@@ -145,20 +157,29 @@ public:
         mask_(entries - 1), decay_spec_only_(decay_on_speculated_only), table_(entries, 0)
     {}
 
-    bool speculate(uint64_t load_pc, const VanadisStoreQView&) override { return table_[index(load_pc)] <= 1; }
-
-    void violated(uint64_t load_pc, uint64_t) override
+    bool speculate(uint64_t load_pc, const VanadisStoreQView&, uint64_t) override
     {
+        const uint8_t c = table_[index(load_pc)];
+        if ( c > 0 ) { predictions_++; }        // a counter at zero knows nothing
+        return c <= 1;
+    }
+
+    void violated(uint64_t load_pc, uint64_t, uint64_t) override
+    {
+        violations_++;
         uint8_t& c = table_[index(load_pc)];
         if ( c < 3 ) { c++; }
     }
 
-    void retiredClean(uint64_t load_pc, bool speculated) override
+    void retiredClean(uint64_t load_pc, bool speculated, uint64_t) override
     {
+        if ( speculated ) { correct_++; }
         if ( decay_spec_only_ && !speculated ) { return; }
         uint8_t& c = table_[index(load_pc)];
         if ( c > 0 ) { c--; }
     }
+
+    uint64_t capacity() const override { return table_.size(); }
 
     void reset() override { std::fill(table_.begin(), table_.end(), static_cast<uint8_t>(0)); }
 
@@ -200,26 +221,40 @@ public:
         store_pc_(entries, 0)
     {}
 
-    bool speculate(uint64_t load_pc, const VanadisStoreQView& older) override
+    bool speculate(uint64_t load_pc, const VanadisStoreQView& older, uint64_t) override
     {
         const size_t i = index(load_pc);
-        if ( !valid_[i] ) { return true; }
+        if ( !valid_[i] ) { return true; }      // nothing known: let it go
+        predictions_++;
         return !older.containsStorePC(store_pc_[i]);
     }
 
-    void violated(uint64_t load_pc, uint64_t store_pc) override
+    void violated(uint64_t load_pc, uint64_t store_pc, uint64_t) override
     {
+        violations_++;
         const size_t i = index(load_pc);
+        if ( !valid_[i] ) { live_++; }
         valid_[i]      = true;
         store_pc_[i]   = store_pc;
     }
 
-    void retiredClean(uint64_t, bool) override {}
+    /// A speculation this table allowed that reached the end of the older
+    /// stores without one of them overlapping it. Counted for the same reason
+    /// PHAST counts it: the two predictors are compared on their own figures,
+    /// and a control arm that reports nothing cannot be compared with anything.
+    void retiredClean(uint64_t, bool speculated, uint64_t) override
+    {
+        if ( speculated ) { correct_++; }
+    }
+
+    uint64_t occupancy() const override { return live_; }
+    uint64_t capacity() const override { return valid_.size(); }
 
     void reset() override
     {
         std::fill(valid_.begin(), valid_.end(), false);
         std::fill(store_pc_.begin(), store_pc_.end(), static_cast<uint64_t>(0));
+        live_ = 0;
     }
 
     /// Invalidating means clearing the valid bits: a store address is read only
@@ -230,6 +265,7 @@ public:
         if ( (cycle - last_clear_) < clear_interval_ ) { return false; }
         last_clear_ = cycle;
         std::fill(valid_.begin(), valid_.end(), false);
+        live_ = 0;
         return true;
     }
 
@@ -241,6 +277,7 @@ private:
     const uint64_t        mask_;
     const uint64_t        clear_interval_;
     uint64_t              last_clear_;
+    uint64_t              live_ = 0;   ///< entries currently valid, kept rather than rescanned
     std::vector<bool>     valid_;
     std::vector<uint64_t> store_pc_;
 };
@@ -307,6 +344,20 @@ public:
         for ( size_t c = 0; c < COMPONENTS; ++c ) { comp_[c].assign(comp_entries, Entry()); }
     }
 
+    /// THE ROUTE A LOAD WAS REACHED ALONG, kept so it can be given back. Every
+    /// memory instruction that enters the queue moves the live history on, so
+    /// by the time this load's address resolves the live history names a route
+    /// through instructions YOUNGER than the load. The ring holds the last
+    /// `ROUTES` histories; a token is the sequence number of one of them, and
+    /// the ring is longer than any queue the core can hold, so a token is still
+    /// in it whenever a load in the queue asks. A token too old to be in the
+    /// ring falls back to the oldest kept, which is the closest route there is.
+    uint64_t pathSnapshot() override
+    {
+        route_[seq_ % ROUTES] = Route{ phr_hi_, phr_lo_ };
+        return seq_++;
+    }
+
     void pathUpdate(uint64_t pc) override
     {
         // Two bits of each memory instruction's address, shifted into a 128-bit
@@ -317,25 +368,26 @@ public:
         phr_lo_             = (phr_lo_ << 2) | bits;
     }
 
-    bool speculate(uint64_t load_pc, const VanadisStoreQView& older) override
+    bool speculate(uint64_t load_pc, const VanadisStoreQView& older, uint64_t path) override
     {
-        const Provider p = provider(load_pc);
+        const Provider p = provider(load_pc, path);
         if ( !p.found ) { return true; }        // nothing known: let it go
         predictions_++;
         return !older.containsStorePC(p.store_pc);
     }
 
-    void violated(uint64_t load_pc, uint64_t store_pc) override
+    void violated(uint64_t load_pc, uint64_t store_pc, uint64_t path) override
     {
         violations_++;
-        const Provider p = provider(load_pc);
+        const Route    r = route(path);
+        const Provider p = provider(load_pc, path);
 
         // The component that answered had the right store and the load
         // violated anyway -- the store was not among the unresolved ones when
         // the load was asked. Nothing to learn; strengthen what is there.
         if ( p.found && p.store_pc == store_pc ) {
             if ( p.comp < COMPONENTS ) {
-                Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+                Entry& e = comp_[p.comp][compIndex(load_pc, p.comp, r)];
                 if ( e.conf < 3 ) { e.conf++; }
             }
             return;
@@ -348,10 +400,10 @@ public:
         const size_t from  = p.found && p.comp < COMPONENTS ? p.comp + 1 : 0;
         bool         taken = false;
         for ( size_t c = from; c < COMPONENTS && !taken; ++c ) {
-            Entry& e = comp_[c][compIndex(load_pc, c)];
+            Entry& e = comp_[c][compIndex(load_pc, c, r)];
             if ( e.valid && e.useful > 0 ) { e.useful--; continue; }   // protected; age it
             e.valid    = true;
-            e.tag      = compTag(load_pc, c);
+            e.tag      = compTag(load_pc, c, r);
             e.store_pc = store_pc;
             e.conf     = 3;
             e.useful   = 0;
@@ -371,12 +423,13 @@ public:
     /// The entry that held this load was wrong: nothing older overlapped it.
     /// Confidence falls, and an entry nothing confirms is given up, so a
     /// context whose dependence was an accident stops costing anything.
-    void heldNeedlessly(uint64_t load_pc) override
+    void heldNeedlessly(uint64_t load_pc, uint64_t path) override
     {
-        const Provider p = provider(load_pc);
+        const Route    r = route(path);
+        const Provider p = provider(load_pc, path);
         if ( !p.found ) { return; }
         if ( p.comp < COMPONENTS ) {
-            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp, r)];
             if ( e.conf > 0 ) { e.conf--; }
             if ( 0 == e.conf ) { e.valid = false; }
             if ( e.useful > 0 ) { e.useful--; }
@@ -386,13 +439,13 @@ public:
         }
     }
 
-    void retiredClean(uint64_t load_pc, bool speculated) override
+    void retiredClean(uint64_t load_pc, bool speculated, uint64_t path) override
     {
         if ( !speculated ) { return; }
         correct_++;
-        const Provider p = provider(load_pc);
+        const Provider p = provider(load_pc, path);
         if ( p.found && p.comp < COMPONENTS ) {
-            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp)];
+            Entry& e = comp_[p.comp][compIndex(load_pc, p.comp, route(path))];
             if ( e.useful < 3 ) { e.useful++; }
         }
     }
@@ -402,6 +455,8 @@ public:
         for ( auto& b : base_ ) { b = BaseEntry(); }
         for ( size_t c = 0; c < COMPONENTS; ++c ) { std::fill(comp_[c].begin(), comp_[c].end(), Entry()); }
         phr_lo_ = phr_hi_ = 0;
+        std::fill(route_.begin(), route_.end(), Route());
+        seq_ = 0;
     }
 
     // PERIODIC AGEING, not a wipe. A tagged component whose entries were all
@@ -453,6 +508,18 @@ private:
         bool     valid    = false;
     };
 
+    /// One saved path history: the 128-bit register as it stood when a load
+    /// entered the queue.
+    struct Route
+    {
+        uint64_t hi = 0;
+        uint64_t lo = 0;
+    };
+
+    /// Longer than any load/store queue this core can be configured with, so a
+    /// load still in the queue always finds the route it was reached along.
+    static constexpr size_t ROUTES = 1024;
+
     struct Provider
     {
         bool     found    = false;
@@ -462,34 +529,47 @@ private:
 
     /// The path history folded down to `bits` bits, as a gshare index folds a
     /// long global history into an index-sized value.
-    uint64_t foldedHistory(size_t bits) const
+    /// A route folded down to `bits` bits, as a gshare index folds a long
+    /// global history into an index-sized value.
+    static uint64_t foldedHistory(const Route& r, size_t bits)
     {
         uint64_t v = 0;
         for ( size_t b = 0; b < bits; ++b ) {
-            const uint64_t bit = (b < 64) ? ((phr_lo_ >> b) & 1ULL) : ((phr_hi_ >> (b - 64)) & 1ULL);
+            const uint64_t bit = (b < 64) ? ((r.lo >> b) & 1ULL) : ((r.hi >> (b - 64)) & 1ULL);
             v ^= bit << (b % 16);
         }
         return v;
     }
 
-    size_t compIndex(uint64_t load_pc, size_t c) const
+    size_t compIndex(uint64_t load_pc, size_t c, const Route& r) const
     {
-        const uint64_t h = foldedHistory(hist_[c]);
+        const uint64_t h = foldedHistory(r, hist_[c]);
         return static_cast<size_t>(((load_pc >> 2) ^ h ^ (h << 3)) & comp_mask_);
     }
 
-    uint16_t compTag(uint64_t load_pc, size_t c) const
+    uint16_t compTag(uint64_t load_pc, size_t c, const Route& r) const
     {
-        const uint64_t h = foldedHistory(hist_[c]);
+        const uint64_t h = foldedHistory(r, hist_[c]);
         return static_cast<uint16_t>(((load_pc >> 2) ^ (load_pc >> 14) ^ (h >> 1) ^ (h << 7)) & 0xFFFF);
     }
 
     /// The longest component holding this context, or the base, or nothing.
-    Provider provider(uint64_t load_pc) const
+    /// The history the token names, or the oldest still kept if the token has
+    /// fallen out of the ring.
+    Route route(uint64_t path) const
     {
+        if ( 0 == seq_ ) { return Route{ phr_hi_, phr_lo_ }; }
+        const uint64_t oldest = (seq_ > ROUTES) ? (seq_ - ROUTES) : 0;
+        const uint64_t use    = (path < oldest) ? oldest : ((path < seq_) ? path : (seq_ - 1));
+        return route_[use % ROUTES];
+    }
+
+    Provider provider(uint64_t load_pc, uint64_t path) const
+    {
+        const Route r = route(path);
         for ( size_t c = COMPONENTS; c-- > 0; ) {
-            const Entry& e = comp_[c][compIndex(load_pc, c)];
-            if ( e.valid && e.tag == compTag(load_pc, c) ) { return Provider{ true, c, e.store_pc }; }
+            const Entry& e = comp_[c][compIndex(load_pc, c, r)];
+            if ( e.valid && e.tag == compTag(load_pc, c, r) ) { return Provider{ true, c, e.store_pc }; }
         }
         const BaseEntry& b = base_[static_cast<size_t>((load_pc >> 2) & base_mask_)];
         if ( b.valid ) { return Provider{ true, COMPONENTS, b.store_pc }; }
@@ -505,6 +585,11 @@ private:
     const size_t           hist_[COMPONENTS];
     uint64_t               phr_lo_ = 0;
     uint64_t               phr_hi_ = 0;
+
+    /// The routes handed out and not yet given back, newest last. `seq_` is the
+    /// next token; a token indexes this ring modulo its size.
+    std::vector<Route>     route_{ ROUTES };
+    uint64_t               seq_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -513,9 +598,9 @@ private:
 class VanadisMemDepNone : public VanadisMemDepPredictor
 {
 public:
-    bool        speculate(uint64_t, const VanadisStoreQView&) override { return true; }
-    void        violated(uint64_t, uint64_t) override {}
-    void        retiredClean(uint64_t, bool) override {}
+    bool        speculate(uint64_t, const VanadisStoreQView&, uint64_t) override { return true; }
+    void        violated(uint64_t, uint64_t, uint64_t) override {}
+    void        retiredClean(uint64_t, bool, uint64_t) override {}
     void        reset() override {}
     const char* name() const override { return "none"; }
 };
@@ -527,9 +612,9 @@ public:
 class VanadisMemDepHold : public VanadisMemDepPredictor
 {
 public:
-    bool        speculate(uint64_t, const VanadisStoreQView&) override { return false; }
-    void        violated(uint64_t, uint64_t) override {}
-    void        retiredClean(uint64_t, bool) override {}
+    bool        speculate(uint64_t, const VanadisStoreQView&, uint64_t) override { return false; }
+    void        violated(uint64_t, uint64_t, uint64_t) override {}
+    void        retiredClean(uint64_t, bool, uint64_t) override {}
     void        reset() override {}
     const char* name() const override { return "hold"; }
 };

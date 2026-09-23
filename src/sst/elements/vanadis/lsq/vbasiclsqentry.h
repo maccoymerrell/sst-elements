@@ -289,12 +289,12 @@ class VanadisBasicLoadPendingEntry : public VanadisBasicLoadEntry {
         VanadisBasicLoadPendingEntry(VanadisLoadInstruction* load_ins, uint64_t address, uint64_t width) :
             VanadisBasicLoadEntry(load_ins), load_address(address), load_width(width),
             entry_age(0), state(INFLIGHT), speculated(false), held(false),
-            fwd_from_age(0), violated(false), violating_store_pc(0) {}
+            fwd_from_age(0), violated(false), violating_store_pc(0), path_token(0) {}
 
         VanadisBasicLoadPendingEntry(VanadisLoadInstruction* load_ins, uint64_t age) :
             VanadisBasicLoadEntry(load_ins), load_address(0), load_width(0),
             entry_age(age), state(RESERVED), speculated(false), held(false),
-            fwd_from_age(0), violated(false), violating_store_pc(0) {}
+            fwd_from_age(0), violated(false), violating_store_pc(0), path_token(0) {}
 
         uint64_t  getAge() const { return entry_age; }
         LoadState getState() const { return state; }
@@ -309,6 +309,15 @@ class VanadisBasicLoadPendingEntry : public VanadisBasicLoadEntry {
 
         bool didSpeculate() const { return speculated; }
         void markSpeculated() { speculated = true; }
+
+        // THE ROUTE THIS LOAD WAS REACHED ALONG, as a token the dependence
+        // predictor handed out when the load entered the queue. It is kept
+        // here, with the load, because the predictor's own path history has
+        // moved on by every memory instruction issued since -- so by the time
+        // this load's address resolves, and again by the time a violation on it
+        // is noticed, only the load itself still knows the route it came by.
+        uint64_t pathToken() const { return path_token; }
+        void     setPathToken(uint64_t t) { path_token = t; }
 
         // Counted once per load however many cycles it spends held, because the
         // statistic is a count of loads the predictor acted on and not of cycles.
@@ -404,6 +413,7 @@ class VanadisBasicLoadPendingEntry : public VanadisBasicLoadEntry {
         uint64_t  fwd_from_age;
         bool      violated;
         uint64_t  violating_store_pc;
+        uint64_t  path_token;
     };
 
 }

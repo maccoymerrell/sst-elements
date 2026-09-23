@@ -117,7 +117,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 { "lsq_speculate", "1 lets a load issue past an older store whose address is not known yet, be answered from an older store's bytes, and be replayed when an older store later resolves onto bytes it has read. 0 is the strictly in-order queue, in which a load never passes a store.", "1"},
                 { "mem_dep_speculation", "Alias of lsq_speculate, kept because the design document names it.", "1"},
                 { "lsq_forward", "1 lets a load be answered out of an older store's bytes. 0 makes it wait for the store to reach memory, as the in-order queue does. Only meaningful when lsq_speculate is 1.", "1"},
-                { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: phast (the default -- the load address hashed with the path it was reached along, at a geometric series of history lengths, so that one load gets a different prediction on each path), store_pc (the store that last made this load flush, indexed by the load address alone), counter (a two-bit counter per load address), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "phast"},
+                { "mem_dep_predictor", "Which memory-dependence predictor decides when a load waits: counter (the default -- a two-bit counter per load address), phast (the load address hashed with the route it was reached along, at a geometric series of history lengths, so that one load gets a different prediction on each route; it is not the default until it has been measured with the route carried by the load, which is a correction newer than the last measurement of it), store_pc (the store that last made this load flush, indexed by the load address alone), none (never hold), hold (never speculate past a store whose address is unknown -- the control case)", "counter"},
                 { "mdp_entries", "Two-bit counters in the counter predictor, rounded up to a power of two", "4096"},
                 { "mdp_store_entries", "Entries in the store-address predictor, rounded up to a power of two. For phast it is the size of ONE tagged component, of which there are four beside the base table", "4096"},
                 { "mdp_counter_decay", "When the counter predictor counts down: retire, or speculated", "retire"},
@@ -253,7 +253,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
             forward_ = params.find<bool>("lsq_forward", true);
 
-            mdp_kind_ = params.find<std::string>("mem_dep_predictor", "phast");
+            mdp_kind_ = params.find<std::string>("mem_dep_predictor", "counter");
             const size_t mdp_entries       = params.find<size_t>("mdp_entries", 4096);
             const size_t mdp_store_entries = params.find<size_t>("mdp_store_entries", 4096);
             const std::string decay        = params.find<std::string>("mdp_counter_decay", "retire");
@@ -398,7 +398,12 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 // THE PATH, in program order. A predictor that distinguishes
                 // the routes to one load needs the route; this is where the
                 // queue sees the memory instructions in the order the program
-                // has them.
+                // has them. The load is given a token for the history AS IT
+                // STANDS NOW -- the route that led to it, before its own
+                // address is shifted in -- and carries that token to its
+                // prediction and to its training, both of which happen after
+                // the live history has moved on.
+                entry->setPathToken(mem_dep_[thr]->pathSnapshot());
                 mem_dep_[thr]->pathUpdate(ins->getInstructionAddress());
             } break;
             case INST_STORE:
@@ -450,7 +455,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 // oscillating between "held" and "flushed" for ever.
                 const bool was_forced = forced_hold_armed_[thr] && (forced_hold_pc_[thr] == pc);
 
-                if ( !was_forced ) { mem_dep_[thr]->retiredClean(pc, entry->didSpeculate()); }
+                if ( !was_forced ) { mem_dep_[thr]->retiredClean(pc, entry->didSpeculate(), entry->pathToken()); }
                 else               { forced_hold_armed_[thr] = false; }
 
                 if ( VanadisBasicLoadPendingEntry::WAITING == entry->getState() ) { waiting_loads_[thr]--; }
@@ -482,7 +487,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
 
             for ( auto* entry : load_q[thr] ) {
                 if ( entry->getInstruction() != ins ) { continue; }
-                mem_dep_[thr]->violated(pc, entry->violatingStorePC());
+                mem_dep_[thr]->violated(pc, entry->violatingStorePC(), entry->pathToken());
                 break;
             }
 
@@ -2032,7 +2037,8 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                 if( ! store_entry->isResolved() ) {
                     // Nobody knows whether this store touches the load. Ask.
                     const VanadisBasicOlderStoreView view(store_q, load_age);
-                    const bool predictor_go = mem_dep_[thr]->speculate(load_pc, view);
+                    const bool predictor_go =
+                        mem_dep_[thr]->speculate(load_pc, view, load_entry->pathToken());
 
                     if( forced || (! predictor_go) ) {
                         // Counted only when it is the PREDICTOR holding the
@@ -2084,7 +2090,9 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // only moment the machine can know that. A predictor whose entry is
             // armed by a violation and has no way to be taken back keeps paying
             // this for ever; telling it is what lets it stop.
-            if( load_entry->wasHeld() ) { mem_dep_[thr]->heldNeedlessly(load_pc); }
+            if( load_entry->wasHeld() ) {
+                mem_dep_[thr]->heldNeedlessly(load_pc, load_entry->pathToken());
+            }
 
             sendLoadFromEntry(load_entry);
         }
