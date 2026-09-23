@@ -37,12 +37,35 @@ public:
         VanadisInstruction(addr, hw_thr, isa_opts, 2, 1, 2, 1, 0, 0, 0, 0)
     {
 
-        isa_int_regs_in[0] = rs1;
-        isa_int_regs_in[1] = rs2;
-        isa_int_regs_out[0] = rd;
+        // THE OPERAND FLAGS ARE HONOURED HERE, and they were not before.
+        //
+        // funct3 of a RoCC instruction is not a selector: its three bits say
+        // which of rd, rs1 and rs2 the instruction actually uses. This
+        // constructor used to declare all three unconditionally, so an
+        // instruction that reads neither source -- a queue-depth probe, say --
+        // was renamed against whatever producers happened to be writing the two
+        // register numbers sitting in its unused fields, and waited for them. On
+        // an out-of-order core that is a false dependence: it delays issue, it
+        // is invisible in any answer, and it makes the same instruction cost
+        // different amounts depending on code around it that it does not read.
+        //
+        // The unused slots are pointed at the ISA's ignore-writes register --
+        // x0 on RISC-V -- rather than being removed, because the issue path
+        // reads input slots 0 and 1 by index and a shorter list would put it out
+        // of bounds. x0 has no producer, so naming it declares no dependence,
+        // and a write to it is dropped by the register file.
+        const uint16_t none = isa_opts->getRegisterIgnoreWrites();
+        isa_int_regs_in[0] = xs1 ? rs1 : none;
+        isa_int_regs_in[1] = xs2 ? static_cast<uint16_t>(rs2) : none;
+        isa_int_regs_out[0] = xd ? rd : none;
 
         this->func7 = func_code7;
-        this->rd = rd;
+        // The same flag on the answer side. The coprocessor always produces a
+        // response, because the core pops one instruction per response and an
+        // instruction that produced none would wedge the queue -- so where xd
+        // is clear the response must name the register that drops writes, or it
+        // would write a physical register this instruction never renamed.
+        this->rd = xd ? rd : static_cast<uint8_t>(none);
         this->xs1 = xs1;
         this->xs2 = xs2;
         this->xd = xd;
