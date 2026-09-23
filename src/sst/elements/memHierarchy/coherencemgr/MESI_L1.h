@@ -57,6 +57,13 @@ public:
         {"eventSent_GetSResp",      "Number of GetSResp responses sent", "events", 2},
         {"eventSent_GetXResp",      "Number of GetXResp responses sent", "events", 2},
         {"eventSent_WriteResp",     "Number of WriteResp responses sent", "events", 2},
+        /* THE INVALIDATION AN L1 FORWARDS TO ITS PROCESSOR, under
+         * `snoop_l1_invalidations`. The manager registers this statistic
+         * whenever that parameter is set and it was never declared here, so
+         * setting the parameter did not enable a feature -- it stopped the
+         * simulation at wire-up with "attempting to register a statistic
+         * 'eventSent_Inv' that is not found in ELI". */
+        {"eventSent_Inv",           "Number of Inv notifications forwarded to the processor", "events", 2},
         {"eventSent_PutS",          "Number of PutS requests sent", "events", 2},
         {"eventSent_PutE",          "Number of PutE requests sent", "events", 2},
         {"eventSent_PutM",          "Number of PutM requests sent", "events", 2},
