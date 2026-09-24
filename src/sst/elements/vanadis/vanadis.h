@@ -572,6 +572,12 @@ public:
           "Number of program instructions retired inside [nmfc_wait_start, nmfc_wait_stop), the "
           "wait and retry code. Progress plus wait is every instruction the program executed",
           "instructions", 1 },
+        { "cycles_waiting",
+          "Cycles that ended with the program inside a WAIT EPISODE: after a wait-code "
+          "instruction retired and before the next instruction outside the wait code did. The "
+          "progress coordinate stands still for exactly these cycles, so a span's cycles minus "
+          "these are the cycles its progress instructions took",
+          "cycles", 1 },
         { "instructions_decoded", "Number of instructions decoded", "instructions", 1 },
         { "branch_mispredicts", "Number of retired branches which were mis-predicted", "instructions", 1 },
         { "execute_squash", "Mis-speculations repaired when the branch executed, not when it retired", "squashes", 1 },
@@ -763,11 +769,20 @@ private:
         const uint64_t addr = ins->getInstructionAddress();
         if ( (nmfc_wait_stop_ > nmfc_wait_start_) && (addr >= nmfc_wait_start_) && (addr < nmfc_wait_stop_) ) {
             ins_wait_this_cycle++;
+            in_wait_episode_ = true;
         }
         else {
             ins_progress_this_cycle++;
+            in_wait_episode_ = false;
         }
     }
+
+    /// THE WAIT STRATUM'S TIME. True from the retirement of a wait-code instruction until the
+    /// next program instruction outside the wait code retires: the span in which the program
+    /// is waiting and its progress coordinate stands still. A cycle that ends in that state is
+    /// counted in `cycles_waiting`, so a span's cycles split exactly into the time spent
+    /// waiting and the time spent making progress.
+    bool in_wait_episode_ = false;
 
     SST::Output* output;
 
@@ -880,6 +895,7 @@ private:
     Statistic<uint64_t>* stat_ins_retired;
     Statistic<uint64_t>* stat_ins_progress;
     Statistic<uint64_t>* stat_ins_wait;
+    Statistic<uint64_t>* stat_cycles_waiting;
     Statistic<uint64_t>* stat_ins_decoded;
     Statistic<uint64_t>* stat_ins_issued;
     Statistic<uint64_t>* stat_loads_issued;

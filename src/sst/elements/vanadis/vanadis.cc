@@ -609,6 +609,7 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
     stat_ins_retired          = registerStatistic<uint64_t>("instructions_retired", "1");
     stat_ins_progress         = registerStatistic<uint64_t>("instructions_progress", "1");
     stat_ins_wait             = registerStatistic<uint64_t>("instructions_wait", "1");
+    stat_cycles_waiting       = registerStatistic<uint64_t>("cycles_waiting", "1");
     stat_ins_decoded          = registerStatistic<uint64_t>("instructions_decoded", "1");
     stat_ins_issued           = registerStatistic<uint64_t>("instructions_issued", "1");
     stat_loads_issued         = registerStatistic<uint64_t>("loads_issued", "1");
@@ -2412,6 +2413,7 @@ VANADIS_COMPONENT::tick(SST::Cycle_t cycle)
     // were inside the wait code or outside it. See countProgress().
     stat_ins_progress->addData(ins_progress_this_cycle);
     stat_ins_wait->addData(ins_wait_this_cycle);
+    if ( in_wait_episode_ ) { stat_cycles_waiting->addData(1); }
 
     // Execute
     // //////////////////////////////////////////////////////////////////////////
