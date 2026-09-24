@@ -271,7 +271,11 @@ private:
     void sendResponseDown(MemEvent * event, L1CacheLine * line, bool data);
     void forwardFlush(MemEvent * event, L1CacheLine * line, bool evict);
     void sendWriteback(Command cmd, L1CacheLine * line, bool dirty, bool flush);
-    void snoopInvalidation(MemEvent * event, L1CacheLine * line);
+    void snoopInvalidation(MemEvent * event, L1CacheLine * line, uint32_t kind = 0);
+    /* The kind bits a notification carries when snoop_l1_evictions is on: the
+     * snoop left a shared copy here (a downgrade), or the line was evicted. */
+    static const uint32_t kSnoopDowngrade = 1u << 17;
+    static const uint32_t kSnoopEviction  = 1u << 18;
     void forwardByAddress(MemEventBase* ev, Cycle_t timestamp) override;
     void forwardByDestination(MemEventBase* ev, Cycle_t timestamp) override;
 
@@ -290,6 +294,7 @@ private:
     bool flush_drain_;
     Cycle_t flush_complete_timestamp_;
     bool snoop_l1_invs_;
+    bool snoop_l1_evicts_;
     State protocol_read_state_;   // E for MESI, S for MSI
     State protocol_exclusive_state_;   // E for MESI, M for MSI
     Cycle_t llsc_block_cycles_;

@@ -80,6 +80,7 @@ public:
             {"slice_allocation_policy", "(string) Policy for allocating addresses among distributed shared cache. Options: rr[round-robin]", "rr"},
             {"maxRequestDelay",         "(uint) Set an error timeout if memory requests take longer than this in ns (0: disable)", "0"},
             {"snoop_l1_invalidations",  "(bool) Forward invalidations from L1s to processors. Options: 0[off], 1[on]", "false"},
+            {"snoop_l1_evictions",      "(bool) With snoop_l1_invalidations, also tell the processor when the L1 evicts a line, and mark every notification with its kind (StandardMem flag bits 17 = downgrade, the line is kept shared; 18 = eviction). A client that watches lines -- an NMFC tile's WAIT -- needs both: a line that left without a word can never be heard again. Options: 0[off], 1[on]", "false"},
             {"llsc_block_cycles",       "(uint64_t) Number of cycles to prevent competing access to an LL/LR line. Encourages forward progress", "0"},
             {"debug",                   "(uint) Where to send output. Options: 0[no output], 1[stdout], 2[stderr], 3[file]", "0"},
             {"debug_level",             "(uint) Debugging level: 0 to 10. Must configure sst-core with '--enable-debug'. 1=info, 2-10=debug output", "0"},

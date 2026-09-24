@@ -35,6 +35,7 @@ MESIL1::MESIL1(ComponentId_t id, Params& params, Params& owner_params, bool pref
     params.insert(owner_params);
 
     snoop_l1_invs_ = params.find<bool>("snoop_l1_invalidations", false);
+    snoop_l1_evicts_ = snoop_l1_invs_ && params.find<bool>("snoop_l1_evictions", false);
     bool MESI = params.find<bool>("protocol", true);
     llsc_block_cycles_ = params.find<Cycle_t>("llsc_block_cycles", 0);
 
@@ -915,7 +916,7 @@ bool MESIL1::handleFetch(MemEvent* event, bool in_mshr) {
     L1CacheLine* line = cache_array_->lookup(addr, false);
     State state = line ? line->getState() : I;
 
-    snoopInvalidation(event, line); // Let core know that line is being accessed elsewhere (for ARM/gem5)
+    snoopInvalidation(event, line, snoop_l1_evicts_ ? kSnoopDowngrade : 0); // Let core know that line is being accessed elsewhere (for ARM/gem5)
 
     if (mem_h_is_debug_event(event))
         event_debuginfo_.prefill(event->getID(), Command::Fetch, "", event->getBaseAddr(), state);
@@ -1168,7 +1169,7 @@ bool MESIL1::handleFetchInvX(MemEvent* event, bool in_mshr) {
     if (in_mshr)
         mshr_->removePendingRetry(addr);
 
-    snoopInvalidation(event, line);
+    snoopInvalidation(event, line, snoop_l1_evicts_ ? kSnoopDowngrade : 0);
 
     if (mem_h_is_debug_event(event))
         event_debuginfo_.prefill(event->getID(), Command::FetchInvX, "", event->getBaseAddr(), state);
@@ -1648,6 +1649,19 @@ bool MESIL1::handleEviction(Addr addr, L1CacheLine*& line, bool flush) {
 
     stat_evict_[state]->addData(1);
 
+    // THE LINE IS LEAVING, SO A CLIENT WATCHING IT MUST BE TOLD: once it is
+    // gone this cache can no longer hear writes to it. Told only when the line
+    // actually goes (a busy line returns false below and is retried).
+    if (snoop_l1_evicts_ && state != I && (state == S || state == E || state == M)
+        && !mshr_->getPendingRetries(line->getAddr())) {
+        for (auto it = system_cpu_names_.begin(); it != system_cpu_names_.end(); it++) {
+            MemEvent * snoop = new MemEvent(cachename_, line->getAddr(), line->getAddr(), Command::Inv);
+            snoop->setMemFlags(kSnoopEviction);
+            snoop->setDst(*it);
+            forwardByDestination(snoop, timestamp_ + tag_latency_);
+        }
+    }
+
     switch (state) {
         case I:
             return true;
@@ -1964,10 +1978,12 @@ void MESIL1::sendWriteback(Command cmd, L1CacheLine * line, bool dirty, bool flu
 
 
 /* Send notification to the core that a line we have might have been lost */
-void MESIL1::snoopInvalidation(MemEvent * event, L1CacheLine * line) {
+void MESIL1::snoopInvalidation(MemEvent * event, L1CacheLine * line, uint32_t kind) {
     if (snoop_l1_invs_ && line) {
         for (auto it = system_cpu_names_.begin(); it != system_cpu_names_.end(); it++) {
             MemEvent * snoop = new MemEvent(cachename_, event->getAddr(), event->getBaseAddr(), Command::Inv);
+            if (kind)
+                snoop->setMemFlags(kind);
             uint64_t base_time = timestamp_ > line->getTimestamp() ? timestamp_ : line->getTimestamp();
             uint64_t delivery_time = base_time + tag_latency_;
             snoop->setDst(*it);

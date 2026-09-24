@@ -852,8 +852,10 @@ StandardMem::Request* StandardInterface::convertResponseCustomResp(StandardMem::
 
 StandardMem::Request* StandardInterface::convertRequestInv(MemEventBase* ev) {
     MemEvent* event = static_cast<MemEvent*>(ev);
+    // The kind bits a notifying L1 sets (snoop_l1_evictions) ride on the
+    // request's flags, above StandardMem's reserved range; zero otherwise.
     StandardMem::InvNotify* req = new StandardMem::InvNotify(event->getAddr(), event->getSize(),
-        0, event->getVirtualAddress(), event->getInstructionPointer(), 0);
+        event->getMemFlags() & ~uint32_t(0xffff), event->getVirtualAddress(), event->getInstructionPointer(), 0);
     return req;
 }
 
