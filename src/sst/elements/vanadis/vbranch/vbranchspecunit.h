@@ -24,6 +24,8 @@
 #include <sst/core/output.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <string>
 #include <vector>
 
 namespace SST {
@@ -90,6 +92,35 @@ public:
         stat_class_mispredict[3] = registerStatistic<uint64_t>("indirect_jump_mispredict", "1");
         stat_class_mispredict[4] = registerStatistic<uint64_t>("indirect_call_mispredict", "1");
         stat_class_mispredict[5] = registerStatistic<uint64_t>("return_mispredict", "1");
+        stat_btb_warm            = registerStatistic<uint64_t>("btb_warm_entries", "1");
+
+        // A RESTORE'S BRANCH TARGET BUFFER (NMFC-Rev tools/sampling/IMAGE.md
+        // 7a). The image's recency record lists the host's taken branches, most
+        // recent first, with the target and the outcome each last had; the
+        // configuration writes them out oldest first, one per line, as
+        // "pc target class width last-taken" in hexadecimal. Each is marked the
+        // way resolution marks a taken branch -- so the buffer's own capacity
+        // and slot replacement decide what stays -- and a conditional's bimodal
+        // counter is left weakly towards its last outcome.
+        const std::string warm = params.find<std::string>("btb_warm", "");
+        if ( !warm.empty() ) {
+            FILE* f = std::fopen(warm.c_str(), "r");
+            if ( nullptr == f ) {
+                output_->fatal(CALL_INFO, -1, "btb_warm: cannot open %s\n", warm.c_str());
+            }
+            unsigned long long pc = 0, target = 0;
+            unsigned           cls = 0, width = 0, taken = 0;
+            uint64_t           n   = 0;
+            while ( 5 == std::fscanf(f, "%llx %llx %x %x %x", &pc, &target, &cls, &width, &taken) ) {
+                if ( cls > 5 ) { continue; }
+                const VanadisBranchClass c = static_cast<VanadisBranchClass>(cls);
+                btb.allocate(pc, c, static_cast<uint8_t>(width), target, true, true);
+                if ( vanadisBranchIsConditional(c) && 0 == taken ) { btb.setBimodal(pc, 0, 0); }
+                ++n;
+            }
+            std::fclose(f);
+            stat_btb_warm->addData(n);
+        }
     }
 
     virtual ~VanadisSpeculativeBranchUnit() { delete output_; }
@@ -483,6 +514,7 @@ protected:
     Statistic<uint64_t>* stat_override_missing;
     Statistic<uint64_t>* stat_runahead_discard;
     Statistic<uint64_t>* stat_execute_repairs;
+    Statistic<uint64_t>* stat_btb_warm;
 };
 
 // The statistics both direction predictors publish.
@@ -526,6 +558,8 @@ protected:
         { "override_missed", "Branches the tagged predictor had right and did not override with", "branches",     \
           1 },                                                                                                   \
         { "runahead_records_discarded", "Fetch-stage predictions thrown away by a re-steer", "branches", 1 },     \
+        { "btb_warm_entries", "Taken branches a restore marked in the buffer before the clock started, from the " \
+          "image's recency record", "branches", 1 },                                                              \
     {                                                                                                            \
         "execute_repairs", "Mis-speculation repairs made at execute rather than at retire", "squashes", 1        \
     }
