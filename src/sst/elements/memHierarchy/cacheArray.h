@@ -49,6 +49,7 @@ class CacheArray {
         Addr            slice_size_; // For cache slices
         Addr            slice_step_; // For cache slices
         unsigned int    banks_;
+        unsigned int    bank_shift_; // line-index bits below the bank bits
         vector<T*>      lines_; // The actual cache
         State* setStates;
         std::map<unsigned int, std::vector<ReplacementInfo*> > rInfo;   // Lookup a vector of replacementInfo by set ID
@@ -68,7 +69,12 @@ class CacheArray {
         Addr toLineAddr(Addr addr);
 
         /** Return bank num */
-        Addr getBank(Addr addr) { return (toLineAddr(addr) % banks_); }
+        /** Return bank num. The bank is the line index, shifted right by
+         *  bank_shift_, modulo the bank count: with a shift of zero consecutive
+         *  lines are in consecutive banks; with the shift a DRAM device's
+         *  mapping puts below its bank bits, a bank of this cache is the set of
+         *  lines one DRAM bank holds. */
+        Addr getBank(Addr addr) { return ((toLineAddr(addr) >> bank_shift_) % banks_); }
 
     /**** Cache queries & maintenance */
 
@@ -87,7 +93,7 @@ class CacheArray {
 
     /**** Configuration and output */
         void setSliceAware(Addr size, Addr step);
-        void setBanked(unsigned int numBanks);
+        void setBanked(unsigned int numBanks, unsigned int bankShift = 0);
         void printCacheArray(Output &out);
 
     /**** Cache iterators */
@@ -141,6 +147,7 @@ CacheArray<T>::CacheArray(Output* dbg, unsigned int numLines, unsigned int assoc
     slice_step_ = 1;
     slice_size_ = 1;
     banks_ = 1;
+    bank_shift_ = 0;
 
     for (unsigned int i = 0; i < num_lines_; i++) {
         lines_[i] = new T(line_size_, i);
@@ -227,8 +234,17 @@ void CacheArray<T>::setSliceAware(Addr size, Addr step) {
 }
 
 template <class T>
-void CacheArray<T>::setBanked(unsigned int numBanks) {
+void CacheArray<T>::setBanked(unsigned int numBanks, unsigned int bankShift) {
     banks_ = numBanks;
+    bank_shift_ = bankShift;
+    // A BANK MUST BE A PARTITION OF THE SETS, or one bank holds a set more than
+    // its neighbour and a conflict stops meaning one thing. With the set taken
+    // from the low line-index bits, (line >> shift) % banks is a function of the
+    // set exactly when banks << shift divides the set count. Refused, not rounded.
+    if (bankShift != 0 && numBanks > 1 &&
+        (num_sets_ % ((uint64_t)numBanks << bankShift)) != 0)
+        debug_->fatal(CALL_INFO, -1, "CacheArray, Error: %u banks at line shift %u do not partition %u sets "
+                      "(banks << shift must divide the set count).\n", numBanks, bankShift, num_sets_);
 }
 
 template <class T>
@@ -252,6 +268,7 @@ void CacheArray<T>::serialize_order(SST::Core::Serialization::serializer& ser)
     SST_SER(slice_size_);
     SST_SER(slice_step_);
     SST_SER(banks_);
+    SST_SER(bank_shift_);
     SST_SER(lines_);
     SST_SER(setStates);
     SST_SER(rInfo);

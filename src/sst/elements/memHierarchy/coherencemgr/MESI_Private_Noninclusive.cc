@@ -53,7 +53,7 @@ MESIPrivNoninclusive::MESIPrivNoninclusive(SST::ComponentId_t id, Params& params
     ReplacementPolicy * rmgr = createReplacementPolicy(lines, assoc, params, false);
     HashFunction * ht = createHashFunction(params);
     cache_array_ = new CacheArray<PrivateCacheLine>(debug_, lines, assoc, line_size_, rmgr, ht);
-    cache_array_->setBanked(params.find<uint64_t>("banks", 0));
+    cache_array_->setBanked(params.find<uint64_t>("banks", 0), params.find<uint64_t>("bank_line_shift", 0));
 
     flush_state_ = FlushState::Ready;
     shutdown_flush_counter_ = 0;

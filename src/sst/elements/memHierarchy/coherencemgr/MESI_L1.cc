@@ -62,7 +62,7 @@ MESIL1::MESIL1(ComponentId_t id, Params& params, Params& owner_params, bool pref
     HashFunction * ht = createHashFunction(params);
 
     cache_array_ = new CacheArray<L1CacheLine>(debug_, lines, assoc, line_size_, rmgr, ht);
-    cache_array_->setBanked(params.find<uint64_t>("banks", 0));
+    cache_array_->setBanked(params.find<uint64_t>("banks", 0), params.find<uint64_t>("bank_line_shift", 0));
 
     // Register statistics
     stat_event_state_[(int)Command::GetS][I] =      registerStatistic<uint64_t>("stateEvent_GetS_I");

@@ -68,7 +68,7 @@ MESIInclusive::MESIInclusive(SST::ComponentId_t id, Params& params, Params& owne
     ReplacementPolicy * rmgr = createReplacementPolicy(lines, assoc, params, false);
     HashFunction * ht = createHashFunction(params);
     cache_array_ = new CacheArray<SharedCacheLine>(debug_, lines, assoc, line_size_, rmgr, ht);
-    cache_array_->setBanked(params.find<uint64_t>("banks", 0));
+    cache_array_->setBanked(params.find<uint64_t>("banks", 0), params.find<uint64_t>("bank_line_shift", 0));
 
     /* Statistics */
     stat_evict_[I] =         registerStatistic<uint64_t>("evict_I");

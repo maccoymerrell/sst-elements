@@ -156,6 +156,7 @@ void Cache::createCoherenceManager(Params &params) {
     coherenceParams.insert("response_link_width", params.find<std::string>("response_link_width", "0B"));
     coherenceParams.insert("min_packet_size", params.find<std::string>("min_packet_size", "8B"));
     coherenceParams.insert("banks", params.find<std::string>("banks", "0"));
+    coherenceParams.insert("bank_line_shift", params.find<std::string>("bank_line_shift", "0"));
     coherenceParams.insert("associativity", params.find<std::string>("associativity", "-1"));
     coherenceParams.insert("lines", params.find<std::string>("lines", "0"));
     coherenceParams.insert("replacement_policy", params.find<std::string>("replacement_policy", "lru"));

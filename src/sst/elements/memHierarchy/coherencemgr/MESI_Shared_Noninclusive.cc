@@ -51,14 +51,14 @@ MESISharNoninclusive::MESISharNoninclusive(ComponentId_t id, Params& params, Par
     ReplacementPolicy * rmgr = createReplacementPolicy(lines, assoc, params, false);
     HashFunction * ht = createHashFunction(params);
     data_array_ = new CacheArray<DataLine>(debug_, lines, assoc, line_size_, rmgr, ht);
-    data_array_->setBanked(params.find<uint64_t>("banks", 0));
+    data_array_->setBanked(params.find<uint64_t>("banks", 0), params.find<uint64_t>("bank_line_shift", 0));
 
     uint64_t dir_lines = params.find<uint64_t>("dlines");
     uint64_t dir_assoc = params.find<uint64_t>("dassoc");
     params.insert("replacement_policy", params.find<std::string>("drpolicy", "lru"));
     ReplacementPolicy *drmgr = createReplacementPolicy(dir_lines, dir_assoc, params, false, 1);
     dir_array_ = new CacheArray<DirectoryLine>(debug_, dir_lines, dir_assoc, line_size_, drmgr, ht);
-    dir_array_->setBanked(params.find<uint64_t>("banks", 0));
+    dir_array_->setBanked(params.find<uint64_t>("banks", 0), params.find<uint64_t>("bank_line_shift", 0));
 
     flush_state_ = FlushState::Ready;
     shutdown_flush_counter_ = 0;

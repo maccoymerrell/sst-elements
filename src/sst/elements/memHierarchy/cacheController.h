@@ -88,6 +88,7 @@ public:
             {"force_noncacheable_reqs", "(bool) Used for verification purposes. All requests are considered to be 'noncacheable'. Options: 0[off], 1[on]", "false"},
             {"min_packet_size",         "(string) Number of bytes in a request/response not including payload (e.g., addr + cmd). Specify in B.", "8B"},
             {"banks",                   "(uint) Number of cache banks: One access per bank per cycle. Use '0' to simulate no bank limits (only limits on bandwidth then are max_requests_per_cycle and *_link_width", "0"},
+            {"bank_line_shift",         "(uint) Line-index bits below the bank bits: bank = (line index >> shift) mod banks. 0 interleaves consecutive lines across banks; a DRAM device's column (and rank) bits make a bank the lines of one DRAM bank. banks << shift must divide the set count", "0"},
             {"node",			        "(uint) Node number in multinode environment", "0"})
 
     SST_ELI_DOCUMENT_PORTS(
