@@ -532,6 +532,17 @@ public:
         { "fp_arith_cycles", "Cycles per floating point arithmetic", "8" },
         { "fp_div_units", "Number of floating point division units", "1" },
         { "fp_div_cycles", "Cycles per floating point division", "80" },
+        { "fp_add_cycles", "Latency of FP add/subtract on the arithmetic unit; 0 = fp_arith_cycles", "0" },
+        { "fp_mul_cycles", "Latency of FP multiply on the arithmetic unit; 0 = fp_arith_cycles", "0" },
+        { "fp_fma_cycles", "Latency of the fused multiply-adds on the arithmetic unit; 0 = fp_arith_cycles", "0" },
+        { "fp_div_s_cycles", "Latency of a single-precision divide; 0 = fp_div_cycles", "0" },
+        { "fp_div_s_interval", "Cycles a divider is held by a single-precision divide; 0 = 1 (fully pipelined)", "0" },
+        { "fp_div_d_interval", "Cycles a divider is held by a double-precision divide; 0 = 1 (fully pipelined)", "0" },
+        { "fp_sqrt_on_divider", "Execute square roots on the division units rather than the arithmetic units", "0" },
+        { "fp_sqrt_s_cycles", "Latency of a single-precision square root on the divider; 0 = the unit's latency", "0" },
+        { "fp_sqrt_s_interval", "Cycles a divider is held by a single-precision square root; 0 = 1", "0" },
+        { "fp_sqrt_d_cycles", "Latency of a double-precision square root on the divider; 0 = the unit's latency", "0" },
+        { "fp_sqrt_d_interval", "Cycles a divider is held by a double-precision square root; 0 = 1", "0" },
         { "branch_units", "Number of branch units", "1" },
         { "branch_unit_cycles", "Cycles per branch", "int_arith_cycles"},
         { "issues_per_cycle", "Number of instruction issues per cycle", "2" },
@@ -812,6 +823,7 @@ private:
     std::vector<VanadisFunctionalUnit*> fu_branch;
     std::vector<VanadisFunctionalUnit*> fu_fp_arith;
     std::vector<VanadisFunctionalUnit*> fu_fp_div;
+    bool                                fp_sqrt_on_divider = false;
 
     std::vector<VanadisRegisterFile*>  register_files;
     VanadisRegisterStack* int_register_stack;

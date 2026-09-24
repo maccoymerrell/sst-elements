@@ -49,11 +49,27 @@ private:
     uint16_t cycles_left;
 };
 
+// THE FLOATING-POINT COST CLASSES. A unit may be given a latency and an issue
+// interval per class; a class it was not given (zero) costs the unit's own
+// latency and one issue per cycle, which is what every unit did before the
+// classes existed.
+enum VanadisFPCostClass : int {
+    VANADIS_FP_COST_ADD = 0,
+    VANADIS_FP_COST_MUL,
+    VANADIS_FP_COST_FMA,
+    VANADIS_FP_COST_DIV_S,
+    VANADIS_FP_COST_DIV_D,
+    VANADIS_FP_COST_SQRT_S,
+    VANADIS_FP_COST_SQRT_D,
+    VANADIS_FP_COST_COUNT
+};
+
 class VanadisFunctionalUnit {
 
 public:
     VanadisFunctionalUnit(uint16_t id, VanadisFunctionalUnitType unit_type, uint16_t lat)
-        : fu_id(id), fu_type(unit_type), latency(lat), accept_this_cycle(true) {
+        : fu_id(id), fu_type(unit_type), latency(lat), busy_cycles(0), held_cycles(0) {
+        for (int i = 0; i < VANADIS_FP_COST_COUNT; i++) { class_latency[i] = 0; class_interval[i] = 0; }
     }
 
     ~VanadisFunctionalUnit() {
@@ -64,13 +80,33 @@ public:
 
     VanadisFunctionalUnitType getType() const { return fu_type; }
 
-    bool isInstructionSlotFree() const { return accept_this_cycle; }
+    bool isInstructionSlotFree() const { return busy_cycles == 0; }
+
+    // Per-class latency and issue interval (zero: the unit's own latency, one
+    // issue per cycle). An ITERATIVE unit -- a divider -- is expressed as an
+    // interval above one: it accepts nothing else until the interval has
+    // passed, which is what "blocks subsequent similar operations" means.
+    void setClassCost(int cls, uint16_t lat, uint16_t interval) {
+        if (cls >= 0 && cls < VANADIS_FP_COST_COUNT) {
+            class_latency[cls]  = lat;
+            class_interval[cls] = interval;
+        }
+    }
 
     void insertInstruction(VanadisInstruction* ins) {
-        //assert(accept_this_cycle == true);
-        pending_execute.push_back(new VanadisFunctionalUnitInsRecord(ins, latency));
-        accept_this_cycle = false;
+        const int cls      = ins->getFPCostClass();
+        uint16_t  lat      = latency;
+        uint16_t  interval = 1;
+        if (cls >= 0 && cls < VANADIS_FP_COST_COUNT) {
+            if (class_latency[cls] > 0) { lat = class_latency[cls]; }
+            if (class_interval[cls] > 0) { interval = class_interval[cls]; }
+        }
+        pending_execute.push_back(new VanadisFunctionalUnitInsRecord(ins, lat));
+        busy_cycles = interval;
+        held_cycles += interval;
     }
+
+    uint64_t heldCycles() const { return held_cycles; }
 
     uint16_t getUnitID() const { return fu_id; }
 
@@ -104,7 +140,7 @@ public:
             }
         }
 
-        accept_this_cycle = true;
+        if (busy_cycles > 0) { busy_cycles--; }
     }
 
     void clearByHWThreadID(SST::Output* output, const uint16_t hw_thr) {
@@ -153,7 +189,10 @@ private:
     const uint16_t latency;
     VanadisFunctionalUnitType fu_type;
     const uint16_t fu_id;
-    bool accept_this_cycle;
+    uint16_t busy_cycles;   ///< cycles before the unit accepts another operation
+    uint64_t held_cycles;   ///< sum of the issue intervals it has been held for
+    uint16_t class_latency[VANADIS_FP_COST_COUNT];
+    uint16_t class_interval[VANADIS_FP_COST_COUNT];
 };
 
 } // namespace Vanadis

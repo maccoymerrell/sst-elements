@@ -589,6 +589,35 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
         fu_fp_div.push_back(new VanadisFunctionalUnit(fu_id++, INST_FP_DIV, fp_div_cycles));
     }
 
+    // PER-OPERATION FLOATING-POINT COSTS. Every one defaults to zero, which
+    // leaves the unit's own latency and one issue per cycle -- the core as it
+    // was. A divider given an issue interval above one is an iterative unit
+    // that accepts nothing else until the interval has passed.
+    {
+        const uint16_t add_c  = params.find<uint16_t>("fp_add_cycles", 0);
+        const uint16_t mul_c  = params.find<uint16_t>("fp_mul_cycles", 0);
+        const uint16_t fma_c  = params.find<uint16_t>("fp_fma_cycles", 0);
+        const uint16_t div_s  = params.find<uint16_t>("fp_div_s_cycles", 0);
+        const uint16_t div_si = params.find<uint16_t>("fp_div_s_interval", 0);
+        const uint16_t div_di = params.find<uint16_t>("fp_div_d_interval", 0);
+        const uint16_t sq_s   = params.find<uint16_t>("fp_sqrt_s_cycles", 0);
+        const uint16_t sq_si  = params.find<uint16_t>("fp_sqrt_s_interval", 0);
+        const uint16_t sq_d   = params.find<uint16_t>("fp_sqrt_d_cycles", 0);
+        const uint16_t sq_di  = params.find<uint16_t>("fp_sqrt_d_interval", 0);
+        fp_sqrt_on_divider    = params.find<bool>("fp_sqrt_on_divider", false);
+        for ( VanadisFunctionalUnit* fu : fu_fp_arith ) {
+            fu->setClassCost(VANADIS_FP_COST_ADD, add_c, 0);
+            fu->setClassCost(VANADIS_FP_COST_MUL, mul_c, 0);
+            fu->setClassCost(VANADIS_FP_COST_FMA, fma_c, 0);
+        }
+        for ( VanadisFunctionalUnit* fu : fu_fp_div ) {
+            fu->setClassCost(VANADIS_FP_COST_DIV_S, div_s, div_si);
+            fu->setClassCost(VANADIS_FP_COST_DIV_D, 0, div_di);
+            fu->setClassCost(VANADIS_FP_COST_SQRT_S, sq_s, sq_si);
+            fu->setClassCost(VANADIS_FP_COST_SQRT_D, sq_d, sq_di);
+        }
+    }
+
     //////////////////////////////////////////////////////////////////////////////////////
     for ( uint32_t i = 0; i < hw_threads; ++i ) {
         thread_decoders[i]->getOSHandler()->setCoreID(core_id);
@@ -2268,7 +2297,14 @@ VANADIS_COMPONENT::allocateFunctionalUnit(VanadisInstruction* ins)
         break;
 
     case INST_FP_ARITH:
-        allocated_fu = mapInstructiontoFunctionalUnit(ins, fu_fp_arith);
+        // A square root is iterative and shares the divider on every core this
+        // host is modelled on; fp_sqrt_on_divider sends it there.
+        if ( fp_sqrt_on_divider && (ins->getFPCostClass() == VANADIS_FP_COST_SQRT_S ||
+                                    ins->getFPCostClass() == VANADIS_FP_COST_SQRT_D) ) {
+            allocated_fu = mapInstructiontoFunctionalUnit(ins, fu_fp_div);
+        } else {
+            allocated_fu = mapInstructiontoFunctionalUnit(ins, fu_fp_arith);
+        }
         break;
 
     case INST_INT_DIV:

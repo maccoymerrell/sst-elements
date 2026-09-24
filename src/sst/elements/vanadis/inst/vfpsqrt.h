@@ -17,6 +17,7 @@
 #define _H_VANADIS_FP_SQRT
 
 #include "inst/vfpinst.h"
+#include "vfuncunit.h"
 #include "inst/vregfmt.h"
 #include "util/vfpreghandler.h"
 
@@ -58,6 +59,7 @@ public:
 
     VanadisFPSquareRootInstruction* clone() override { return new VanadisFPSquareRootInstruction(*this); }
     VanadisFunctionalUnitType     getInstFuncType() const override { return INST_FP_ARITH; }
+    int getFPCostClass() const override { return (sizeof(fp_format) == 8) ? VANADIS_FP_COST_SQRT_D : VANADIS_FP_COST_SQRT_S; }
 
     const char* getInstCode() const override
     {

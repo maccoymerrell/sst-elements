@@ -19,6 +19,7 @@
 #include <cfenv>
 
 #include "inst/vfpinst.h"
+#include "vfuncunit.h"
 #include "inst/vregfmt.h"
 #include "util/vfpreghandler.h"
 
@@ -66,6 +67,7 @@ public:
 
     VanadisFPFusedMultiplyAddInstruction*  clone() override { return new VanadisFPFusedMultiplyAddInstruction(*this); }
     VanadisFunctionalUnitType getInstFuncType() const override { return INST_FP_ARITH; }
+    int getFPCostClass() const override { return VANADIS_FP_COST_FMA; }
 
     const char* getInstCode() const override
     {

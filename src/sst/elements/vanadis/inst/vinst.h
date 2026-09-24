@@ -406,6 +406,13 @@ class VanadisInstruction
 
         virtual VanadisFunctionalUnitType getInstFuncType() const = 0;
 
+        // THE COST CLASS of a floating-point operation inside its functional
+        // unit: an index into the unit's per-class latency and issue-interval
+        // tables (VanadisFPCostClass in vfuncunit.h), or -1 for "the unit's
+        // own latency, one per cycle". Only the FP instructions whose cost
+        // differs from their unit's name one.
+        virtual int getFPCostClass() const { return -1; }
+
 
         virtual void instOp(VanadisRegisterFile* regFile,
                             uint16_t phys_int_regs_out_0, uint16_t phys_int_regs_in_0,

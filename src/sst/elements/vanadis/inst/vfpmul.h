@@ -17,6 +17,7 @@
 #define _H_VANADIS_FP_MUL
 
 #include "inst/vfpinst.h"
+#include "vfuncunit.h"
 #include "inst/vregfmt.h"
 #include "util/vfpreghandler.h"
 
@@ -61,6 +62,7 @@ public:
 
     VanadisFPMultiplyInstruction* clone() override { return new VanadisFPMultiplyInstruction(*this); }
     VanadisFunctionalUnitType     getInstFuncType() const override { return INST_FP_ARITH; }
+    int getFPCostClass() const override { return VANADIS_FP_COST_MUL; }
 
     const char* getInstCode() const override
     {

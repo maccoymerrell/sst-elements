@@ -17,6 +17,7 @@
 #define _H_VANADIS_FP_DIV
 
 #include "inst/vfpinst.h"
+#include "vfuncunit.h"
 #include "inst/vregfmt.h"
 #include "util/vfpreghandler.h"
 
@@ -61,6 +62,7 @@ public:
 
     VanadisFPDivideInstruction* clone() override { return new VanadisFPDivideInstruction(*this); }
     VanadisFunctionalUnitType   getInstFuncType() const override { return INST_FP_DIV; }
+    int getFPCostClass() const override { return (sizeof(fp_format) == 8) ? VANADIS_FP_COST_DIV_D : VANADIS_FP_COST_DIV_S; }
 
     const char* getInstCode() const override
     {
