@@ -67,6 +67,12 @@ public:
     virtual std::tuple<bool,bool> handleSysCall(VanadisSysCallInstruction* syscallIns) = 0;
     virtual void recvSyscallResp( VanadisSyscallResponse* os_resp ) = 0;
 
+    // WHICH EXIT, if any, the last system call this handler sent was: 0 none,
+    // 1 exit (this thread), 2 exit_group (the whole program). The core reads it
+    // straight after handing the handler a system call, which is the moment the
+    // program's exit is issued, and tells its accelerators.
+    int exitRequested() const { return exit_requested_; }
+
     void setOS_link( SST::Link* link ) {
         os_link_ = link;
     }
@@ -89,6 +95,8 @@ protected:
     VanadisISATable* isa_table_;
 
     uint64_t* tls_address_;
+
+    int exit_requested_ = 0;
 
 private:
     SST::Link* os_link_;

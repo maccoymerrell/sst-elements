@@ -111,6 +111,7 @@ public:
         uint64_t call_link_value = getLinkReg();
 
         flush_lsq_ = false;
+        exit_requested_ = 0;
         const uint32_t hw_thr = syscallIns->getHWThread();
 
         const uint64_t os_code = getOsCode();
@@ -272,6 +273,7 @@ protected:
 
         output_->verbose(CALL_INFO, 16, 0, "exit( %" PRIdXX " )\n", code);
         flush_lsq_ = true;
+        exit_requested_ = 1;
         return new VanadisSyscallExitEvent(core_id_, hw_thr, BitType, code);
     }
 
@@ -392,6 +394,7 @@ protected:
         output_->verbose(CALL_INFO, 16, 0, "exit_group( %" PRIdXX " )\n", exit_code);
 
         flush_lsq_=true;
+        exit_requested_ = 2;
 
         return new VanadisSyscallExitGroupEvent(core_id_, hw_thr, BitType, exit_code);
     }

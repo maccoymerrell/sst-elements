@@ -48,6 +48,27 @@
 using namespace SST::Vanadis;
 using namespace std;
 
+// The core's own state is not touched: the accelerators are told that the
+// program's exit has been issued -- an exit_group (ex == 2), or the exit of the
+// last thread still running (ex == 1).
+static void __attribute__((noinline, cold))
+tellAcceleratorsOfExit(std::vector<VanadisRoCCInterface*>& roccs, const bool* halted, uint32_t threads,
+                       uint32_t thr, int ex, uint64_t cycle)
+{
+    bool last = ( ex == 2 );
+    if ( ex == 1 ) {
+        last = true;
+        for ( uint32_t i = 0; i < threads; ++i ) {
+            if ( i != thr && !halted[i] ) { last = false; }
+        }
+    }
+    if ( last ) {
+        for ( size_t i = 0; i < roccs.size(); ++i ) {
+            roccs[i]->programExit(cycle);
+        }
+    }
+}
+
 
 
 VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params) : Component(id), current_cycle(0),
@@ -2019,6 +2040,19 @@ VANADIS_COMPONENT::performRetire(int rob_num, VanadisCircularQueue<VanadisInstru
                     #endif
                     bool ret, flushLSQ;
                     std::tie( ret, flushLSQ) = thr_decoder->getOSHandler()->handleSysCall(the_syscall_ins);
+
+                    // THE PROGRAM'S EXIT is issued here: an exit_group, or the
+                    // exit of the last thread still running. The accelerators
+                    // are told at this cycle, so a span they measure that
+                    // reaches the program's end closes at the exit rather than
+                    // at an instruction count. Out of line, so the retire loop
+                    // this sits in compiles as it did without it.
+                    {
+                        const int ex = thr_decoder->getOSHandler()->exitRequested();
+                        if ( UNLIKELY(ex != 0) ) {
+                            tellAcceleratorsOfExit(roccs_, halted_masks, hw_threads, ins_thread, ex, current_cycle);
+                        }
+                    }
 
                     // mark as front of ROB now we can proceed
                     rob_front->markFrontOfROB();

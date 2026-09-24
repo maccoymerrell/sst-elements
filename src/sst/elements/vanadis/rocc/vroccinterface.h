@@ -97,6 +97,19 @@ public:
 
     virtual void init(unsigned int phase) = 0;
 
+    // THE PROGRAM'S EXIT, told to the accelerator when it happens.
+    //
+    // The core calls this when it issues the program's exit to the operating
+    // system: an exit_group, or the exit system call of the last thread still
+    // running.
+    // An accelerator measuring a span of the program that reaches the program's
+    // end closes that span here: beyond the program's last instruction no count
+    // of instructions marks the end, because how often a polling loop runs
+    // before the exit depends on the machine. `cycle` is the core's cycle at the
+    // exit. The default does nothing, so an accelerator that does not measure
+    // ignores it.
+    virtual void programExit(uint64_t cycle) { (void)cycle; }
+
     SST::Output* output;
 
     Statistic<uint64_t>* stat_rocc_issued;
