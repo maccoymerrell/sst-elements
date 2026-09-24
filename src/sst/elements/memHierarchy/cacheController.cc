@@ -522,6 +522,15 @@ void Cache::init(unsigned int phase) {
                 event->setSrc(getName());
                 linkDown_->sendUntimedData(event);
             }
+        } else if (event->getInitCmd() == MemEventInit::InitCommand::Data && event->getCmd() == Command::Write
+                   && event->queryFlag(MemEventBase::F_NMFC_WARM)) {
+            // A RESTORE'S WARM INSTALL: this cache holds the line, and the bytes
+            // go no further -- memory already has them from the image.
+            if (!coherenceMgr_->warmLine(event->getAddr(), event->getPayload(),
+                                         event->queryFlag(MemEventBase::F_NMFC_WARM_DIRTY)))
+                out_->fatal(CALL_INFO, -1, "%s, Error: a restore asked to install a line and this cache's coherence "
+                            "protocol cannot install one before the clock starts\n", getName().c_str());
+            delete event;
         } else if (event->getInitCmd() == MemEventInit::InitCommand::Data) {
             if (mem_h_is_debug_event((event))) {
                 dbg_->debug(_L10_, "U: %-20s   Event:Untimed   (%s)\n",

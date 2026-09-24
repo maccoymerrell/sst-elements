@@ -29,6 +29,9 @@ namespace SST { namespace MemHierarchy {
 
 class MESIL1 : public CoherenceController {
 public:
+    /* A restore's warm install (coherenceController.h). */
+    bool warmLine(Addr addr, std::vector<uint8_t>& data, bool dirty) override;
+
 /* Element Library Info */
     SST_ELI_REGISTER_SUBCOMPONENT(MESIL1, "memHierarchy", "coherence.mesi_l1", SST_ELI_ELEMENT_VERSION(1,0,0),
             "Implements MESI or MSI coherence for an L1 cache", SST::MemHierarchy::CoherenceController)

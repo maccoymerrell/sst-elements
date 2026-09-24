@@ -1581,6 +1581,27 @@ MemEventStatus MESIL1::checkMSHRCollision(MemEvent* event, bool in_mshr) {
 }
 
 /*
+ * A restore's warm install. Records arrive oldest first, so taking the
+ * replacement candidate -- the least recently used way when the set is full --
+ * leaves each set holding the most recent lines that map to it, in the order
+ * they were used. Nothing is written back: memory already holds every byte.
+ */
+bool MESIL1::warmLine(Addr addr, std::vector<uint8_t>& data, bool dirty) {
+    const Addr base = addr & ~(Addr(line_size_) - 1);
+    L1CacheLine* line = cache_array_->lookup(base, false);
+    if (!line) {
+        line = cache_array_->findReplacementCandidate(base);
+        cache_array_->replace(base, line);
+    }
+    std::vector<uint8_t> bytes(data);
+    bytes.resize(line_size_, 0);
+    line->setData(bytes, 0);
+    line->setState(dirty ? M : E);
+    cache_array_->lookup(base, true);   // the replacement state, with the line's new state
+    return true;
+}
+
+/*
  * Allocate a new cache line
  */
 L1CacheLine* MESIL1::allocateLine(MemEvent* event, L1CacheLine* line) {

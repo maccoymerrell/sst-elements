@@ -134,6 +134,12 @@ public:
      */
     virtual MemEventInitCoherence * getInitCoherenceEvent() = 0;
 
+    /* A restore's warm install (NMFC-Rev tools/sampling/IMAGE.md 7a): hold the
+     * line at `addr` with these bytes, Modified when `dirty`, before the clock
+     * starts; displace the least recently used line of its set silently when it
+     * is full (memory holds every byte already). False: not supported. */
+    virtual bool warmLine(Addr addr, std::vector<uint8_t>& data, bool dirty) { return false; }
+
     /* Parse an incoming InitCoherence event */
     virtual void processInitCoherenceEvent(MemEventInitCoherence * event, bool source);
 

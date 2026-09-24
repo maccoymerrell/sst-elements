@@ -700,6 +700,14 @@ SST::Event* StandardInterface::UntimedMemEventConverter::convert(StandardMem::Re
 
 SST::Event* StandardInterface::UntimedMemEventConverter::convert(StandardMem::Write* req) {
     MemEventInit *me = new MemEventInit(iface->getName(), Command::Write, req->pAddr, req->data);
+    // The two request flags a restore's warm install carries (NMFC-Rev
+    // src/nmfc/src/NMFCCoherenceFabric.h, WARM_FLAG and WARM_DIRTY_FLAG), which
+    // are the first two user flags above StandardMem's reserved range.
+    if (req->getAllFlags() & (static_cast<StandardMem::Request::flags_t>(StandardMem::Request::Flag::F_RESERVED) << 1)) {
+        me->setFlag(MemEventBase::F_NMFC_WARM);
+        if (req->getAllFlags() & (static_cast<StandardMem::Request::flags_t>(StandardMem::Request::Flag::F_RESERVED) << 2))
+            me->setFlag(MemEventBase::F_NMFC_WARM_DIRTY);
+    }
     return me;
 }
 

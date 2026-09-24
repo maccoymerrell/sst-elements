@@ -42,6 +42,12 @@ public:
     static const uint32_t F_LLSC            = 0x00000100;
     static const uint32_t F_FAIL            = 0x00001000;
     static const uint32_t F_NORESPONSE      = 0x00010000;
+    // A RESTORE'S WARM INSTALL (NMFC-Rev tools/sampling/IMAGE.md 7a): an
+    // untimed Write that asks the cache it reaches to hold the line, rather than
+    // to pass the bytes on to memory, and in the Modified state when
+    // F_NMFC_WARM_DIRTY is also set. Only ever sent during init.
+    static const uint32_t F_NMFC_WARM       = 0x00100000;
+    static const uint32_t F_NMFC_WARM_DIRTY = 0x01000000;
 
 
     /** Creates a new MemEventBase */
