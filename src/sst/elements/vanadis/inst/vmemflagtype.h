@@ -23,7 +23,10 @@ enum VanadisMemoryTransaction {
     MEM_TRANSACTION_NONE,
     MEM_TRANSACTION_LLSC_LOAD,
     MEM_TRANSACTION_LLSC_STORE,
-    MEM_TRANSACTION_LOCK
+    MEM_TRANSACTION_LOCK,
+    // A cache-block clean (RISC-V Zicbom cbo.clean): no bytes read or written;
+    // the line is written back below the coherence point and kept.
+    MEM_TRANSACTION_CLEAN
 };
 
 inline const char*
@@ -38,6 +41,8 @@ getTransactionTypeString(VanadisMemoryTransaction transT)
         return "LLSC_STORE";
     case MEM_TRANSACTION_LOCK:
         return "LOCK";
+    case MEM_TRANSACTION_CLEAN:
+        return "CLEAN";
     default:
         return "UNKNOWN";
     }

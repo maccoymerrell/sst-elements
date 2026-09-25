@@ -74,6 +74,7 @@
 #include "inst/vpartialstore.h"
 #include "inst/vstore.h"
 #include "inst/vstorecond.h"
+#include "inst/vcacheclean.h"
 
 // Conditional move instructions
 #include "inst/vcimov.h"

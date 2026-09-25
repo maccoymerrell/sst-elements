@@ -1503,6 +1503,21 @@ protected:
 								    new VanadisFenceInstruction(ins_address, hw_thr, options, VANADIS_LOAD_STORE_FENCE));
                             decode_fault = false;
                         } break;
+                        case 0x2:
+                        {
+                            // THE CACHE-BLOCK OPERATIONS (Zicbom, Zicboz): I-type,
+                            // rd = x0, the operation named by imm[11:0]. Only
+                            // CBO.CLEAN (0x001) is modelled; CBO.INVAL (0x000),
+                            // CBO.FLUSH (0x002) and CBO.ZERO (0x004) stay decode
+                            // faults rather than running as something else.
+                            const uint32_t cbo_op = (ins >> 20) & 0xFFF;
+                            if ( (0 == rd) && (0x001 == cbo_op) ) {
+                                VANADIS_VERB(output_, 16, 0, "----> CBO.CLEAN block of %" PRIu16 "\n", rs1);
+                                bundle->addInstruction(
+                                    new VanadisCacheCleanInstruction(ins_address, hw_thr, options, rs1, 0));
+                                decode_fault = false;
+                            }
+                        } break;
                     }
 				} break;
             case 0x2F:

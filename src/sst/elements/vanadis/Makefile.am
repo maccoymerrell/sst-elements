@@ -108,6 +108,7 @@ inst/vsrl.h \
 inst/vsrli.h \
 inst/vstore.h \
 inst/vstorecond.h \
+inst/vcacheclean.h \
 inst/vsub.h \
 inst/vsyscall.h \
 inst/vtrunc.h \

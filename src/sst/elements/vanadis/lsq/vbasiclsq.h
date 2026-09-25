@@ -138,6 +138,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                                     { "loads_issued", "Count the number of loads issued", "operations", 1 },
                                     { "stores_issued", "Count the number of stores issued", "operations", 1 },
                                     { "fences_issued", "Count the number of fences issued", "operations", 1},
+                                    { "cleans_executed", "Count the cache-block cleans (cbo.clean) sent to memory: each one a flush that keeps the line, issued from the head of the reorder buffer on a store port", "operations", 1},
                                     { "loads_executed", "Count the number of loads issued", "operations", 1 },
                                     { "stores_executed", "Count the number of stores issued", "operations", 1 },
                                     { "fences_executed", "Count the number of fences issued", "operations", 1},
@@ -204,6 +205,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             stat_loads_executed = registerStatistic<uint64_t>("loads_executed", "1");
             stat_stores_executed = registerStatistic<uint64_t>("stores_executed", "1");
             stat_fences_executed = registerStatistic<uint64_t>("fences_executed", "1");
+            stat_cleans_executed = registerStatistic<uint64_t>("cleans_executed", "1");
 
             stat_loaded_bytes = registerStatistic<uint64_t>("bytes_read", "1");
             stat_wrong_path_load_returned = registerStatistic<uint64_t>("wrong_path_load_returned", "1");
@@ -1203,6 +1205,17 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     delete ev;
                 }
 
+                // A CACHE-BLOCK CLEAN'S ACKNOWLEDGEMENT. It frees the store-buffer
+                // entry the clean held, exactly as a posted store's does.
+                virtual void handle(StandardMem::FlushResp* ev)
+                {
+                    auto iter = lsq->std_stores_in_flight.find( ev->getID() );
+                    if ( iter != lsq->std_stores_in_flight.end() ) {
+                        lsq->std_stores_in_flight.erase(iter);
+                    }
+                    delete ev;
+                }
+
                 virtual void handle(StandardMem::WriteResp* ev)
                 {
                     VANADIS_VERB(out, 9, VANADIS_DBG_LSQ_STORE_FLG, "-> handle write-response (virt-addr: 0x%" PRI_ADDR ")\n", ev->vAddr);
@@ -1508,6 +1521,19 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     work_reg, store_ins->getRegisterOffset(), &seen[0], store_width,
                     store_ins->getValueRegisterType() == STORE_FP_REGISTER);
                 noteWorkStore(store_address, &seen[0], store_width);
+            }
+
+            // A CACHE-BLOCK CLEAN carries no payload: it is sent as a flush that
+            // keeps the line, and is answered like a posted store -- it leaves
+            // the queue now and holds a store-buffer entry until the level-one
+            // data cache acknowledges it, so a store fence waits for it.
+            if( UNLIKELY(store_ins->getTransactionType() == MEM_TRANSACTION_CLEAN) ) {
+                store_req = new StandardMem::FlushAddr(store_address & address_mask, store_width, false, 0, 0,
+                    store_address, store_ins->getInstructionAddress(), store_ins->getHWThread());
+                std_stores_in_flight.insert(store_req->getID());
+                memInterface->send(store_req);
+                stat_cleans_executed->addData(1);
+                return true;
             }
 
             const bool needs_split = operationStraddlesCacheLine(store_address, store_width);
@@ -1929,6 +1955,10 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         /// wrong ones.
         void noteStoreResolved(const uint32_t thr, VanadisBasicStorePendingEntry* store_entry)
         {
+            // A CACHE-BLOCK CLEAN WRITES NO BYTES, so no load read anything it
+            // could have changed.
+            if( UNLIKELY(isClean(store_entry)) ) { return; }
+
             const uint64_t store_age = store_entry->getAge();
             const uint64_t store_pc  = store_entry->getInstructionAddress();
 
@@ -2034,6 +2064,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             for( size_t i = older; i-- > 0; ) {
                 VanadisBasicStorePendingEntry* store_entry = store_q[i];
 
+                // A cache-block clean is not a store to any byte: a load neither
+                // waits for it nor is answered from it, whether or not its
+                // address is known yet.
+                if( UNLIKELY(isClean(store_entry)) ) { continue; }
+
                 if( ! store_entry->isResolved() ) {
                     // Nobody knows whether this store touches the load. Ask.
                     const VanadisBasicOlderStoreView view(store_q, load_age);
@@ -2101,6 +2136,11 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         /// A floating-point destination is excluded because the load response
         /// path writes one differently, and two pieces of code that must agree
         /// byte for byte are better replaced by one that is never taken.
+        static bool isClean(VanadisBasicStorePendingEntry* store_entry)
+        {
+            return store_entry->getStoreInstruction()->getTransactionType() == MEM_TRANSACTION_CLEAN;
+        }
+
         bool canForwardFrom(VanadisLoadInstruction* load_ins, VanadisBasicStorePendingEntry* store_entry) const
         {
             if( ! forward_ ) { return false; }
@@ -2719,6 +2759,7 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
         Statistic<uint64_t>* stat_stores_executed;
         Statistic<uint64_t>* stat_loads_executed;
         Statistic<uint64_t>* stat_fences_executed;
+        Statistic<uint64_t>* stat_cleans_executed;
         Statistic<uint64_t>* stat_split_stores;
         Statistic<uint64_t>* stat_split_loads;
         Statistic<uint64_t>* stat_stored_bytes;
