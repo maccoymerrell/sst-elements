@@ -705,11 +705,18 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
                     reserved_stores_.erase(entry->getInstruction());
                 }
 
-                // Every entry that could have been compared against is gone, so
-                // the ages may start again. The predictors are NOT cleared: what
-                // they have learned about the program survives a repair, and a
-                // table emptied on every mis-predict would stay empty.
-                next_age_[thread] = VANADIS_LSQ_FIRST_AGE;
+                // THE AGES DO NOT START AGAIN. The stores that survive a clear
+                // are the retired ones still in the store queue, on their way to
+                // memory -- a clear with some left happened 170 times in one
+                // run of tile_lrsc_away_race and 225 in the dictionary at its
+                // smallest size -- and every load issued after the clear is
+                // YOUNGER than all of them. Restarting the count gave the next
+                // loads ages below theirs, so such a load looked older than a
+                // retired store it follows, and neither waited for nor forwarded
+                // from it. The count is 64 bits and only ever grows. The
+                // predictors are NOT cleared either: what they have learned
+                // about the program survives a repair, and a table emptied on
+                // every mis-predict would stay empty.
                 ordered_ins_[thread] = nullptr;
             } else {
                 for(auto load_itr = loads_pending.begin(); load_itr != loads_pending.end(); ) {
@@ -2048,9 +2055,23 @@ class VanadisBasicLoadStoreQueue : public SST::Vanadis::VanadisLoadStoreQueue
             // not an ordinary read: it never passes a store and is never
             // answered from one. This is what load_process() asks for the
             // in-order queue, said against ages instead of against emptiness.
+            //
+            // AND IT GOES TO MEMORY ONLY AT THE HEAD OF THE REORDER BUFFER. A
+            // load-linked has an effect beyond its value: it opens a
+            // reservation at the cache. Sent down a path that is then squashed,
+            // the reservation it opened survives the squash, and the correct
+            // path's store-conditional -- which reaches the cache after it --
+            // is validated by a reservation its own load-linked never made; a
+            // snoop that broke the real one in between goes unnoticed and an
+            // update is lost (a host increment lost against a function core's
+            // in tile_lrsc_away_race, phase 5, two tiles). So it is performed
+            // non-speculatively, as BOOM performs its atomics and
+            // load-reserveds when they reach the head of the reorder buffer,
+            // and as stores already are here.
             if( UNLIKELY((load_ins->getTransactionType() == MEM_TRANSACTION_LLSC_LOAD)
                       || (load_ins->getTransactionType() == MEM_TRANSACTION_LOCK)) ) {
                 if( older > 0 ) { return; }
+                if( ! load_ins->checkFrontOfROB() ) { return; }
                 sendLoadFromEntry(load_entry);
                 return;
             }
