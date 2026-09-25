@@ -17,6 +17,7 @@
 #define _H_VANADIS_DIV_REMAIN
 
 #include "inst/vinst.h"
+#include "vfuncunit.h"
 
 namespace SST {
 namespace Vanadis {
@@ -39,6 +40,7 @@ public:
 
     VanadisDivideRemainderInstruction* clone() override { return new VanadisDivideRemainderInstruction(*this); }
     VanadisFunctionalUnitType          getInstFuncType() const override { return INST_INT_DIV; }
+    int getFPCostClass() const override { return (sizeof(gpr_format) == 8) ? VANADIS_INT_COST_DIV_X : VANADIS_INT_COST_DIV_W; }
     const char*                        getInstCode() const override {
 		if(sizeof(gpr_format)==8) {
 			if(std::is_signed<gpr_format>::value) {

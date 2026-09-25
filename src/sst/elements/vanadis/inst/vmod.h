@@ -17,6 +17,7 @@
 #define _H_VANADIS_MOD
 
 #include "inst/vinst.h"
+#include "vfuncunit.h"
 
 namespace SST {
 namespace Vanadis {
@@ -38,6 +39,7 @@ public:
 
     VanadisModuloInstruction* clone() override { return new VanadisModuloInstruction(*this); }
     VanadisFunctionalUnitType getInstFuncType() const override { return INST_INT_DIV; }
+    int getFPCostClass() const override { return (sizeof(gpr_format) == 8) ? VANADIS_INT_COST_DIV_X : VANADIS_INT_COST_DIV_W; }
 
     const char* getInstCode() const override
     {

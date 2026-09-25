@@ -554,6 +554,16 @@ VANADIS_COMPONENT::VANADIS_COMPONENT(SST::ComponentId_t id, SST::Params& params)
         fu_int_div.push_back(new VanadisFunctionalUnit(fu_id++, INST_INT_DIV, int_div_cycles));
     }
 
+    // THE INTEGER DIVIDER'S PER-WIDTH COSTS. Zero leaves the unit's own latency
+    // and one issue per cycle -- the core as it was. An interval above one is an
+    // iterative divider that accepts nothing else until it has passed.
+    for ( VanadisFunctionalUnit* fu : fu_int_div ) {
+        fu->setClassCost(VANADIS_INT_COST_DIV_W, params.find<uint16_t>("integer_div_w_cycles", 0),
+                         params.find<uint16_t>("integer_div_w_interval", 0));
+        fu->setClassCost(VANADIS_INT_COST_DIV_X, params.find<uint16_t>("integer_div_x_cycles", 0),
+                         params.find<uint16_t>("integer_div_x_interval", 0));
+    }
+
     const uint16_t branch_units  = params.find<uint16_t>("branch_units", 1);
     const uint16_t branch_cycles = params.find<uint16_t>("branch_unit_cycles", int_arith_cycles);
 

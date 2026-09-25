@@ -61,6 +61,10 @@ enum VanadisFPCostClass : int {
     VANADIS_FP_COST_DIV_D,
     VANADIS_FP_COST_SQRT_S,
     VANADIS_FP_COST_SQRT_D,
+    // The integer divider's two widths (divide and remainder alike): a
+    // division unit may be given a latency and an issue interval for each.
+    VANADIS_INT_COST_DIV_W,
+    VANADIS_INT_COST_DIV_X,
     VANADIS_FP_COST_COUNT
 };
 
